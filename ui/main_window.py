@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from services.metadata_preview import MetadataPreviewController
     from services.safe_rename import SafeRenameController
     from services.playlist_controller import PlaylistController
+    from services.safe_import import SafeImportController
 
 from services.metadata_preview import MetadataPreviewInput
 from services.safe_rename import SafeRenameInput
@@ -40,6 +41,7 @@ class MainWindow(QMainWindow):
         safe_rename_controller: SafeRenameController | None = None,
         lyrics_match_controller: LyricsMatchController | None = None,
         playlist_controller: PlaylistController | None = None,
+        safe_import_controller: SafeImportController | None = None,
         *,
         use_model_view: bool = False,
     ) -> None:
@@ -49,8 +51,10 @@ class MainWindow(QMainWindow):
         self._safe_rename_controller = safe_rename_controller
         self._lyrics_match_controller = lyrics_match_controller
         self._playlist_controller = playlist_controller
+        self._safe_import_controller = safe_import_controller
         self._use_model_view = bool(use_model_view)
         self._scan_dialog: ReadOnlyScanDialog | None = None
+        self._import_dialog: ImportDialog | None = None
         self._rename_dialog: RenamePreviewDialog | None = None
         self._lyrics_dialog: LyricsMatchDialog | None = None
         self._close_pending = False
@@ -161,6 +165,11 @@ class MainWindow(QMainWindow):
                 self._replace_playlists(playlist_controller.list_playlists())
             except Exception as error:
                 playlist_controller.failed.emit(f"无法加载歌单：{error}")
+        if safe_import_controller is not None:
+            safe_import_controller.completed.connect(self._safe_import_completed)
+            safe_import_controller.cancelled.connect(self._safe_import_cancelled)
+            safe_import_controller.failed.connect(self._safe_import_failed)
+            safe_import_controller.running_changed.connect(self._safe_import_running_changed)
 
     def _add_page(self, key: str, page: LibraryPage) -> None:
         self.pages[key] = page
@@ -191,6 +200,20 @@ class MainWindow(QMainWindow):
         self._open_windows = [window for window in self._open_windows if id(window) != tracked_id]
 
     def open_import(self) -> None:
+        if self._safe_import_controller is not None:
+            if self._import_dialog is not None:
+                self._import_dialog.show()
+                self._import_dialog.raise_()
+                self._import_dialog.activateWindow()
+                return
+            dialog = ImportDialog(self, live_mode=True)
+            self._import_dialog = dialog
+            dialog.destroyed.connect(lambda: setattr(self, "_import_dialog", None))
+            dialog.start_requested.connect(self._start_safe_import)
+            dialog.cancel_requested.connect(self._safe_import_controller.request_cancel)
+            dialog.set_running(self._safe_import_controller.running)
+            self._show_window(dialog)
+            return
         if self._scan_controller is None:
             self._show_window(ImportDialog(self))
             return
@@ -220,6 +243,50 @@ class MainWindow(QMainWindow):
             dialog.path_input.setText(str(remembered))
         dialog.set_running(self._scan_controller.running)
         self._show_window(dialog)
+
+    def _start_safe_import(self, source_root: Path, target_root: Path, mode: str) -> None:
+        if self._safe_import_controller is None or self._import_dialog is None:
+            return
+        if self._has_running_background_task():
+            self._import_dialog.show_failed("已有后台任务运行，请完成后再导入")
+            return
+        answer = QMessageBox.question(
+            self._import_dialog,
+            "确认安全移动导入",
+            "源文件只有在目标副本完成大小和 SHA-256 校验后才会删除。\n"
+            "同名不同内容不会覆盖。是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self._safe_import_controller.start(source_root, target_root, mode)
+        except Exception as error:
+            self._import_dialog.show_failed(str(error))
+
+    def _safe_import_completed(self, result: object) -> None:
+        if self._import_dialog is not None:
+            self._import_dialog.show_result(result)
+        if self._scan_controller is not None and getattr(result, "success_count", 0) and not self._scan_controller.running:
+            try:
+                self._scan_controller.start_scan(getattr(result, "target_root"))
+            except Exception as error:
+                if self._import_dialog is not None:
+                    self._import_dialog.show_failed(f"文件已安全导入，但索引刷新失败：{error}")
+
+    def _safe_import_cancelled(self, result: object) -> None:
+        if self._import_dialog is not None:
+            self._import_dialog.show_result(result, cancelled=True)
+
+    def _safe_import_failed(self, message: str) -> None:
+        if self._import_dialog is not None:
+            self._import_dialog.show_failed(message)
+
+    def _safe_import_running_changed(self, running: bool) -> None:
+        if self._import_dialog is not None:
+            self._import_dialog.set_running(running)
+        self._background_running_changed(running)
 
     def _start_read_only_scan(self, root) -> None:
         if self._scan_controller is None:
@@ -743,6 +810,8 @@ class MainWindow(QMainWindow):
                 self._lyrics_match_controller.request_cancel()
             if self._playlist_controller is not None and self._playlist_controller.running:
                 self._playlist_controller.request_cancel()
+            if self._safe_import_controller is not None and self._safe_import_controller.running:
+                self._safe_import_controller.request_cancel()
             event.ignore()
             return
         super().closeEvent(event)
@@ -765,5 +834,9 @@ class MainWindow(QMainWindow):
             or (
                 self._playlist_controller is not None
                 and self._playlist_controller.running
+            )
+            or (
+                self._safe_import_controller is not None
+                and self._safe_import_controller.running
             )
         )

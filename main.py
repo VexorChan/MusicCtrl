@@ -14,6 +14,7 @@ from services.lyrics_match_controller import LyricsMatchController
 from services.metadata_preview import MetadataPreviewController
 from services.safe_rename import SafeRenameController
 from services.playlist_controller import PlaylistController
+from services.safe_import import SafeImportController
 from ui.main_window import MainWindow
 
 
@@ -67,12 +68,14 @@ def main() -> int:
     )
     lyrics_match_controller = LyricsMatchController(database_config)
     playlist_controller = PlaylistController(database_config)
+    safe_import_controller = SafeImportController()
     window = MainWindow(
         controller,
         metadata_preview_controller,
         safe_rename_controller,
         lyrics_match_controller,
         playlist_controller,
+        safe_import_controller,
         use_model_view=True,
     )
     window.show()
