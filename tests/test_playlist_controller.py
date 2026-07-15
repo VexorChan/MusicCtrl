@@ -14,6 +14,7 @@ from services.playlist_controller import (
     PlaylistAudioInput,
     PlaylistController,
     PlaylistRemovalInput,
+    PlaylistRetargetInput,
 )
 from ui.main_window import MainWindow
 
@@ -88,6 +89,25 @@ class PlaylistControllerTests(unittest.TestCase):
         self._wait()
         self.assertEqual(results[-1].skipped_count, 1)
         self.assertEqual(shortcut.read_bytes(), before)
+
+    def test_retarget_updates_managed_shortcut_after_audio_rename(self) -> None:
+        item = PlaylistAudioInput(self.asset.id, self.audio, self.audio_root, "active")
+        self.controller.start_add("通勤", (item,))
+        self._wait()
+        old_shortcut = self.controller.load_playlist("通勤")[0]["_shortcut_path"]
+        renamed = self.audio_root / "晴天现场版-周杰伦.mp3"
+        os.rename(self.audio, renamed)
+
+        self.controller.start_retarget(
+            (PlaylistRetargetInput(self.audio, renamed, self.audio_root),)
+        )
+        self._wait()
+
+        rows = self.controller.load_playlist("通勤")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["_target_path"], renamed)
+        self.assertFalse(old_shortcut.exists())
+        self.assertTrue(rows[0]["_shortcut_path"].is_file())
 
     def test_main_window_uses_dynamic_playlists_and_mock_fallback(self) -> None:
         window = MainWindow(playlist_controller=self.controller)

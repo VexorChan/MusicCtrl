@@ -40,16 +40,37 @@ class PlaylistRemovalInput:
 
 
 @dataclass(frozen=True, slots=True)
+class PlaylistRetargetInput:
+    source_path: Path
+    target_path: Path
+    audio_root: Path
+
+
+@dataclass(frozen=True, slots=True)
 class PlaylistOperationResult:
     playlist_name: str
     success_count: int
     skipped_count: int
     failure_count: int
     messages: tuple[str, ...]
+    affected_playlists: tuple[str, ...] = ()
 
 
 def _name_key(value: str) -> str:
     return value.rstrip(" .").casefold()
+
+
+def _path_key(path: Path) -> str:
+    return os.path.normcase(os.path.normpath(os.path.abspath(os.fspath(path))))
+
+
+def _safe_playlist_directories(root: Path) -> tuple[Path, ...]:
+    directories: list[Path] = []
+    for entry in os.scandir(root):
+        metadata = entry.stat(follow_symlinks=False)
+        if entry.is_dir(follow_symlinks=False) and not entry.is_symlink() and not _is_reparse(metadata):
+            directories.append(root / entry.name)
+    return tuple(sorted(directories, key=lambda path: (path.name.casefold(), path.name)))
 
 
 def _human_size(size_bytes: int) -> str:
@@ -73,15 +94,17 @@ class PlaylistShortcutWorker(QThread):
         playlist_name: str,
         add_items: tuple[PlaylistAudioInput, ...] = (),
         remove_items: tuple[PlaylistRemovalInput, ...] = (),
+        retarget_items: tuple[PlaylistRetargetInput, ...] = (),
         parent=None,
     ) -> None:
         super().__init__(parent)
-        if bool(add_items) == bool(remove_items):
-            raise ValueError("必须且只能选择添加或移除一种操作")
+        if sum(bool(value) for value in (add_items, remove_items, retarget_items)) != 1:
+            raise ValueError("必须且只能选择一种歌单操作")
         self._playlist_root = playlist_root
         self._playlist_name = playlist_name
         self._add_items = add_items
         self._remove_items = remove_items
+        self._retarget_items = retarget_items
         self._cancel = threading.Event()
 
     def request_cancel(self) -> None:
@@ -91,8 +114,11 @@ class PlaylistShortcutWorker(QThread):
     def run(self) -> None:
         success = skipped = failures = 0
         messages: list[str] = []
+        affected: set[str] = set()
         try:
-            if self._add_items:
+            if self._retarget_items:
+                folder = None
+            elif self._add_items:
                 folder = create_playlist_directory(
                     playlist_root=self._playlist_root,
                     name=self._playlist_name,
@@ -109,16 +135,57 @@ class PlaylistShortcutWorker(QThread):
                 if len(matches) != 1:
                     raise ValueError("要移除快捷方式的歌单不存在或不安全")
                 folder = self._playlist_root / matches[0].name
-            items = self._add_items or self._remove_items
+            items = self._add_items or self._remove_items or self._retarget_items
             for item in items:
                 if self._cancel.is_set():
                     result = PlaylistOperationResult(
-                        self._playlist_name, success, skipped, failures, tuple(messages)
+                        self._playlist_name,
+                        success,
+                        skipped,
+                        failures,
+                        tuple(messages),
+                        tuple(sorted(affected)),
                     )
                     self.cancelled.emit(result)
                     return
                 try:
-                    if isinstance(item, PlaylistAudioInput):
+                    if isinstance(item, PlaylistRetargetInput):
+                        updated = 0
+                        for playlist in _safe_playlist_directories(self._playlist_root):
+                            for shortcut_path in sorted(playlist.glob("*.lnk")):
+                                try:
+                                    info = read_shortcut(shortcut_path, playlist_root=self._playlist_root)
+                                except Exception:
+                                    continue
+                                if _path_key(info.target_path) != _path_key(item.source_path):
+                                    continue
+                                destination = playlist / f"{item.target_path.name}.lnk"
+                                create_shortcut(
+                                    target_path=item.target_path,
+                                    audio_root=item.audio_root,
+                                    shortcut_path=destination,
+                                    playlist_root=self._playlist_root,
+                                )
+                                try:
+                                    remove_shortcut(
+                                        shortcut_path=shortcut_path,
+                                        playlist_root=self._playlist_root,
+                                        expected_target=item.source_path,
+                                    )
+                                except Exception:
+                                    remove_shortcut(
+                                        shortcut_path=destination,
+                                        playlist_root=self._playlist_root,
+                                        expected_target=item.target_path,
+                                    )
+                                    raise
+                                affected.add(playlist.name)
+                                updated += 1
+                        if updated == 0:
+                            skipped += 1
+                            messages.append(f"未发现引用：{item.source_path.name}")
+                            continue
+                    elif isinstance(item, PlaylistAudioInput):
                         if item.file_state != "active":
                             raise ValueError("只允许添加 active 音频")
                         create_shortcut(
@@ -135,7 +202,11 @@ class PlaylistShortcutWorker(QThread):
                         )
                 except ShortcutConflictError:
                     skipped += 1
-                    item_path = item.target_path if isinstance(item, PlaylistAudioInput) else item.shortcut_path
+                    item_path = (
+                        item.target_path
+                        if isinstance(item, (PlaylistAudioInput, PlaylistRetargetInput))
+                        else item.shortcut_path
+                    )
                     messages.append(f"已跳过重复项：{item_path.name}")
                 except Exception as error:
                     failures += 1
@@ -144,7 +215,12 @@ class PlaylistShortcutWorker(QThread):
                     success += 1
             self.completed.emit(
                 PlaylistOperationResult(
-                    self._playlist_name, success, skipped, failures, tuple(messages)
+                    self._playlist_name,
+                    success,
+                    skipped,
+                    failures,
+                    tuple(messages),
+                    tuple(sorted(affected)),
                 )
             )
         except Exception as error:
@@ -275,10 +351,18 @@ class PlaylistController(QObject):
     def start_remove(self, playlist_name: str, items: tuple[PlaylistRemovalInput, ...]) -> None:
         self._start_worker(playlist_name, remove_items=items)
 
+    def start_retarget(self, items: tuple[PlaylistRetargetInput, ...]) -> None:
+        self._start_worker("受管歌单", retarget_items=items)
+
     def _start_worker(self, playlist_name: str, **items) -> None:
         if self.running:
             raise RuntimeError("歌单操作已经在运行")
-        payload = tuple(items.get("add_items") or items.get("remove_items") or ())
+        payload = tuple(
+            items.get("add_items")
+            or items.get("remove_items")
+            or items.get("retarget_items")
+            or ()
+        )
         if not payload:
             raise ValueError("至少选择一个歌单项")
         worker = PlaylistShortcutWorker(
@@ -310,7 +394,11 @@ class PlaylistController(QObject):
         kind, payload = self._terminal or ("failed", "歌单线程结束但没有终态")
         if isinstance(payload, PlaylistOperationResult):
             try:
-                self.playlist_changed.emit(payload.playlist_name, self.load_playlist(payload.playlist_name))
+                names = payload.affected_playlists
+                if not names and payload.playlist_name != "受管歌单":
+                    names = (payload.playlist_name,)
+                for name in names:
+                    self.playlist_changed.emit(name, self.load_playlist(name))
             except Exception as error:
                 self.failed.emit(f"操作完成但歌单刷新失败：{error}")
                 kind = "failed"

@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 
 from services.metadata_preview import MetadataPreviewInput
 from services.safe_rename import SafeRenameInput
-from services.playlist_controller import PlaylistAudioInput, PlaylistRemovalInput
+from services.playlist_controller import PlaylistAudioInput, PlaylistRemovalInput, PlaylistRetargetInput
 
 
 class MainWindow(QMainWindow):
@@ -451,6 +451,23 @@ class MainWindow(QMainWindow):
         if self._rename_dialog is not None:
             self._rename_dialog.show_rename_completed(result)
         self._reload_library_after_rename()
+        if self._playlist_controller is not None and self._playlist_controller.remembered_root() is not None:
+            try:
+                retarget_items = tuple(
+                    PlaylistRetargetInput(
+                        source_path=item.source_path,
+                        target_path=item.target_path,
+                        audio_root=self._metadata_inputs_by_asset[item.asset_id].allowed_root,
+                    )
+                    for item in getattr(result, "items", ())
+                    if getattr(item, "result", None) == "success"
+                    and item.asset_id in self._metadata_inputs_by_asset
+                )
+                if retarget_items:
+                    self._playlist_controller.start_retarget(retarget_items)
+            except Exception as error:
+                if self._rename_dialog is not None:
+                    self._rename_dialog.show_warning(f"音乐已重命名，但歌单快捷方式联动失败：{error}")
 
     def _safe_rename_cancelled(self, result: object) -> None:
         if self._rename_dialog is not None:
