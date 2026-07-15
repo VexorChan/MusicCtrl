@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import hashlib
 import os
 from pathlib import Path
@@ -10,14 +11,17 @@ import stat
 import tempfile
 import threading
 import time
+from uuid import uuid4
 
 from PySide6.QtCore import QObject, QThread, Signal
 
 from services.file_safety import _is_reparse, _locked_directory_chain, _within_root
+from repositories import LibraryRepository
 
 
 SUPPORTED_AUDIO = {".mp3", ".flac", ".wav", ".m4a", ".ogg", ".aac"}
 _CANDIDATE_PREFIX = ".musicctrl-import-"
+IMPORT_HISTORY_KEY = "p6.import_history"
 
 
 class SafeImportError(RuntimeError):
@@ -42,6 +46,37 @@ class ImportRunResult:
     duplicate_count: int
     conflict_count: int
     failure_count: int
+    action: str = "import"
+
+
+def _result_to_history(result: ImportRunResult) -> dict[str, object]:
+    return {
+        "id": str(uuid4()),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "source_root": str(result.source_root),
+        "target_root": str(result.target_root),
+        "undone_at": None,
+        "complete": bool(result.items) and result.success_count == len(result.items),
+        "items": [
+            {
+                "source_path": str(item.source_path),
+                "target_path": str(item.target_path),
+                "status": item.status,
+                "sha256": item.sha256,
+                "message": item.message,
+            }
+            for item in result.items
+        ],
+    }
+
+
+def _load_history(repository: LibraryRepository) -> list[dict[str, object]]:
+    setting = repository.get_setting(IMPORT_HISTORY_KEY)
+    if setting is None:
+        return []
+    if not isinstance(setting.value, list) or not all(isinstance(item, dict) for item in setting.value):
+        raise SafeImportError("导入历史格式损坏")
+    return [dict(item) for item in setting.value]
 
 
 def _validate_root(root: Path, *, label: str) -> None:
@@ -241,14 +276,84 @@ class SafeImportWorker(QThread):
         )
 
 
+class SafeImportUndoWorker(QThread):
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, *, batch: dict[str, object], repository_factory, parent=None) -> None:
+        super().__init__(parent)
+        self._batch = batch
+        self._repository_factory = repository_factory
+
+    def run(self) -> None:
+        restored: list[tuple[Path, Path]] = []
+        try:
+            source_root = Path(str(self._batch["source_root"]))
+            target_root = Path(str(self._batch["target_root"]))
+            raw_items = self._batch.get("items")
+            if not source_root.is_absolute() or not target_root.is_absolute() or not isinstance(raw_items, list):
+                raise SafeImportError("导入历史路径损坏")
+            items = [item for item in raw_items if isinstance(item, dict) and item.get("status") == "success"]
+            if not items or len(items) != len(raw_items):
+                raise SafeImportError("只有完整成功的导入批次可以撤销")
+            for item in items:
+                source = Path(str(item["source_path"]))
+                target = Path(str(item["target_path"]))
+                expected_hash = str(item.get("sha256") or "")
+                if source.exists() or not target.is_file() or _sha256(target) != expected_hash:
+                    raise SafeImportError(f"文件已变化，不能撤销：{target.name}")
+            for item in reversed(items):
+                source = Path(str(item["source_path"]))
+                target = Path(str(item["target_path"]))
+                moved = import_one(target, source_root=target_root, target_root=source.parent)
+                if moved.status != "success" or moved.sha256 != item.get("sha256"):
+                    raise SafeImportError(f"撤销校验失败：{target.name}")
+                restored.append((source, target))
+            repository = self._repository_factory()
+            try:
+                history = _load_history(repository)
+                matching = [entry for entry in history if entry.get("id") == self._batch.get("id")]
+                if len(matching) != 1:
+                    raise SafeImportError("导入历史已变化")
+                matching[0]["undone_at"] = datetime.now(timezone.utc).isoformat()
+                repository.set_setting(IMPORT_HISTORY_KEY, history)
+            except Exception:
+                for source, target in reversed(restored):
+                    import_one(source, source_root=source_root, target_root=target.parent)
+                raise
+            finally:
+                repository.close()
+            results = tuple(
+                ImportItemResult(target, source, "success", "已撤销导入并恢复源路径", str(item["sha256"]))
+                for item, (source, target) in zip(reversed(items), restored)
+            )
+            self.completed.emit(
+                ImportRunResult(source_root, target_root, results, len(results), 0, 0, 0, "undo")
+            )
+        except Exception as error:
+            if restored:
+                try:
+                    source_root = Path(str(self._batch["source_root"]))
+                    for source, target in reversed(restored):
+                        if source.exists() and not target.exists():
+                            import_one(source, source_root=source_root, target_root=target.parent)
+                except Exception as rollback_error:
+                    self.failed.emit(f"撤销失败且补偿失败，需要人工处理：{rollback_error}")
+                    return
+            self.failed.emit(str(error).strip() or error.__class__.__name__)
+
+
 class SafeImportController(QObject):
     completed = Signal(object)
     cancelled = Signal(object)
     failed = Signal(str)
     running_changed = Signal(bool)
 
-    def __init__(self, parent: QObject | None = None) -> None:
+    warning = Signal(str)
+
+    def __init__(self, repository_factory=None, parent: QObject | None = None) -> None:
         super().__init__(parent)
+        self._repository_factory = repository_factory
         self._worker: SafeImportWorker | None = None
         self._terminal: tuple[str, object] | None = None
 
@@ -269,6 +374,31 @@ class SafeImportController(QObject):
         self.running_changed.emit(True)
         worker.start()
 
+    def list_history(self) -> tuple[dict[str, object], ...]:
+        if self._repository_factory is None:
+            return ()
+        with self._repository_factory() as repository:
+            return tuple(_load_history(repository))
+
+    def undo_last_complete(self) -> None:
+        if self.running:
+            raise RuntimeError("已有安全导入任务正在运行")
+        if self._repository_factory is None:
+            raise SafeImportError("没有可用的导入历史仓库")
+        history = self.list_history()
+        candidates = [item for item in history if item.get("complete") is True and item.get("undone_at") is None]
+        if not candidates:
+            raise SafeImportError("没有可撤销的完整导入批次")
+        batch = candidates[-1]
+        worker = SafeImportUndoWorker(batch=batch, repository_factory=self._repository_factory)
+        worker.completed.connect(lambda value: self._cache("completed", value))
+        worker.failed.connect(lambda value: self._cache("failed", value))
+        worker.finished.connect(self._finished)
+        self._worker = worker  # type: ignore[assignment]
+        self._terminal = None
+        self.running_changed.emit(True)
+        worker.start()
+
     def request_cancel(self) -> None:
         if self._worker is not None:
             self._worker.request_cancel()
@@ -282,6 +412,14 @@ class SafeImportController(QObject):
         if worker is None:
             return
         kind, value = self._terminal or ("failed", "导入线程结束但没有终态")
+        if kind == "completed" and isinstance(value, ImportRunResult) and value.action == "import" and self._repository_factory is not None:
+            try:
+                with self._repository_factory() as repository:
+                    history = _load_history(repository)
+                    history.append(_result_to_history(value))
+                    repository.set_setting(IMPORT_HISTORY_KEY, history)
+            except Exception as error:
+                self.warning.emit(f"文件已导入，但历史保存失败：{error}")
         self._worker = None
         self._terminal = None
         worker.deleteLater()

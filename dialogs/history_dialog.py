@@ -20,8 +20,9 @@ from ui.tables import DataTable
 class HistoryDialog(PrototypeDialog):
     restore_requested = Signal(object)
     cleanup_requested = Signal()
+    undo_import_requested = Signal()
 
-    def __init__(self, parent: QWidget | None = None, *, backup_entries: tuple[object, ...] | None = None) -> None:
+    def __init__(self, parent: QWidget | None = None, *, backup_entries: tuple[object, ...] | None = None, import_batches: tuple[dict[str, object], ...] = ()) -> None:
         super().__init__("操作历史", (1000, 650), parent)
         root = QVBoxLayout(self)
         root.setContentsMargins(22, 18, 22, 18)
@@ -45,7 +46,7 @@ class HistoryDialog(PrototypeDialog):
         self.table = DataTable()
         self.table.setColumnCount(5)
         self.table.setHorizontalHeaderLabels(["时间", "操作类型", "成功数量", "失败数量", "状态"])
-        rows = HISTORY if backup_entries is None else tuple(backup_entries)
+        rows = HISTORY if backup_entries is None else tuple(backup_entries) + tuple(import_batches)
         self.table.setRowCount(len(rows))
         self.table.setColumnWidth(0, 170)
         self.table.horizontalHeader().setSectionResizeMode(1, self.table.horizontalHeader().ResizeMode.Stretch)
@@ -54,13 +55,25 @@ class HistoryDialog(PrototypeDialog):
         self.table.setColumnWidth(4, 130)
         for row, record in enumerate(rows):
             if self._live_mode:
-                values = (
-                    getattr(record, "created_at", ""),
-                    "备份删除" if getattr(record, "restored_at", None) is None else "已恢复",
-                    1,
-                    0,
-                    "可恢复" if getattr(record, "restored_at", None) is None else "已恢复",
-                )
+                if isinstance(record, dict):
+                    items = tuple(record.get("items", ()))
+                    success = sum(isinstance(item, dict) and item.get("status") == "success" for item in items)
+                    failed = len(items) - success
+                    values = (
+                        str(record.get("created_at", "")),
+                        "移动导入",
+                        success,
+                        failed,
+                        "已撤销" if record.get("undone_at") else "可撤销" if record.get("complete") else "部分完成",
+                    )
+                else:
+                    values = (
+                        getattr(record, "created_at", ""),
+                        "备份删除" if getattr(record, "restored_at", None) is None else "已恢复",
+                        1,
+                        0,
+                        "可恢复" if getattr(record, "restored_at", None) is None else "已恢复",
+                    )
             else:
                 values = record
             for col, value in enumerate(values):
@@ -73,7 +86,8 @@ class HistoryDialog(PrototypeDialog):
                 self.table.setItem(row, col, item)
             self.table.setCellWidget(row, 4, make_status_badge(values[4]))
             if self._live_mode:
-                self.table.item(row, 0).setData(Qt.ItemDataRole.UserRole, getattr(record, "id", ""))
+                restore_id = "" if isinstance(record, dict) else getattr(record, "id", "")
+                self.table.item(row, 0).setData(Qt.ItemDataRole.UserRole, restore_id)
         if rows:
             self.table.selectRow(0)
         root.addWidget(self.table, 1)
@@ -101,6 +115,9 @@ class HistoryDialog(PrototypeDialog):
         self.undo.clicked.connect(self._request_restore)
         footer.addWidget(self.undo)
         if self._live_mode:
+            undo_import = QPushButton("撤销最近完整导入")
+            undo_import.clicked.connect(self.undo_import_requested)
+            footer.addWidget(undo_import)
             cleanup = QPushButton("清理到期备份")
             cleanup.setObjectName("DangerButton")
             cleanup.clicked.connect(self.cleanup_requested)
@@ -119,6 +136,7 @@ class HistoryDialog(PrototypeDialog):
             str(self.table.item(row, 0).data(Qt.ItemDataRole.UserRole))
             for row in rows
             if self.table.item(row, 0) is not None
+            and self.table.item(row, 0).data(Qt.ItemDataRole.UserRole)
         )
         if ids:
             self.restore_requested.emit(ids)

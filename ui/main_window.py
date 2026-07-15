@@ -175,6 +175,7 @@ class MainWindow(QMainWindow):
             safe_import_controller.completed.connect(self._safe_import_completed)
             safe_import_controller.cancelled.connect(self._safe_import_cancelled)
             safe_import_controller.failed.connect(self._safe_import_failed)
+            safe_import_controller.warning.connect(self._safe_import_failed)
             safe_import_controller.running_changed.connect(self._safe_import_running_changed)
         if backup_controller is not None:
             backup_controller.completed.connect(self._backup_completed)
@@ -653,7 +654,16 @@ class MainWindow(QMainWindow):
             self._show_window(HistoryDialog(self))
             return
         try:
-            dialog = HistoryDialog(self, backup_entries=self._backup_controller.list_entries())
+            import_batches = (
+                self._safe_import_controller.list_history()
+                if self._safe_import_controller is not None
+                else ()
+            )
+            dialog = HistoryDialog(
+                self,
+                backup_entries=self._backup_controller.list_entries(),
+                import_batches=import_batches,
+            )
         except Exception as error:
             current = self.stack.currentWidget()
             if isinstance(current, LibraryPage):
@@ -663,6 +673,7 @@ class MainWindow(QMainWindow):
         dialog.destroyed.connect(lambda: setattr(self, "_history_dialog", None))
         dialog.restore_requested.connect(self._restore_backups)
         dialog.cleanup_requested.connect(self._cleanup_backups)
+        dialog.undo_import_requested.connect(self._undo_last_import)
         self._show_window(dialog)
 
     def _restore_backups(self, entry_ids: object) -> None:
@@ -674,6 +685,25 @@ class MainWindow(QMainWindow):
             current = self.stack.currentWidget()
             if isinstance(current, LibraryPage):
                 current.status.setText(f"无法恢复备份：{error}")
+
+    def _undo_last_import(self) -> None:
+        if self._safe_import_controller is None:
+            return
+        answer = QMessageBox.question(
+            self._history_dialog,
+            "确认撤销导入",
+            "只会撤销最近一次完整成功且文件未变化的导入；遇到冲突会停止并恢复现场。是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self._safe_import_controller.undo_last_complete()
+        except Exception as error:
+            current = self.stack.currentWidget()
+            if isinstance(current, LibraryPage):
+                current.status.setText(f"无法撤销导入：{error}")
 
     def _cleanup_backups(self) -> None:
         if self._backup_controller is None:

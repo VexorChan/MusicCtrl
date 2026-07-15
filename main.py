@@ -69,7 +69,9 @@ def main() -> int:
     )
     lyrics_match_controller = LyricsMatchController(database_config)
     playlist_controller = PlaylistController(database_config)
-    safe_import_controller = SafeImportController()
+    safe_import_controller = SafeImportController(
+        lambda: LibraryRepository(database_config)
+    )
     backup_root = database_config.path.parent / "backups"
     backup_controller = BackupController(
         backup_root=backup_root,

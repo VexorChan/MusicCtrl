@@ -8,6 +8,8 @@ import threading
 import unittest
 
 from PySide6.QtWidgets import QApplication
+from database import DatabaseConfig
+from repositories import LibraryRepository
 
 from services.safe_import import (
     SafeImportError,
@@ -120,6 +122,36 @@ class SafeImportTests(unittest.TestCase):
         self.assertEqual(len(completed), 1)
         self.assertEqual(failed, [])
         self.assertEqual(completed[0].success_count, 1)
+
+    def test_complete_import_is_persisted_and_can_be_undone(self) -> None:
+        source = self.source / "undo.mp3"
+        source.write_bytes(b"undo payload")
+        config = DatabaseConfig(self.root / "history.sqlite3")
+        controller = SafeImportController(lambda: LibraryRepository(config))
+        completed = []
+        controller.completed.connect(completed.append)
+
+        def wait() -> None:
+            import time
+            deadline = time.monotonic() + 5
+            while controller.running and time.monotonic() < deadline:
+                self.app.processEvents()
+            self.app.processEvents()
+            self.assertFalse(controller.running)
+
+        controller.start(self.source, self.target, "audio")
+        wait()
+        self.assertFalse(source.exists())
+        self.assertTrue((self.target / source.name).exists())
+        self.assertEqual(len(controller.list_history()), 1)
+        self.assertTrue(controller.list_history()[0]["complete"])
+
+        controller.undo_last_complete()
+        wait()
+        self.assertEqual(source.read_bytes(), b"undo payload")
+        self.assertFalse((self.target / source.name).exists())
+        self.assertIsNotNone(controller.list_history()[0]["undone_at"])
+        self.assertEqual(completed[-1].action, "undo")
 
 
 if __name__ == "__main__":
