@@ -265,6 +265,18 @@ class LibraryPage(QWidget):
         self.search.textChanged.connect(lambda _text: self.search_timer.start())
         self._populate_table()
 
+    def replace_data(self, records: Iterable[dict]) -> None:
+        """Replace library rows without retaining stale selection or sort state."""
+
+        self.search_timer.stop()
+        self.table.clearSelection()
+        self.all_data = [dict(item, _index=index) for index, item in enumerate(records)]
+        self.sort_key = None
+        self.sort_descending = False
+        self.visible_data = self._matching_rows(self.search.text())
+        self.count_label.setText(f"共 {len(self.all_data)} 首")
+        self._populate_table()
+
     def _columns(self) -> list[str]:
         if self.kind == "lyrics":
             return ["", "歌名", "歌手", "格式", "大小", "歌词状态"]

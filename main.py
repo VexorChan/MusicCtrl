@@ -3,10 +3,12 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QStandardPaths, Qt
 from PySide6.QtGui import QFont, QIcon
 from PySide6.QtWidgets import QApplication
 
+from database import DatabaseConfig
+from services.library_scan_controller import LibraryScanController
 from ui.main_window import MainWindow
 
 
@@ -36,9 +38,24 @@ def build_app() -> QApplication:
     return app
 
 
+def build_production_database_config() -> DatabaseConfig:
+    location = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppLocalDataLocation)
+    if not location:
+        raise RuntimeError("系统未提供应用数据目录")
+    directory = Path(location)
+    if not directory.is_absolute():
+        raise RuntimeError("应用数据目录必须是绝对路径")
+    directory = Path(str(directory))
+    if directory == ROOT or directory == Path.cwd():
+        raise RuntimeError("数据库不能放在项目根或当前工作目录")
+    directory.mkdir(parents=True, exist_ok=True)
+    return DatabaseConfig(directory / "library.sqlite3")
+
+
 def main() -> int:
     app = build_app()
-    window = MainWindow()
+    controller = LibraryScanController(build_production_database_config())
+    window = MainWindow(controller)
     window.show()
     return app.exec()
 

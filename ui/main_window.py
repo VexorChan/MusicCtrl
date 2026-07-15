@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from typing import TYPE_CHECKING
+
+from PySide6.QtCore import QTimer, Qt
+from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import QApplication, QDialog, QHBoxLayout, QMainWindow, QStackedWidget, QVBoxLayout, QWidget
 
 from dialogs.delete_confirm_dialog import DeleteConfirmDialog, DeleteLyricsConfirmDialog, RemovePlaylistItemsDialog
@@ -9,16 +12,23 @@ from dialogs.import_dialog import ImportDialog
 from dialogs.lyrics_match_dialog import LyricsMatchDialog
 from dialogs.playlist_dialog import CreatePlaylistDialog
 from dialogs.rename_preview_dialog import RenamePreviewDialog
+from dialogs.read_only_scan_dialog import ReadOnlyScanDialog
 from dialogs.settings_dialog import SettingsDialog
 from mock.data import LYRICS, PLAYLIST_MAP, SONGS
 from ui.music_page import LibraryPage
 from ui.sidebar import Sidebar
 from ui.toolbars import GlobalToolbar
 
+if TYPE_CHECKING:
+    from services.library_scan_controller import LibraryScanController
+
 
 class MainWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, scan_controller: LibraryScanController | None = None) -> None:
         super().__init__()
+        self._scan_controller = scan_controller
+        self._scan_dialog: ReadOnlyScanDialog | None = None
+        self._close_pending = False
         self.setWindowTitle("乐库整理助手")
         app = QApplication.instance()
         if app is not None and not app.windowIcon().isNull():
@@ -56,7 +66,9 @@ class MainWindow(QMainWindow):
         content_layout.addWidget(self.stack, 1)
         root_layout.addWidget(content, 1)
 
-        self._add_page("所有音乐", LibraryPage("所有音乐", SONGS, display_count=268))
+        music_data = SONGS if scan_controller is None else []
+        music_count = 268 if scan_controller is None else 0
+        self._add_page("所有音乐", LibraryPage("所有音乐", music_data, display_count=music_count))
         self._add_page("所有歌词", LibraryPage("所有歌词", LYRICS, kind="lyrics", display_count=214))
         display_counts = {"我喜欢的": 62, "粤语": 36, "通勤": 28, "怀旧": 41, "古巨基": 17}
         for name, indices in PLAYLIST_MAP.items():
@@ -66,6 +78,13 @@ class MainWindow(QMainWindow):
                 LibraryPage(name, records, display_count=display_counts.get(name, len(records)), playlist_name=name),
             )
         self.navigate("所有音乐")
+        if scan_controller is not None:
+            scan_controller.library_changed.connect(self._replace_music_library)
+            scan_controller.running_changed.connect(self._scan_running_changed)
+            try:
+                self._replace_music_library(scan_controller.load_library())
+            except Exception as error:
+                scan_controller.warning.emit(f"无法加载音乐索引：{error}")
 
     def _add_page(self, key: str, page: LibraryPage) -> None:
         self.pages[key] = page
@@ -95,7 +114,46 @@ class MainWindow(QMainWindow):
         self._open_windows = [window for window in self._open_windows if id(window) != tracked_id]
 
     def open_import(self) -> None:
-        self._show_window(ImportDialog(self))
+        if self._scan_controller is None:
+            self._show_window(ImportDialog(self))
+            return
+        if self._scan_dialog is not None:
+            self._scan_dialog.show()
+            self._scan_dialog.raise_()
+            self._scan_dialog.activateWindow()
+            return
+        dialog = ReadOnlyScanDialog(None, self)
+        self._scan_dialog = dialog
+        dialog.destroyed.connect(lambda: setattr(self, "_scan_dialog", None))
+        dialog.start_requested.connect(self._start_read_only_scan)
+        dialog.cancel_requested.connect(self._scan_controller.request_cancel)
+        self._scan_controller.batch_committed.connect(dialog.add_batch)
+        self._scan_controller.completed.connect(dialog.show_completed)
+        self._scan_controller.cancelled.connect(dialog.show_cancelled)
+        self._scan_controller.failed.connect(dialog.show_failed)
+        self._scan_controller.warning.connect(dialog.show_warning)
+        self._scan_controller.running_changed.connect(dialog.set_running)
+        remembered = self._scan_controller.remembered_root()
+        if remembered is not None:
+            dialog.path_input.setText(str(remembered))
+        dialog.set_running(self._scan_controller.running)
+        self._show_window(dialog)
+
+    def _start_read_only_scan(self, root) -> None:
+        if self._scan_controller is None:
+            return
+        try:
+            self._scan_controller.start_scan(root)
+        except Exception as error:
+            if self._scan_dialog is not None:
+                self._scan_dialog.show_failed(str(error))
+
+    def _replace_music_library(self, records) -> None:
+        self.pages["所有音乐"].replace_data(records)
+
+    def _scan_running_changed(self, running: bool) -> None:
+        if not running and self._close_pending:
+            QTimer.singleShot(0, self.close)
 
     def open_rename(self) -> None:
         self._show_window(RenamePreviewDialog(self))
@@ -134,3 +192,11 @@ class MainWindow(QMainWindow):
         if page.kind == "lyrics":
             return DeleteLyricsConfirmDialog(records, self)
         raise ValueError(f"不支持的页面类型：{page.kind}")
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        if self._scan_controller is not None and self._scan_controller.running:
+            self._close_pending = True
+            self._scan_controller.request_cancel()
+            event.ignore()
+            return
+        super().closeEvent(event)
