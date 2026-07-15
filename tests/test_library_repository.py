@@ -12,6 +12,7 @@ from unittest.mock import patch
 from database import DatabaseConfig, open_database
 from repositories.library_repository import (
     AssetUpsert,
+    IndexBatchItem,
     LibraryRepository,
     RecordNotFoundError,
     RepositoryClosedError,
@@ -258,6 +259,108 @@ class LibraryRepositoryTests(unittest.TestCase):
                 session.id,
                 (ScanItemInput(self.root / "scan" / "bad.mp3", 1, status="duplicate"),),
             )
+
+    def test_index_scan_batch_writes_matching_assets_and_items_together(self) -> None:
+        repository = self.create_repository()
+        session = repository.create_scan_session(mode="audio", source_folder=self.root / "scan")
+        source = self.root / "scan" / "song.MP3"
+
+        records = repository.index_scan_batch(
+            session.id,
+            (IndexBatchItem(source, 12, 34),),
+        )
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].asset.id, repository.get_asset_by_path(source).id)  # type: ignore[union-attr]
+        self.assertEqual(records[0].asset.mtime_ns, 34)
+        self.assertEqual(records[0].scan_item.status, "indexed")
+        self.assertEqual(records[0].scan_item.source_path.as_posix(), records[0].asset.normalized_path)
+
+    def test_index_scan_batch_scan_item_failure_rolls_back_assets_and_items(self) -> None:
+        repository = self.create_repository()
+        session = repository.create_scan_session(mode="audio", source_folder=self.root / "scan")
+        connection = open_database(self.config)
+        try:
+            connection.execute(
+                """
+                CREATE TRIGGER reject_second_scan_item
+                BEFORE INSERT ON scan_items
+                WHEN NEW.source_path LIKE '%reject.mp3'
+                BEGIN
+                    SELECT RAISE(ABORT, 'simulated scan item failure');
+                END
+                """
+            )
+        finally:
+            connection.close()
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            repository.index_scan_batch(
+                session.id,
+                (
+                    IndexBatchItem(self.root / "scan" / "first.mp3", 1, 1),
+                    IndexBatchItem(self.root / "scan" / "reject.mp3", 2, 2),
+                ),
+            )
+
+        self.assertEqual(repository.list_assets(), ())
+        self.assertEqual(repository.list_scan_items(session.id), ())
+
+    @unittest.skipUnless(os.name == "nt", "Windows 组合索引路径等价规则")
+    def test_index_scan_batch_equivalent_paths_roll_back_without_half_rows(self) -> None:
+        repository = self.create_repository()
+        session = repository.create_scan_session(mode="audio", source_folder=self.root / "scan")
+        original = self.root / "Scan" / "Song.MP3"
+        equivalent = Path(os.fspath(original).swapcase().replace("\\", "/"))
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            repository.index_scan_batch(
+                session.id,
+                (IndexBatchItem(original, 1, 1), IndexBatchItem(equivalent, 1, 1)),
+            )
+
+        self.assertEqual(repository.list_assets(), ())
+        self.assertEqual(repository.list_scan_items(session.id), ())
+
+    def test_index_scan_batch_commit_failure_rolls_back_assets_and_items(self) -> None:
+        repository = self.create_repository()
+        session = repository.create_scan_session(mode="audio", source_folder=self.root / "scan")
+        connection = open_database(self.config)
+        try:
+            connection.execute("CREATE TABLE test_commit_parent(id TEXT PRIMARY KEY)")
+            connection.execute(
+                """
+                CREATE TABLE test_commit_guard(
+                    parent_id TEXT REFERENCES test_commit_parent(id)
+                        DEFERRABLE INITIALLY DEFERRED
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TRIGGER fail_index_commit
+                AFTER INSERT ON scan_items
+                BEGIN
+                    INSERT INTO test_commit_guard(parent_id) VALUES ('missing');
+                END
+                """
+            )
+        finally:
+            connection.close()
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            repository.index_scan_batch(
+                session.id,
+                (IndexBatchItem(self.root / "scan" / "commit.mp3", 1, 1),),
+            )
+
+        self.assertEqual(repository.list_assets(), ())
+        self.assertEqual(repository.list_scan_items(session.id), ())
+        connection = open_database(self.config)
+        try:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM test_commit_guard").fetchone()[0], 0)
+        finally:
+            connection.close()
 
     def test_duplicate_scan_item_rolls_back_the_whole_batch(self) -> None:
         repository = self.create_repository()

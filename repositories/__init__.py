@@ -3,6 +3,8 @@
 from .library_repository import (
     AssetRecord,
     AssetUpsert,
+    IndexBatchItem,
+    IndexBatchRecord,
     LibraryRepository,
     RecordNotFoundError,
     RepositoryClosedError,
@@ -19,6 +21,8 @@ from .library_repository import (
 __all__ = [
     "AssetRecord",
     "AssetUpsert",
+    "IndexBatchItem",
+    "IndexBatchRecord",
     "LibraryRepository",
     "RecordNotFoundError",
     "RepositoryClosedError",

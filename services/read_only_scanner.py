@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -18,6 +19,7 @@ class AudioFileEntry:
     relative_path: Path
     extension: str
     size_bytes: int
+    mtime_ns: int
 
 
 class ScanError(Exception):
@@ -34,6 +36,18 @@ class ScanRootError(ScanError):
 
 class ScanAccessError(ScanError):
     """Raised when directory metadata cannot be read safely."""
+
+
+class ScanCancelled(ScanError):
+    """Raised at a cooperative checkpoint when scanning was cancelled."""
+
+
+CancelCallback = Callable[[], bool]
+
+
+def _check_cancelled(cancel_requested: CancelCallback | None) -> None:
+    if cancel_requested is not None and cancel_requested():
+        raise ScanCancelled("扫描已取消")
 
 
 def _absolute_path(path: Path) -> Path:
@@ -74,8 +88,13 @@ def _directory_chain(root: Path, allowed_root: Path) -> list[Path]:
     return chain
 
 
-def _validate_directory_chain(root: Path, allowed_root: Path) -> None:
+def _validate_directory_chain(
+    root: Path,
+    allowed_root: Path,
+    cancel_requested: CancelCallback | None,
+) -> None:
     for directory in _directory_chain(root, allowed_root):
+        _check_cancelled(cancel_requested)
         try:
             metadata = os.lstat(directory)
         except FileNotFoundError as exc:
@@ -88,14 +107,30 @@ def _validate_directory_chain(root: Path, allowed_root: Path) -> None:
             raise ScanRootError(f"路径不是目录：{directory}")
 
 
-def _scan_directory(directory: Path, root: Path, results: list[AudioFileEntry]) -> None:
+def _iter_scan_directory(
+    directory: Path,
+    root: Path,
+    cancel_requested: CancelCallback | None,
+) -> Iterator[AudioFileEntry]:
+    _check_cancelled(cancel_requested)
     try:
         with os.scandir(directory) as iterator:
-            entries = sorted(iterator, key=lambda entry: (entry.name.casefold(), entry.name))
+            entries = []
+            while True:
+                _check_cancelled(cancel_requested)
+                try:
+                    entry = next(iterator)
+                except StopIteration:
+                    break
+                _check_cancelled(cancel_requested)
+                entries.append(entry)
     except OSError as exc:
         raise ScanAccessError(f"无法读取目录：{directory}") from exc
 
+    entries.sort(key=lambda entry: (entry.name.casefold(), entry.name))
+    _check_cancelled(cancel_requested)
     for entry in entries:
+        _check_cancelled(cancel_requested)
         entry_path = directory / entry.name
         try:
             metadata = entry.stat(follow_symlinks=False)
@@ -106,8 +141,10 @@ def _scan_directory(directory: Path, root: Path, results: list[AudioFileEntry]) 
         except OSError as exc:
             raise ScanAccessError(f"无法读取路径信息：{entry_path}") from exc
 
+        _check_cancelled(cancel_requested)
         if is_directory:
-            _scan_directory(entry_path, root, results)
+            _check_cancelled(cancel_requested)
+            yield from _iter_scan_directory(entry_path, root, cancel_requested)
             continue
         if not is_file:
             continue
@@ -115,26 +152,52 @@ def _scan_directory(directory: Path, root: Path, results: list[AudioFileEntry]) 
         extension = Path(entry.name).suffix.casefold()
         if extension not in SUPPORTED_AUDIO_EXTENSIONS:
             continue
-        results.append(
-            AudioFileEntry(
-                path=entry_path,
-                relative_path=entry_path.relative_to(root),
-                extension=extension,
-                size_bytes=int(metadata.st_size),
-            )
+        mtime_ns = int(metadata.st_mtime_ns)
+        if mtime_ns < 0:
+            raise ScanAccessError(f"文件修改时间无效：{entry_path}")
+        result = AudioFileEntry(
+            path=entry_path,
+            relative_path=entry_path.relative_to(root),
+            extension=extension,
+            size_bytes=int(metadata.st_size),
+            mtime_ns=mtime_ns,
         )
+        _check_cancelled(cancel_requested)
+        yield result
 
 
-def enumerate_audio_files(root: Path, *, allowed_root: Path) -> tuple[AudioFileEntry, ...]:
-    """Return supported audio files without following links or reading file content."""
+def iter_audio_files(
+    root: Path,
+    *,
+    allowed_root: Path,
+    cancel_requested: CancelCallback | None = None,
+) -> Iterator[AudioFileEntry]:
+    """Lazily yield supported files with deterministic per-directory ordering."""
 
+    _check_cancelled(cancel_requested)
     absolute_root = _absolute_path(root)
     absolute_allowed_root = _absolute_path(allowed_root)
     _assert_within_boundary(absolute_root, absolute_allowed_root)
-    _validate_directory_chain(absolute_root, absolute_allowed_root)
+    _validate_directory_chain(absolute_root, absolute_allowed_root, cancel_requested)
+    _check_cancelled(cancel_requested)
+    yield from _iter_scan_directory(absolute_root, absolute_root, cancel_requested)
 
-    results: list[AudioFileEntry] = []
-    _scan_directory(absolute_root, absolute_root, results)
+
+def enumerate_audio_files(
+    root: Path,
+    *,
+    allowed_root: Path,
+    cancel_requested: CancelCallback | None = None,
+) -> tuple[AudioFileEntry, ...]:
+    """Return supported audio files without following links or reading file content."""
+
+    results = list(
+        iter_audio_files(
+            root,
+            allowed_root=allowed_root,
+            cancel_requested=cancel_requested,
+        )
+    )
     results.sort(
         key=lambda item: (
             item.relative_path.as_posix().casefold(),

@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import stat
 import subprocess
+import threading
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
@@ -14,9 +15,11 @@ from services.read_only_scanner import (
     SUPPORTED_AUDIO_EXTENSIONS,
     ScanAccessError,
     ScanBoundaryError,
+    ScanCancelled,
     ScanRootError,
     _is_reparse_point,
     enumerate_audio_files,
+    iter_audio_files,
 )
 
 
@@ -65,6 +68,95 @@ class ReadOnlyScannerTests(unittest.TestCase):
         self.assertEqual({item.extension for item in results}, SUPPORTED_AUDIO_EXTENSIONS)
         self.assertEqual(len(results), 6)
 
+    def test_reports_non_negative_mtime_ns_from_file_metadata(self) -> None:
+        path = self.touch("timestamp.mp3")
+        requested_mtime = 1_700_000_000_123_456_700
+        os.utime(path, ns=(requested_mtime, requested_mtime))
+        expected_mtime = int(path.stat().st_mtime_ns)
+
+        result = self.scan()[0]
+
+        self.assertEqual(result.mtime_ns, expected_mtime)
+        self.assertGreaterEqual(result.mtime_ns, 0)
+
+    def test_iter_api_is_lazy_and_cancels_before_directory_access(self) -> None:
+        cancelled = threading.Event()
+        cancelled.set()
+        iterator = iter_audio_files(
+            self.scan_root,
+            allowed_root=self.allowed_root,
+            cancel_requested=cancelled.is_set,
+        )
+
+        with patch("services.read_only_scanner.os.scandir", side_effect=AssertionError("scandir ran")):
+            with self.assertRaises(ScanCancelled):
+                next(iterator)
+
+    def test_iter_api_checks_cancellation_between_yields(self) -> None:
+        self.touch("a.mp3")
+        self.touch("nested/b.flac")
+        cancelled = threading.Event()
+        checks = 0
+
+        def cancel_requested() -> bool:
+            nonlocal checks
+            checks += 1
+            return cancelled.is_set()
+
+        iterator = iter_audio_files(
+            self.scan_root,
+            allowed_root=self.allowed_root,
+            cancel_requested=cancel_requested,
+        )
+        first = next(iterator)
+        cancelled.set()
+
+        with self.assertRaises(ScanCancelled):
+            next(iterator)
+
+        self.assertEqual(first.relative_path.as_posix(), "a.mp3")
+        self.assertGreater(checks, 1)
+
+    def test_scandir_consumption_stops_before_next_entry_after_cancel(self) -> None:
+        cancelled = threading.Event()
+
+        class ControlledScandir:
+            def __init__(self) -> None:
+                self.next_count = 0
+                self.consumed_after_cancel = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback) -> None:
+                return None
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                if cancelled.is_set():
+                    self.consumed_after_cancel = True
+                self.next_count += 1
+                if self.next_count == 2:
+                    cancelled.set()
+                if self.next_count > 3:
+                    raise StopIteration
+                return SimpleNamespace(name=f"entry-{self.next_count}.txt")
+
+        controlled = ControlledScandir()
+        with patch("services.read_only_scanner.os.scandir", return_value=controlled):
+            iterator = iter_audio_files(
+                self.scan_root,
+                allowed_root=self.allowed_root,
+                cancel_requested=cancelled.is_set,
+            )
+            with self.assertRaises(ScanCancelled):
+                next(iterator)
+
+        self.assertEqual(controlled.next_count, 2)
+        self.assertFalse(controlled.consumed_after_cancel)
+
     def test_ignores_unsupported_extensions(self) -> None:
         self.touch("keep.mp3")
         self.touch("ignore.txt")
@@ -84,6 +176,19 @@ class ReadOnlyScannerTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(relative_paths, sorted(relative_paths, key=lambda value: (value.casefold(), value)))
         self.assertTrue(all(item.path.is_absolute() for item in first))
+
+    def test_enumerate_wrapper_restores_global_order_across_file_and_directory(self) -> None:
+        self.touch("a/z.mp3")
+        self.touch("a.mp3")
+
+        first = self.scan()
+        second = self.scan()
+
+        self.assertEqual(first, second)
+        self.assertEqual(
+            [entry.relative_path.as_posix() for entry in first],
+            ["a.mp3", "a/z.mp3"],
+        )
 
     def test_empty_directory_returns_empty_tuple(self) -> None:
         self.assertEqual(self.scan(), ())

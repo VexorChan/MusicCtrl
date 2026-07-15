@@ -108,6 +108,23 @@ class ScanItemRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class IndexBatchItem:
+    """One source file that must update its asset and scan item atomically."""
+
+    canonical_path: Path
+    size_bytes: int
+    mtime_ns: int | None
+    kind: str = "audio"
+    file_state: str = "active"
+
+
+@dataclass(frozen=True, slots=True)
+class IndexBatchRecord:
+    asset: AssetRecord
+    scan_item: ScanItemRecord
+
+
+@dataclass(frozen=True, slots=True)
 class _PreparedAsset:
     canonical_path: Path
     normalized_path: str
@@ -255,6 +272,46 @@ class LibraryRepository:
             updated_at=row["updated_at"],
         )
 
+    def _upsert_prepared_asset(self, item: _PreparedAsset) -> AssetRecord:
+        now = _utc_now()
+        self._connection.execute(
+            """
+            INSERT INTO assets(
+                id, kind, canonical_path, normalized_path, file_name, extension,
+                size_bytes, mtime_ns, file_state, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(normalized_path) DO UPDATE SET
+                kind = excluded.kind,
+                canonical_path = excluded.canonical_path,
+                file_name = excluded.file_name,
+                extension = excluded.extension,
+                size_bytes = excluded.size_bytes,
+                mtime_ns = excluded.mtime_ns,
+                file_state = excluded.file_state,
+                updated_at = excluded.updated_at
+            """,
+            (
+                str(uuid4()),
+                item.kind,
+                os.fspath(item.canonical_path),
+                item.normalized_path,
+                item.file_name,
+                item.extension,
+                item.size_bytes,
+                item.mtime_ns,
+                item.file_state,
+                now,
+                now,
+            ),
+        )
+        row = self._connection.execute(
+            "SELECT * FROM assets WHERE normalized_path = ?",
+            (item.normalized_path,),
+        ).fetchone()
+        if row is None:
+            raise RepositoryDataError("资产写入后无法读取")
+        return self._asset_from_row(row)
+
     def upsert_asset(self, item: AssetUpsert) -> AssetRecord:
         self._require_open_in_owner_thread()
         return self.upsert_assets((item,))[0]
@@ -268,44 +325,7 @@ class LibraryRepository:
         records: list[AssetRecord] = []
         with self._transaction():
             for item in prepared:
-                now = _utc_now()
-                self._connection.execute(
-                    """
-                    INSERT INTO assets(
-                        id, kind, canonical_path, normalized_path, file_name, extension,
-                        size_bytes, mtime_ns, file_state, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(normalized_path) DO UPDATE SET
-                        kind = excluded.kind,
-                        canonical_path = excluded.canonical_path,
-                        file_name = excluded.file_name,
-                        extension = excluded.extension,
-                        size_bytes = excluded.size_bytes,
-                        mtime_ns = excluded.mtime_ns,
-                        file_state = excluded.file_state,
-                        updated_at = excluded.updated_at
-                    """,
-                    (
-                        str(uuid4()),
-                        item.kind,
-                        os.fspath(item.canonical_path),
-                        item.normalized_path,
-                        item.file_name,
-                        item.extension,
-                        item.size_bytes,
-                        item.mtime_ns,
-                        item.file_state,
-                        now,
-                        now,
-                    ),
-                )
-                row = self._connection.execute(
-                    "SELECT * FROM assets WHERE normalized_path = ?",
-                    (item.normalized_path,),
-                ).fetchone()
-                if row is None:
-                    raise RepositoryDataError("资产写入后无法读取")
-                records.append(self._asset_from_row(row))
+                records.append(self._upsert_prepared_asset(item))
         return tuple(records)
 
     def get_asset_by_path(self, canonical_path: Path) -> AssetRecord | None:
@@ -486,6 +506,45 @@ class LibraryRepository:
             reason=row["reason"],
         )
 
+    def _require_running_session(self, session_id: str) -> None:
+        session = self._connection.execute(
+            "SELECT status FROM scan_sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        if session is None:
+            raise RecordNotFoundError(f"扫描会话不存在：{session_id}")
+        if session["status"] != "running":
+            raise RepositoryDataError(f"扫描会话已经结束，不能继续写入条目：{session_id}")
+
+    def _insert_prepared_scan_item(
+        self,
+        session_id: str,
+        item: _PreparedScanItem,
+    ) -> ScanItemRecord:
+        item_id = str(uuid4())
+        self._connection.execute(
+            """
+            INSERT INTO scan_items(
+                id, session_id, source_path, size_bytes, status, reason
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                item_id,
+                session_id,
+                item.normalized_path,
+                item.size_bytes,
+                item.status,
+                item.reason,
+            ),
+        )
+        row = self._connection.execute(
+            "SELECT * FROM scan_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+        if row is None:
+            raise RepositoryDataError("扫描条目写入后无法读取")
+        return self._scan_item_from_row(row)
+
     def add_scan_items(
         self,
         session_id: str,
@@ -497,40 +556,50 @@ class LibraryRepository:
             return ()
         records: list[ScanItemRecord] = []
         with self._transaction():
-            session = self._connection.execute(
-                "SELECT status FROM scan_sessions WHERE id = ?",
-                (session_id,),
-            ).fetchone()
-            if session is None:
-                raise RecordNotFoundError(f"扫描会话不存在：{session_id}")
-            if session["status"] != "running":
-                raise RepositoryDataError(
-                    f"扫描会话已经结束，不能继续写入条目：{session_id}"
-                )
+            self._require_running_session(session_id)
             for item in prepared:
-                item_id = str(uuid4())
-                self._connection.execute(
-                    """
-                    INSERT INTO scan_items(
-                        id, session_id, source_path, size_bytes, status, reason
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        item_id,
-                        session_id,
-                        item.normalized_path,
-                        item.size_bytes,
-                        item.status,
-                        item.reason,
-                    ),
+                records.append(self._insert_prepared_scan_item(session_id, item))
+        return tuple(records)
+
+    def index_scan_batch(
+        self,
+        session_id: str,
+        items: Iterable[IndexBatchItem],
+    ) -> tuple[IndexBatchRecord, ...]:
+        """Atomically upsert assets and insert their matching scan items."""
+
+        self._require_open_in_owner_thread()
+        prepared: list[tuple[_PreparedAsset, _PreparedScanItem]] = []
+        for item in items:
+            if not isinstance(item, IndexBatchItem):
+                raise RepositoryDataError("索引批次必须使用 IndexBatchItem")
+            asset = self._prepare_asset(
+                AssetUpsert(
+                    canonical_path=item.canonical_path,
+                    size_bytes=item.size_bytes,
+                    mtime_ns=item.mtime_ns,
+                    kind=item.kind,
+                    file_state=item.file_state,
                 )
-                row = self._connection.execute(
-                    "SELECT * FROM scan_items WHERE id = ?",
-                    (item_id,),
-                ).fetchone()
-                if row is None:
-                    raise RepositoryDataError("扫描条目写入后无法读取")
-                records.append(self._scan_item_from_row(row))
+            )
+            scan_item = _PreparedScanItem(
+                source_path=asset.canonical_path,
+                normalized_path=asset.normalized_path,
+                size_bytes=asset.size_bytes,
+                status="indexed",
+                reason=None,
+            )
+            prepared.append((asset, scan_item))
+        if not prepared:
+            return ()
+
+        records: list[IndexBatchRecord] = []
+        with self._transaction():
+            self._require_running_session(session_id)
+            for asset, scan_item in prepared:
+                asset_record = self._upsert_prepared_asset(asset)
+                scan_item_record = self._insert_prepared_scan_item(session_id, scan_item)
+                records.append(IndexBatchRecord(asset_record, scan_item_record))
         return tuple(records)
 
     def list_scan_items(self, session_id: str) -> tuple[ScanItemRecord, ...]:
