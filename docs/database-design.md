@@ -1,17 +1,39 @@
 # SQLite 数据库设计
 
-## 1. 设计原则
+## 1. 文档状态与设计原则
 
-- 本设计属于后续正式功能阶段，M1 不创建或写入真实数据库。
-- 文件系统是事实来源；SQLite 保存索引、关系、设置和审计日志。
-- 所有数据库访问必须经过 repository 层。
-- 启用 `PRAGMA foreign_keys = ON`。
-- 正式运行建议使用 WAL 模式，但测试必须验证正常关闭和异常恢复。
+本文同时记录当前已经部署的 P1 v1 schema 和 P2～P7 的目标草案：
+
+- 标记为“P1 v1 已部署”的表、字段、约束、索引和事务已经存在于当前 migration。
+- 标记为“P2～P7 目标草案”的内容尚未落入任何 migration，不得作为当前数据库能力使用。
+- 后续新增正式字段或表时，必须先更新设计、增加连续 migration，并完成升级、回滚和数据保留测试。
+
+通用原则：
+
+- 文件系统是事实来源；SQLite 在 P1 保存只读索引、扫描会话和设置，后续阶段再保存关系和审计信息。
+- 所有数据库访问必须经过 repository 层，UI 不直接连接 SQLite。
+- 数据库路径必须由调用方以绝对 `Path` 显式注入；连接层不选择默认路径，也不创建缺失的父目录。
+- 每个 SQLite 连接和 `LibraryRepository` 只允许创建它们的线程使用和关闭。
+- P1 启用 `PRAGMA foreign_keys = ON` 和显式 `busy_timeout`，使用 autocommit 连接并由 migration/repository 明确控制事务。
+- P1 明确不启用 WAL，保持 SQLite 默认 rollback journal；未来出现并发读写需求时再通过专项测试评估 WAL。
 - 时间统一保存为 UTC ISO 8601 文本。
 - 主键使用应用生成的 UUID 文本，避免依赖跨事务自增编号。
-- 文件级操作结果必须持久化，以支持部分成功、诊断和恢复。
+- 不得通过删除数据库重新初始化正式用户数据。
 
 ## 2. 关系概览
+
+### 2.1 当前已部署：P1 v1
+
+```text
+schema_migrations
+assets
+settings
+scan_sessions ── scan_items
+```
+
+当前唯一持久化外键为 `scan_items.session_id → scan_sessions.id`，删除 session 时级联删除其 scan items。
+
+### 2.2 尚未部署：P2～P7 目标草案
 
 ```text
 assets
@@ -20,55 +42,171 @@ assets
 │   └── playlist_items ── playlists
 ├── backup_entries
 └── operation_items ── operations
-
-scan_sessions ── scan_items
-settings
-schema_migrations
 ```
 
-## 3. 表结构
+以上关系均未存在于当前 v1 schema，必须在对应阶段重新审查并通过新 migration 落地。
 
-### 3.1 schema_migrations
+## 3. 当前已部署的 P1 v1 规范
+
+当前正式 migration 仅包含 v1，共五张表。
+
+### 3.1 schema_migrations（P1 v1 已部署）
 
 记录数据库结构版本。
 
-| 字段 | 类型 | 约束 |
+| 字段 | 类型 | 当前约束 |
 |---|---|---|
 | version | INTEGER | PRIMARY KEY |
 | description | TEXT | 允许为空 |
 | applied_at | TEXT | NOT NULL |
 
-### 3.2 assets
+### 3.2 assets（P1 v1 已部署）
 
-统一表示音频和歌词文件。
+保存音频或歌词文件的只读索引。P1 产品扫描当前只接入音频，但 schema 为后续歌词索引保留 `lyric` 类型。
 
-| 字段 | 类型 | 约束 |
+| 字段 | 类型 | 当前约束 |
 |---|---|---|
-| id | TEXT | PRIMARY KEY |
-| kind | TEXT | audio / lyric |
-| canonical_path | TEXT | NOT NULL，用户可见规范路径 |
-| normalized_path | TEXT | NOT NULL，大小写和分隔符规范后的比较路径 |
-| original_path | TEXT | 初次导入前路径 |
+| id | TEXT | PRIMARY KEY，NOT NULL |
+| kind | TEXT | NOT NULL；audio / lyric |
+| canonical_path | TEXT | NOT NULL；用户可见规范路径 |
+| normalized_path | TEXT | NOT NULL，UNIQUE；用于 Windows 等价路径比较 |
 | file_name | TEXT | NOT NULL |
 | extension | TEXT | NOT NULL |
-| size_bytes | INTEGER | NOT NULL |
-| sha256 | TEXT | 完成计算前允许为空 |
-| mtime_ns | INTEGER | 文件修改时间 |
-| file_state | TEXT | active / missing / backup / external_changed |
-| is_standardized | INTEGER | 0 / 1 |
+| size_bytes | INTEGER | NOT NULL，且 `>= 0` |
+| mtime_ns | INTEGER | 允许为空；非空时 `>= 0` |
+| file_state | TEXT | NOT NULL；active / missing / external_changed |
 | created_at | TEXT | NOT NULL |
 | updated_at | TEXT | NOT NULL |
-| deleted_at | TEXT | 软删除时间 |
 
-索引：
+当前命名索引：
 
-- `UNIQUE(normalized_path)`
-- `INDEX(kind, file_state)`
-- `INDEX(sha256)`
+- `idx_assets_kind_state(kind, file_state)`
 
-### 3.3 audio_tracks
+`original_path`、`sha256`、`backup` 状态、`is_standardized`、`deleted_at` 和 SHA-256 索引均未在 P1 v1 中部署。
 
-| 字段 | 类型 | 约束 |
+### 3.3 settings（P1 v1 已部署）
+
+| 字段 | 类型 | 当前约束 |
+|---|---|---|
+| key | TEXT | PRIMARY KEY，NOT NULL |
+| value_json | TEXT | NOT NULL |
+| updated_at | TEXT | NOT NULL |
+
+- repository 负责标准 JSON 序列化和严格反序列化。
+- 不接受 NaN、Infinity 或无法序列化为标准 JSON 的值。
+- 设置中不得保存密钥、密码或其他凭据。
+
+### 3.4 scan_sessions（P1 v1 已部署）
+
+一次扫描尝试对应一个 session；同一 session 可以包含多个原子索引批次。
+
+| 字段 | 类型 | 当前约束 |
+|---|---|---|
+| id | TEXT | PRIMARY KEY，NOT NULL |
+| mode | TEXT | NOT NULL；audio / lyric |
+| source_folder | TEXT | NOT NULL |
+| status | TEXT | NOT NULL；running / cancelled / completed / failed |
+| started_at | TEXT | NOT NULL |
+| completed_at | TEXT | 允许为空 |
+
+`target_folder` 未在 P1 v1 中部署；它属于后续真实导入流程的目标草案。
+
+### 3.5 scan_items（P1 v1 已部署）
+
+| 字段 | 类型 | 当前约束 |
+|---|---|---|
+| id | TEXT | PRIMARY KEY，NOT NULL |
+| session_id | TEXT | NOT NULL；引用 scan_sessions.id，ON DELETE CASCADE |
+| source_path | TEXT | NOT NULL |
+| size_bytes | INTEGER | 允许为空；非空时 `>= 0` |
+| status | TEXT | NOT NULL；waiting / indexed / skipped / failed |
+| reason | TEXT | 允许为空 |
+
+当前约束和索引：
+
+- `UNIQUE(session_id, source_path)`
+- `idx_scan_items_session(session_id)`
+
+`suggested_path`、`sha256`、`selected` 以及 importable / rename_required / duplicate / conflict 状态均未在 P1 v1 中部署。
+
+## 4. P1 扫描事务边界
+
+1. 每轮扫描先创建一个状态为 running 的 `scan_sessions` 记录。
+2. 一轮扫描可以包含多个索引批次。每个 `index_scan_batch()` 使用独立的 `BEGIN IMMEDIATE`：
+   - 读取并验证 session 的状态、模式和扫描根；
+   - 使用 repository 的权威路径规范化和 `os.path.commonpath` 做组件级根边界检查；
+   - 对同一批次逐项 upsert `assets` 并插入对应 `scan_items`。
+3. 同一批次的 assets 与 scan items 原子提交；任一校验、约束、SQL 或 COMMIT 失败时整批回滚，不允许留下半批资产。
+4. 已成功提交的早期批次，在后续扫描取消或失败时保留。
+5. worker 的终态数量是 `committed_count`，即数据库实际已经提交的 assets/scan items 数量；它不等同于已经发出的 `batch_ready` 数量。
+6. 取消发生在原子批次执行期间时，允许该批次完成并计入 `committed_count`；取消被观察后不再写后续批次，也不再发送该批 `batch_ready`。
+7. cancelled 和 failed 使用独立的 session 终结事务，不执行负向 missing 推导。
+8. audio 扫描完整成功时调用 `complete_scan_and_reconcile()`；missing 更新与当前 session 的 completed 状态在同一个 `BEGIN IMMEDIATE` 事务中提交。
+9. reconciliation 的 SQL 或 COMMIT 失败时，missing 更新和 completed 状态全部回滚，worker 随后将 session 终结为 failed。
+
+P1 不执行复制、移动、重命名、删除、哈希或标签写入，因此数据库事务不涉及真实文件补偿。
+
+## 5. P1 数据库与文件系统重新校准
+
+### 5.1 当前已见文件的状态
+
+索引批次在覆盖资产指纹前先读取旧 `size_bytes` 和 `mtime_ns`，使用 Python 相等比较处理可空 mtime：
+
+- 新路径：`active`。
+- size 与 mtime 均未变化：`active`。
+- 原状态为 missing，且以相同指纹重新出现：`active`。
+- size 或 mtime 任一变化：`external_changed`。
+
+P1 不读取文件内容，也不计算 SHA-256。
+
+### 5.2 成功扫描后的 missing 推导
+
+P1 当前只对 running audio session 执行 reconciliation；“同 mode”在 P1 中即 audio。
+
+1. 从当前 session 的 `source_folder` 生成权威规范化根。
+2. 只选择最近一次同时满足以下条件的历史 session 作为基线：
+   - mode 与当前 reconciliation 模式相同，P1 为 audio；
+   - status 为 completed；
+   - `source_folder` 规范化后与当前根完全相同。
+3. 候选 session 按 `completed_at DESC、started_at DESC、id DESC` 稳定决胜。
+4. cancelled、failed、其他根、相似前缀根和嵌套根均不参与当前根的基线。
+5. 本次与历史 scan items 都按精确 normalized path 集合比较，并再次通过组件级根边界校验；不使用字符串 `LIKE` 或前缀判断限定根。
+6. 上一次成功扫描出现、本次未出现、且资产当前状态为 active 的记录改为 `missing`。
+7. 当前状态为 `external_changed` 的缺席资产保持 `external_changed`。
+8. 没有上一次同根成功基线时，不推导 missing。
+9. missing 只更新状态，不删除资产记录。
+10. missing 更新与当前 session completed 同事务提交，失败时一起回滚。
+
+## 6. P1 migration、备份与 fail-closed 规则
+
+- migration 版本必须从 1 开始连续、唯一、升序，逐版本记录到 `schema_migrations`。
+- 全新数据库文件或真正空的 SQLite 数据库应用 v1 时不创建备份。
+- 没有待执行 migration 时不创建备份。
+- 已有受 MusicCtrl 管理的数据库从 v1 升级到后续版本前，使用 SQLite Backup API 在数据库同目录创建一致性备份。
+- 备份创建后执行 `PRAGMA integrity_check`；备份失败时禁止开始 migration。
+- 每个 migration 使用独立的 `BEGIN IMMEDIATE / COMMIT`，逐条执行 SQL，不使用 `executescript`。
+- migration 失败时回滚当前版本的 DDL 和版本记录；已经成功创建的升级前备份保留，供诊断和恢复。
+- 包含未知表或数据、但没有有效 `schema_migrations` 的非空数据库 fail-closed，不原地初始化，也不删除原数据。
+- migration 历史存在断档、版本高于当前程序支持范围或数据库损坏时 fail-closed。
+- 当前正式 migration 只有 v1；测试中注入的 v2 只用于验证升级备份和回滚机制，不代表已经部署 v2 schema。
+
+## 7. P2～P7 未部署目标草案
+
+以下结构均未存在于当前 v1 数据库。字段、枚举、索引和外键必须在对应阶段重新审查；只有新增连续 migration 并通过升级、回滚和数据保留测试后，才能标记为已部署。
+
+### 7.1 assets 后续扩展（P2、P6、P7 目标草案，未部署）
+
+计划增加：
+
+- `original_path`：初次导入前路径。
+- `sha256`：完成计算前允许为空，并增加 SHA-256 查询索引。
+- `file_state = backup`。
+- `is_standardized`：0 / 1。
+- `deleted_at`：软删除时间。
+
+### 7.2 audio_tracks（P2 目标草案，未部署）
+
+| 字段 | 类型 | 目标约束 |
 |---|---|---|
 | asset_id | TEXT | PRIMARY KEY，引用 assets.id |
 | title | TEXT | 规范歌名 |
@@ -82,9 +220,9 @@ schema_migrations
 | rename_state | TEXT | unchecked / ready / manual / conflict / completed |
 | checked_at | TEXT | 允许为空 |
 
-### 3.4 lyrics_files
+### 7.3 lyrics_files（P4 目标草案，未部署）
 
-| 字段 | 类型 | 约束 |
+| 字段 | 类型 | 目标约束 |
 |---|---|---|
 | asset_id | TEXT | PRIMARY KEY，引用 assets.id |
 | parsed_title | TEXT | 允许为空 |
@@ -93,11 +231,9 @@ schema_migrations
 | match_state | TEXT | unchecked / matched / possible / unmatched / conflict |
 | checked_at | TEXT | 允许为空 |
 
-### 3.5 lyrics_matches
+### 7.4 lyrics_matches（P4 目标草案，未部署）
 
-保存当前匹配和历史匹配。
-
-| 字段 | 类型 | 约束 |
+| 字段 | 类型 | 目标约束 |
 |---|---|---|
 | id | TEXT | PRIMARY KEY |
 | audio_asset_id | TEXT | 引用 audio_tracks.asset_id |
@@ -110,14 +246,14 @@ schema_migrations
 | created_at | TEXT | NOT NULL |
 | updated_at | TEXT | NOT NULL |
 
-约束：
+目标约束：
 
 - 每首音频最多一个当前匹配。
 - 当前外部 LRC 最多绑定一首音频。
-- 检测到内嵌歌词时优先创建 `source_kind = embedded` 的当前状态。
+- 检测到内嵌歌词时优先使用 `source_kind = embedded`。
 - 更换匹配时将旧记录设为非当前，不直接删除历史。
 
-建议使用部分唯一索引：
+目标部分唯一索引：
 
 ```sql
 CREATE UNIQUE INDEX uq_current_lyrics_by_audio
@@ -129,9 +265,9 @@ ON lyrics_matches(lyric_asset_id)
 WHERE is_current = 1 AND lyric_asset_id IS NOT NULL;
 ```
 
-### 3.6 playlists
+### 7.5 playlists（P5 目标草案，未部署）
 
-| 字段 | 类型 | 约束 |
+| 字段 | 类型 | 目标约束 |
 |---|---|---|
 | id | TEXT | PRIMARY KEY |
 | name | TEXT | NOT NULL |
@@ -142,9 +278,9 @@ WHERE is_current = 1 AND lyric_asset_id IS NOT NULL;
 | updated_at | TEXT | NOT NULL |
 | deleted_at | TEXT | 允许为空 |
 
-### 3.7 playlist_items
+### 7.6 playlist_items（P5 目标草案，未部署）
 
-| 字段 | 类型 | 约束 |
+| 字段 | 类型 | 目标约束 |
 |---|---|---|
 | id | TEXT | PRIMARY KEY |
 | playlist_id | TEXT | 引用 playlists.id |
@@ -156,37 +292,19 @@ WHERE is_current = 1 AND lyric_asset_id IS NOT NULL;
 | created_at | TEXT | NOT NULL |
 | updated_at | TEXT | NOT NULL |
 
-约束：`UNIQUE(playlist_id, audio_asset_id)`。
+目标约束：`UNIQUE(playlist_id, audio_asset_id)`。
 
-### 3.8 scan_sessions
+### 7.7 scan_sessions 与 scan_items 后续扩展（P6 目标草案，未部署）
 
-| 字段 | 类型 | 约束 |
-|---|---|---|
-| id | TEXT | PRIMARY KEY |
-| mode | TEXT | audio / lyric |
-| source_folder | TEXT | NOT NULL |
-| target_folder | TEXT | NOT NULL |
-| status | TEXT | running / cancelled / completed / failed |
-| started_at | TEXT | NOT NULL |
-| completed_at | TEXT | 允许为空 |
+计划增加：
 
-### 3.9 scan_items
+- `scan_sessions.target_folder`。
+- `scan_items.suggested_path`、`sha256`、`selected`。
+- importable / rename_required / duplicate / conflict 等导入分析状态。
 
-| 字段 | 类型 | 约束 |
-|---|---|---|
-| id | TEXT | PRIMARY KEY |
-| session_id | TEXT | 引用 scan_sessions.id |
-| source_path | TEXT | NOT NULL |
-| suggested_path | TEXT | 允许为空 |
-| size_bytes | INTEGER | 允许为空 |
-| sha256 | TEXT | 允许为空 |
-| status | TEXT | waiting / importable / rename_required / duplicate / conflict / failed |
-| reason | TEXT | 允许为空 |
-| selected | INTEGER | 0 / 1 |
+### 7.8 operations（P2～P7 目标草案，未部署）
 
-### 3.10 operations
-
-| 字段 | 类型 | 约束 |
+| 字段 | 类型 | 目标约束 |
 |---|---|---|
 | id | TEXT | PRIMARY KEY |
 | operation_type | TEXT | scan / import / rename / match / playlist / delete / restore / undo / purge |
@@ -200,9 +318,9 @@ WHERE is_current = 1 AND lyric_asset_id IS NOT NULL;
 | started_at | TEXT | NOT NULL |
 | completed_at | TEXT | 允许为空 |
 
-### 3.11 operation_items
+### 7.9 operation_items（P2～P7 目标草案，未部署）
 
-| 字段 | 类型 | 约束 |
+| 字段 | 类型 | 目标约束 |
 |---|---|---|
 | id | TEXT | PRIMARY KEY |
 | operation_id | TEXT | 引用 operations.id |
@@ -217,9 +335,9 @@ WHERE is_current = 1 AND lyric_asset_id IS NOT NULL;
 | after_json | TEXT | 操作后快照 |
 | created_at | TEXT | NOT NULL |
 
-### 3.12 backup_entries
+### 7.10 backup_entries（P7 目标草案，未部署）
 
-| 字段 | 类型 | 约束 |
+| 字段 | 类型 | 目标约束 |
 |---|---|---|
 | id | TEXT | PRIMARY KEY |
 | asset_id | TEXT | 引用 assets.id |
@@ -232,38 +350,17 @@ WHERE is_current = 1 AND lyric_asset_id IS NOT NULL;
 | purged_at | TEXT | 允许为空 |
 | created_at | TEXT | NOT NULL |
 
-### 3.13 settings
+## 8. P2～P7 未来事务目标
 
-| 字段 | 类型 | 约束 |
-|---|---|---|
-| key | TEXT | PRIMARY KEY |
-| value_json | TEXT | NOT NULL |
-| updated_at | TEXT | NOT NULL |
+以下规则尚未实现，落地时数据库事务不能替代文件系统回滚，应用层必须维护补偿步骤：
 
-设置中不得保存密钥、密码或其他凭据。
-
-## 4. 事务边界
-
-- 扫描：每个批次一个会话，文件索引可以分批提交，但会话最终状态单独提交。
 - 导入和移动：目标校验成功后，文件状态、操作明细和相关关系在同一个数据库事务中提交。
 - 删除：文件成功进入备份后，才能提交 `assets.file_state = backup` 和 `backup_entries`。
 - 重命名：文件、元数据和快捷方式全部成功时提交成功；部分失败必须保留可恢复的操作明细。
-- 数据库事务不能替代文件系统回滚，应用层必须维护补偿步骤。
+- 歌单快捷方式外部变化：更新未来的 `playlist_items.state`，不自动删除用户新增内容。
 
-## 5. 数据库与文件系统重新校准
+## 9. 当前验证基线
 
-重新扫描时：
-
-1. 路径和文件指纹一致：更新 `mtime_ns` 等非关键字段。
-2. 数据库有记录但文件不存在：标记 `missing`，不直接删除数据库记录。
-3. 路径存在但大小、时间或哈希变化：标记 `external_changed`。
-4. 文件系统出现新文件：创建新索引记录，初始状态为未检查。
-5. 歌单快捷方式外部变化：更新 `playlist_items.state`，不自动删除用户新增内容。
-
-## 6. 迁移与备份
-
-- 每次结构变更必须新增 migration，不得在运行时临时修改表结构。
-- migration 执行前备份数据库文件。
-- migration 必须有升级测试；破坏性变更还必须有数据保留验证。
-- 不允许通过删除数据库重新初始化来处理正式用户数据。
-
+- `tests/test_database.py`：五表、字段约束、命名索引、外键级联、无 WAL、migration 幂等、备份和回滚。
+- `tests/test_library_repository.py`：批次原子性、路径根边界、指纹状态、reconciliation 基线和事务回滚。
+- `tests/test_scan_worker.py`：成功、取消、失败、终态互斥、`committed_count` 及真实两轮 SQLite 重新校准。
