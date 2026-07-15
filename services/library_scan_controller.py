@@ -31,6 +31,14 @@ def asset_to_music_record(
     *,
     allowed_root: Path | None = None,
 ) -> dict[str, object]:
+    stem = Path(asset.file_name).stem
+    title = stem
+    artist = "待识别"
+    if "-" in stem:
+        parsed_title, parsed_artist = (part.strip() for part in stem.rsplit("-", 1))
+        if parsed_title and parsed_artist:
+            title = parsed_title
+            artist = parsed_artist
     status = {
         "active": "未检查",
         "missing": "文件缺失",
@@ -43,8 +51,8 @@ def asset_to_music_record(
         "_size_bytes": asset.size_bytes,
         "_mtime_ns": asset.mtime_ns,
         "_allowed_root": allowed_root,
-        "title": Path(asset.file_name).stem,
-        "artist": "待识别",
+        "title": title,
+        "artist": artist,
         "duration": "—",
         "format": asset.extension.lstrip(".").upper(),
         "size": _human_size(asset.size_bytes),

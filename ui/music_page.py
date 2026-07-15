@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Iterable
 
-from PySide6.QtCore import QPoint, Qt, QTimer, Signal
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QHeaderView,
@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
 
 from mock.data import PLAYLISTS
 from ui.components import make_status_badge
-from ui.tables import DataTable
+from ui.tables import DataTable, ModelDataTable
 
 
 def _normalize(text: str) -> str:
@@ -148,6 +148,98 @@ class PlaylistAddMenu(QMenu):
         self.close()
 
 
+class LibraryTableModel(QAbstractTableModel):
+    """Immutable-record model for the production all-music view."""
+
+    check_state_changed = Signal()
+
+    def __init__(self, *, kind: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.kind = kind
+        self._records: tuple[dict[str, object], ...] = ()
+        self._checked: set[int] = set()
+
+    def columns(self) -> tuple[str, ...]:
+        if self.kind == "lyrics":
+            return ("", "歌名", "歌手", "格式", "大小", "歌词状态")
+        return ("", "歌名", "歌手", "时长", "格式", "大小", "歌词状态")
+
+    def fields(self) -> tuple[str, ...]:
+        if self.kind == "lyrics":
+            return ("title", "artist", "format", "size", "status")
+        return ("title", "artist", "duration", "format", "size", "status")
+
+    def replace_records(self, records: Iterable[dict[str, object]]) -> None:
+        self.beginResetModel()
+        self._records = tuple(dict(record) for record in records)
+        self._checked.clear()
+        self.endResetModel()
+        self.check_state_changed.emit()
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self._records)
+
+    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self.columns())
+
+    def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.ItemDataRole.DisplayRole):
+        if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
+            columns = self.columns()
+            return columns[section] if 0 <= section < len(columns) else None
+        return super().headerData(section, orientation, role)
+
+    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole):
+        if not index.isValid() or not 0 <= index.row() < len(self._records):
+            return None
+        if index.column() == 0:
+            if role == Qt.ItemDataRole.CheckStateRole:
+                return Qt.CheckState.Checked if index.row() in self._checked else Qt.CheckState.Unchecked
+            if role == Qt.ItemDataRole.TextAlignmentRole:
+                return int(Qt.AlignmentFlag.AlignCenter)
+            return None
+        field = self.fields()[index.column() - 1]
+        record = self._records[index.row()]
+        if role == Qt.ItemDataRole.DisplayRole:
+            return str(record.get(field, ""))
+        if role == Qt.ItemDataRole.UserRole:
+            return record.get("_index", index.row())
+        if role == Qt.ItemDataRole.TextAlignmentRole and field in {"duration", "format", "size"}:
+            return int(Qt.AlignmentFlag.AlignCenter)
+        if role == Qt.ItemDataRole.ToolTipRole and field == "status":
+            return str(record.get(field, ""))
+        return None
+
+    def flags(self, index: QModelIndex) -> Qt.ItemFlag:
+        flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+        if index.isValid() and index.column() == 0:
+            flags |= Qt.ItemFlag.ItemIsUserCheckable
+        return flags
+
+    def setData(self, index: QModelIndex, value, role: int = Qt.ItemDataRole.EditRole) -> bool:
+        if not index.isValid() or index.column() != 0 or role != Qt.ItemDataRole.CheckStateRole:
+            return False
+        if Qt.CheckState(value) == Qt.CheckState.Checked:
+            self._checked.add(index.row())
+        else:
+            self._checked.discard(index.row())
+        self.dataChanged.emit(index, index, [Qt.ItemDataRole.CheckStateRole])
+        self.check_state_changed.emit()
+        return True
+
+    def checked_rows(self) -> tuple[int, ...]:
+        return tuple(sorted(self._checked))
+
+    def set_all_checked(self, checked: bool) -> None:
+        self._checked = set(range(len(self._records))) if checked else set()
+        if self._records:
+            self.dataChanged.emit(
+                self.index(0, 0),
+                self.index(len(self._records) - 1, 0),
+                [Qt.ItemDataRole.CheckStateRole],
+            )
+        self.check_state_changed.emit()
+
+
 class LibraryPage(QWidget):
     delete_requested = Signal(list)
     new_playlist_requested = Signal()
@@ -160,12 +252,16 @@ class LibraryPage(QWidget):
         kind: str = "music",
         display_count: int | None = None,
         playlist_name: str | None = None,
+        use_model_view: bool = False,
+        live_mode: bool = False,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("PageRoot")
         self.kind = kind
         self.playlist_name = playlist_name
+        self.use_model_view = bool(use_model_view)
+        self.live_mode = bool(live_mode)
         self.all_data = [dict(item, _index=index) for index, item in enumerate(data)]
         self.visible_data = list(self.all_data)
         self.sort_key: str | None = None
@@ -225,10 +321,18 @@ class LibraryPage(QWidget):
         host = QWidget()
         self.content_stack = QStackedLayout(host)
         self.content_stack.setContentsMargins(0, 0, 0, 0)
-        self.table = DataTable(checkable_header=True)
+        self._table_model: LibraryTableModel | None = None
+        if self.use_model_view:
+            self.table = ModelDataTable(checkable_header=True)
+            self._table_model = LibraryTableModel(kind=self.kind, parent=self.table)
+            self.table.setModel(self._table_model)
+            self._table_model.check_state_changed.connect(self._update_selection_state)
+        else:
+            self.table = DataTable(checkable_header=True)
         self.checkable_header = self.table.require_checkable_header()
-        self.table.itemSelectionChanged.connect(self._update_selection_state)
-        self.table.itemChanged.connect(self._update_selection_state)
+        self.table.selectionModel().selectionChanged.connect(self._update_selection_state)
+        if not self.use_model_view:
+            self.table.itemChanged.connect(self._update_selection_state)
         self.checkable_header.toggle_requested.connect(self._toggle_select_all)
         self.table.horizontalHeader().sectionClicked.connect(self._header_clicked)
         self.table.customContextMenuRequested.connect(self._context_menu)
@@ -290,6 +394,28 @@ class LibraryPage(QWidget):
     def _populate_table(self) -> None:
         columns = self._columns()
         fields = self._field_order()
+        if self._table_model is not None:
+            self.table.clearSelection()
+            self._table_model.replace_records(self.visible_data)
+            header = self.table.horizontalHeader()
+            header.setMinimumSectionSize(40)
+            for column, width in enumerate((44, 230, 190, 76, 72, 84, 136)):
+                self.table.setColumnWidth(column, width)
+            header.setStretchLastSection(False)
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+            header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+            self.content_stack.setCurrentIndex(0 if self.visible_data else 1)
+            if not self.visible_data:
+                self.empty_title.setText("没有找到匹配的歌词" if self.kind == "lyrics" else "没有找到匹配的音乐")
+            if self.sort_key:
+                field_column = self._field_order().index(self.sort_key) + 1
+                order = Qt.SortOrder.DescendingOrder if self.sort_descending else Qt.SortOrder.AscendingOrder
+                header.setSortIndicator(field_column, order)
+                header.setSortIndicatorShown(True)
+            else:
+                header.setSortIndicatorShown(False)
+            self._update_selection_state()
+            return
         self.table.blockSignals(True)
         self.table.clear()
         self.table.setColumnCount(len(columns))
@@ -367,6 +493,8 @@ class LibraryPage(QWidget):
         self._apply_search()
 
     def _checked_rows(self) -> list[int]:
+        if self._table_model is not None:
+            return list(self._table_model.checked_rows())
         rows: list[int] = []
         for row in range(self.table.rowCount()):
             item = self.table.item(row, 0)
@@ -394,7 +522,7 @@ class LibraryPage(QWidget):
     def _update_selection_state(self, *_args) -> None:
         checked_count = len(self._checked_rows())
         count = len(self._selected_rows())
-        row_count = self.table.rowCount()
+        row_count = self._table_model.rowCount() if self._table_model is not None else self.table.rowCount()
         if checked_count == 0 or row_count == 0:
             header_state = Qt.CheckState.Unchecked
         elif checked_count == row_count:
@@ -405,7 +533,8 @@ class LibraryPage(QWidget):
         self.add_button.setEnabled(count > 0 and self.kind == "music")
         self.delete_button.setEnabled(count > 0)
         shown = len(self.visible_data)
-        self.status.setText(f"已选择 {count} 项    ·    当前显示 {shown} 项    ·    仅演示界面，不操作真实文件")
+        suffix = "索引来自用户选择目录" if self.live_mode else "仅演示界面，不操作真实文件"
+        self.status.setText(f"已选择 {count} 项    ·    当前显示 {shown} 项    ·    {suffix}")
 
     def _header_clicked(self, column: int) -> None:
         if column == 0:
@@ -420,6 +549,9 @@ class LibraryPage(QWidget):
 
     def _toggle_select_all(self) -> None:
         all_checked = self.checkable_header.check_state() == Qt.CheckState.Checked
+        if self._table_model is not None:
+            self._table_model.set_all_checked(not all_checked)
+            return
         self.table.blockSignals(True)
         for row in range(self.table.rowCount()):
             self.table.item(row, 0).setCheckState(Qt.CheckState.Unchecked if all_checked else Qt.CheckState.Checked)

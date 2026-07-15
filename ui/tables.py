@@ -6,6 +6,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QHeaderView,
+    QTableView,
     QTableWidget,
 )
 
@@ -95,6 +96,34 @@ class DataTable(QTableWidget):
 
     def checkable_header(self) -> CheckableHeaderView | None:
         return self._checkable_header
+
+    def require_checkable_header(self) -> CheckableHeaderView:
+        if self._checkable_header is None:
+            raise RuntimeError("此表格未启用可勾选表头")
+        return self._checkable_header
+
+
+class ModelDataTable(QTableView):
+    """Model/View table used by the production all-music page."""
+
+    def __init__(self, parent=None, *, checkable_header: bool = False) -> None:
+        super().__init__(parent)
+        self._checkable_header: CheckableHeaderView | None = None
+        if checkable_header:
+            self._checkable_header = CheckableHeaderView(Qt.Orientation.Horizontal, self)
+            self.setHorizontalHeader(self._checkable_header)
+        self.setAlternatingRowColors(True)
+        self.setShowGrid(False)
+        self.setWordWrap(False)
+        self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.verticalHeader().setVisible(False)
+        self.verticalHeader().setDefaultSectionSize(40)
+        self.horizontalHeader().setHighlightSections(False)
+        self.horizontalHeader().setSectionsClickable(True)
+        self.horizontalHeader().setSortIndicatorShown(False)
 
     def require_checkable_header(self) -> CheckableHeaderView:
         if self._checkable_header is None:

@@ -34,11 +34,14 @@ class MainWindow(QMainWindow):
         scan_controller: LibraryScanController | None = None,
         metadata_preview_controller: MetadataPreviewController | None = None,
         safe_rename_controller: SafeRenameController | None = None,
+        *,
+        use_model_view: bool = False,
     ) -> None:
         super().__init__()
         self._scan_controller = scan_controller
         self._metadata_preview_controller = metadata_preview_controller
         self._safe_rename_controller = safe_rename_controller
+        self._use_model_view = bool(use_model_view)
         self._scan_dialog: ReadOnlyScanDialog | None = None
         self._rename_dialog: RenamePreviewDialog | None = None
         self._close_pending = False
@@ -83,7 +86,16 @@ class MainWindow(QMainWindow):
 
         music_data = SONGS if scan_controller is None else []
         music_count = 268 if scan_controller is None else 0
-        self._add_page("所有音乐", LibraryPage("所有音乐", music_data, display_count=music_count))
+        self._add_page(
+            "所有音乐",
+            LibraryPage(
+                "所有音乐",
+                music_data,
+                display_count=music_count,
+                use_model_view=self._use_model_view,
+                live_mode=scan_controller is not None,
+            ),
+        )
         self._add_page("所有歌词", LibraryPage("所有歌词", LYRICS, kind="lyrics", display_count=214))
         display_counts = {"我喜欢的": 62, "粤语": 36, "通勤": 28, "怀旧": 41, "古巨基": 17}
         for name, indices in PLAYLIST_MAP.items():

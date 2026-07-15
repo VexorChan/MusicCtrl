@@ -519,11 +519,12 @@ class P2RenameIntegrationTests(unittest.TestCase):
             self.assertEqual(repository._connection.execute("PRAGMA database_list").fetchone()[2], str(config.path))
         finally:
             repository.close()
-        window_type.assert_called_once_with(
-            scan_controller,
-            metadata_controller,
-            safe_controller,
-        )
+            window_type.assert_called_once_with(
+                scan_controller,
+                metadata_controller,
+                safe_controller,
+                use_model_view=True,
+            )
         window.show.assert_called_once_with()
 
 

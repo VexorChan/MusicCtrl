@@ -67,6 +67,7 @@ def main() -> int:
         controller,
         metadata_preview_controller,
         safe_rename_controller,
+        use_model_view=True,
     )
     window.show()
     return app.exec()

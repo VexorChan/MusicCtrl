@@ -216,6 +216,7 @@ class P2PreviewIntegrationTests(unittest.TestCase):
         self.assertEqual(record["_file_state"], "external_changed")
         self.assertIsInstance(record["_size_bytes"], int)
         self.assertIsInstance(record["_mtime_ns"], int)
+        self.assertEqual((record["title"], record["artist"]), ("标题", "歌手"))
 
     def test_real_a_then_b_scan_roots_support_separate_and_same_batch_preview(self) -> None:
         config = self._database_config()
