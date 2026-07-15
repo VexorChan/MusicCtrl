@@ -15,6 +15,7 @@ from services.metadata_preview import MetadataPreviewController
 from services.safe_rename import SafeRenameController
 from services.playlist_controller import PlaylistController
 from services.safe_import import SafeImportController
+from services.backup_manager import BackupController
 from ui.main_window import MainWindow
 
 
@@ -69,6 +70,11 @@ def main() -> int:
     lyrics_match_controller = LyricsMatchController(database_config)
     playlist_controller = PlaylistController(database_config)
     safe_import_controller = SafeImportController()
+    backup_root = database_config.path.parent / "backups"
+    backup_controller = BackupController(
+        backup_root=backup_root,
+        repository_factory=lambda: LibraryRepository(database_config),
+    )
     window = MainWindow(
         controller,
         metadata_preview_controller,
@@ -76,6 +82,7 @@ def main() -> int:
         lyrics_match_controller,
         playlist_controller,
         safe_import_controller,
+        backup_controller,
         use_model_view=True,
     )
     window.show()

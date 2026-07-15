@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
     QHBoxLayout,
@@ -18,12 +18,16 @@ from ui.tables import DataTable
 
 
 class HistoryDialog(PrototypeDialog):
-    def __init__(self, parent: QWidget | None = None) -> None:
+    restore_requested = Signal(object)
+    cleanup_requested = Signal()
+
+    def __init__(self, parent: QWidget | None = None, *, backup_entries: tuple[object, ...] | None = None) -> None:
         super().__init__("操作历史", (1000, 650), parent)
         root = QVBoxLayout(self)
         root.setContentsMargins(22, 18, 22, 18)
         root.setSpacing(12)
-        root.addWidget(dialog_header("操作历史", "查看模拟操作记录和文件级明细。"))
+        self._live_mode = backup_entries is not None
+        root.addWidget(dialog_header("操作历史", "查看备份记录并恢复文件。" if self._live_mode else "查看模拟操作记录和文件级明细。"))
 
         filters = QHBoxLayout()
         group = QButtonGroup(self)
@@ -41,14 +45,25 @@ class HistoryDialog(PrototypeDialog):
         self.table = DataTable()
         self.table.setColumnCount(5)
         self.table.setHorizontalHeaderLabels(["时间", "操作类型", "成功数量", "失败数量", "状态"])
-        self.table.setRowCount(len(HISTORY))
+        rows = HISTORY if backup_entries is None else tuple(backup_entries)
+        self.table.setRowCount(len(rows))
         self.table.setColumnWidth(0, 170)
         self.table.horizontalHeader().setSectionResizeMode(1, self.table.horizontalHeader().ResizeMode.Stretch)
         self.table.setColumnWidth(2, 100)
         self.table.setColumnWidth(3, 100)
         self.table.setColumnWidth(4, 130)
-        for row, record in enumerate(HISTORY):
-            for col, value in enumerate(record):
+        for row, record in enumerate(rows):
+            if self._live_mode:
+                values = (
+                    getattr(record, "created_at", ""),
+                    "备份删除" if getattr(record, "restored_at", None) is None else "已恢复",
+                    1,
+                    0,
+                    "可恢复" if getattr(record, "restored_at", None) is None else "已恢复",
+                )
+            else:
+                values = record
+            for col, value in enumerate(values):
                 item = QTableWidgetItem("" if col == 4 else str(value))
                 if col in {2, 3}:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -56,8 +71,11 @@ class HistoryDialog(PrototypeDialog):
                     item.setData(Qt.ItemDataRole.UserRole, value)
                     item.setToolTip(str(value))
                 self.table.setItem(row, col, item)
-            self.table.setCellWidget(row, 4, make_status_badge(record[4]))
-        self.table.selectRow(0)
+            self.table.setCellWidget(row, 4, make_status_badge(values[4]))
+            if self._live_mode:
+                self.table.item(row, 0).setData(Qt.ItemDataRole.UserRole, getattr(record, "id", ""))
+        if rows:
+            self.table.selectRow(0)
         root.addWidget(self.table, 1)
 
         detail = QWidget()
@@ -78,11 +96,29 @@ class HistoryDialog(PrototypeDialog):
         root.addWidget(detail)
 
         footer = QHBoxLayout()
-        undo = QPushButton("撤销导入")
-        undo.setToolTip("仅最近一次完整导入记录可撤销")
-        footer.addWidget(undo)
+        self.undo = QPushButton("恢复所选备份" if self._live_mode else "撤销导入")
+        self.undo.setToolTip("恢复时遇到同名文件绝不覆盖" if self._live_mode else "仅最近一次完整导入记录可撤销")
+        self.undo.clicked.connect(self._request_restore)
+        footer.addWidget(self.undo)
+        if self._live_mode:
+            cleanup = QPushButton("清理到期备份")
+            cleanup.setObjectName("DangerButton")
+            cleanup.clicked.connect(self.cleanup_requested)
+            footer.addWidget(cleanup)
         footer.addStretch(1)
         close = QPushButton("关闭")
         close.clicked.connect(self.close)
         footer.addWidget(close)
         root.addLayout(footer)
+
+    def _request_restore(self) -> None:
+        if not self._live_mode:
+            return
+        rows = sorted({index.row() for index in self.table.selectionModel().selectedRows()})
+        ids = tuple(
+            str(self.table.item(row, 0).data(Qt.ItemDataRole.UserRole))
+            for row in rows
+            if self.table.item(row, 0) is not None
+        )
+        if ids:
+            self.restore_requested.emit(ids)

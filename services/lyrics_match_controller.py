@@ -330,6 +330,12 @@ class LyricsMatchController(QObject):
         repository = self._open_repository()
         try:
             assets = repository.list_assets(kind="lyric")
+            setting = repository.get_setting(LAST_SUCCESSFUL_LYRICS_ROOT_KEY)
+            allowed_root = (
+                Path(setting.value)
+                if setting is not None and isinstance(setting.value, str) and Path(setting.value).is_absolute()
+                else None
+            )
             matched_ids = {
                 item.lyric_asset_id
                 for item in repository.list_lyrics_matches(current_only=True)
@@ -342,6 +348,8 @@ class LyricsMatchController(QObject):
                     {
                         "_asset_id": asset.id,
                         "_canonical_path": asset.canonical_path,
+                        "_allowed_root": allowed_root,
+                        "_file_state": asset.file_state,
                         "title": title,
                         "artist": artist or "待识别",
                         "format": asset.extension.lstrip(".").upper(),

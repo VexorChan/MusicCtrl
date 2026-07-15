@@ -27,10 +27,12 @@ if TYPE_CHECKING:
     from services.safe_rename import SafeRenameController
     from services.playlist_controller import PlaylistController
     from services.safe_import import SafeImportController
+    from services.backup_manager import BackupController
 
 from services.metadata_preview import MetadataPreviewInput
 from services.safe_rename import SafeRenameInput
 from services.playlist_controller import PlaylistAudioInput, PlaylistRemovalInput, PlaylistRetargetInput
+from services.backup_manager import BackupInput
 
 
 class MainWindow(QMainWindow):
@@ -42,6 +44,7 @@ class MainWindow(QMainWindow):
         lyrics_match_controller: LyricsMatchController | None = None,
         playlist_controller: PlaylistController | None = None,
         safe_import_controller: SafeImportController | None = None,
+        backup_controller: BackupController | None = None,
         *,
         use_model_view: bool = False,
     ) -> None:
@@ -52,15 +55,18 @@ class MainWindow(QMainWindow):
         self._lyrics_match_controller = lyrics_match_controller
         self._playlist_controller = playlist_controller
         self._safe_import_controller = safe_import_controller
+        self._backup_controller = backup_controller
         self._use_model_view = bool(use_model_view)
         self._scan_dialog: ReadOnlyScanDialog | None = None
         self._import_dialog: ImportDialog | None = None
         self._rename_dialog: RenamePreviewDialog | None = None
         self._lyrics_dialog: LyricsMatchDialog | None = None
+        self._history_dialog: HistoryDialog | None = None
         self._close_pending = False
         self._metadata_inputs_by_asset: dict[str, MetadataPreviewInput] = {}
         self._metadata_results_by_asset: dict[str, object] = {}
         self._playlist_add_queue: list[tuple[str, tuple[PlaylistAudioInput, ...]]] = []
+        self._pending_backup_roots: list[tuple[str, Path]] = []
         self.setWindowTitle("乐库整理助手")
         app = QApplication.instance()
         if app is not None and not app.windowIcon().isNull():
@@ -170,6 +176,10 @@ class MainWindow(QMainWindow):
             safe_import_controller.cancelled.connect(self._safe_import_cancelled)
             safe_import_controller.failed.connect(self._safe_import_failed)
             safe_import_controller.running_changed.connect(self._safe_import_running_changed)
+        if backup_controller is not None:
+            backup_controller.completed.connect(self._backup_completed)
+            backup_controller.failed.connect(self._backup_failed)
+            backup_controller.running_changed.connect(self._background_running_changed)
 
     def _add_page(self, key: str, page: LibraryPage) -> None:
         self.pages[key] = page
@@ -635,7 +645,54 @@ class MainWindow(QMainWindow):
             self._lyrics_dialog.show_warning(f"无法取消歌词匹配：{error}")
 
     def open_history(self) -> None:
-        self._show_window(HistoryDialog(self))
+        if self._history_dialog is not None:
+            self._history_dialog.show()
+            self._history_dialog.raise_()
+            return
+        if self._backup_controller is None:
+            self._show_window(HistoryDialog(self))
+            return
+        try:
+            dialog = HistoryDialog(self, backup_entries=self._backup_controller.list_entries())
+        except Exception as error:
+            current = self.stack.currentWidget()
+            if isinstance(current, LibraryPage):
+                current.status.setText(f"无法读取备份历史：{error}")
+            return
+        self._history_dialog = dialog
+        dialog.destroyed.connect(lambda: setattr(self, "_history_dialog", None))
+        dialog.restore_requested.connect(self._restore_backups)
+        dialog.cleanup_requested.connect(self._cleanup_backups)
+        self._show_window(dialog)
+
+    def _restore_backups(self, entry_ids: object) -> None:
+        if self._backup_controller is None or not isinstance(entry_ids, tuple):
+            return
+        try:
+            self._backup_controller.start_restore(entry_ids)
+        except Exception as error:
+            current = self.stack.currentWidget()
+            if isinstance(current, LibraryPage):
+                current.status.setText(f"无法恢复备份：{error}")
+
+    def _cleanup_backups(self) -> None:
+        if self._backup_controller is None:
+            return
+        answer = QMessageBox.warning(
+            self._history_dialog,
+            "确认永久清理",
+            "将永久删除超过 7 天且尚未恢复的备份文件。此操作不可撤销，是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self._backup_controller.start_cleanup(retention_days=7)
+        except Exception as error:
+            current = self.stack.currentWidget()
+            if isinstance(current, LibraryPage):
+                current.status.setText(f"无法清理备份：{error}")
 
     def open_settings(self) -> None:
         self._show_window(SettingsDialog(self))
@@ -787,6 +844,53 @@ class MainWindow(QMainWindow):
                 self._playlist_controller.start_remove(page.playlist_name, items)
             except Exception as error:
                 page.status.setText(f"无法从歌单移除：{error}")
+        elif self._backup_controller is not None and page.kind in {"music", "lyrics"}:
+            try:
+                items = tuple(self._backup_input(record, page.kind) for record in records)
+                self._pending_backup_roots = list(
+                    dict.fromkeys((item.kind, item.allowed_root) for item in items)
+                )
+                self._backup_controller.start_backup(items)
+            except Exception as error:
+                page.status.setText(f"无法备份删除：{error}")
+
+    @staticmethod
+    def _backup_input(record: dict[str, object], kind: str) -> BackupInput:
+        allowed_root = record.get("_allowed_root")
+        path = record.get("_canonical_path")
+        asset_id = record.get("_asset_id")
+        if not isinstance(asset_id, str) or not isinstance(path, Path) or not isinstance(allowed_root, Path):
+            raise ValueError("所选记录缺少可验证的扫描来源，请重新扫描")
+        if record.get("_file_state", "active") != "active":
+            raise ValueError("只允许备份删除 active 文件")
+        return BackupInput(asset_id, path, allowed_root, "audio" if kind == "music" else "lyric")
+
+    def _backup_completed(self, result: object) -> None:
+        message = f"已安全移入备份 {getattr(result, 'success_count', 0)} 项，失败 {getattr(result, 'failure_count', 0)} 项"
+        current = self.stack.currentWidget()
+        if isinstance(current, LibraryPage):
+            current.status.setText(message)
+        if self._history_dialog is not None:
+            self._history_dialog.close()
+        roots = tuple(self._pending_backup_roots)
+        self._pending_backup_roots.clear()
+        for kind, root in roots:
+            try:
+                if kind == "audio" and self._scan_controller is not None and not self._scan_controller.running:
+                    self._scan_controller.start_scan(root)
+                    break
+                if kind == "lyric" and self._lyrics_match_controller is not None and not self._lyrics_match_controller.running:
+                    self._lyrics_match_controller.start_scan(root)
+                    break
+            except Exception as error:
+                if isinstance(current, LibraryPage):
+                    current.status.setText(f"{message}；索引刷新失败：{error}")
+
+    def _backup_failed(self, message: str) -> None:
+        self._pending_backup_roots.clear()
+        current = self.stack.currentWidget()
+        if isinstance(current, LibraryPage):
+            current.status.setText(f"备份删除失败：{message}")
 
     def _create_delete_dialog(self, page: LibraryPage, records: list[dict]) -> QDialog:
         if page.playlist_name:
@@ -812,6 +916,8 @@ class MainWindow(QMainWindow):
                 self._playlist_controller.request_cancel()
             if self._safe_import_controller is not None and self._safe_import_controller.running:
                 self._safe_import_controller.request_cancel()
+            if self._backup_controller is not None and self._backup_controller.running:
+                self._backup_controller.request_cancel()
             event.ignore()
             return
         super().closeEvent(event)
@@ -838,5 +944,9 @@ class MainWindow(QMainWindow):
             or (
                 self._safe_import_controller is not None
                 and self._safe_import_controller.running
+            )
+            or (
+                self._backup_controller is not None
+                and self._backup_controller.running
             )
         )
