@@ -379,8 +379,17 @@ class LibraryPage(QWidget):
         rows.update(self._checked_rows())
         return sorted(rows)
 
-    def _selected_records(self) -> list[dict]:
-        return [self.visible_data[row] for row in self._selected_rows() if row < len(self.visible_data)]
+    def selected_records(self) -> tuple[dict[str, object], ...]:
+        """Return a frozen-by-copy snapshot of the visible selection union."""
+
+        return tuple(
+            dict(self.visible_data[row])
+            for row in self._selected_rows()
+            if row < len(self.visible_data)
+        )
+
+    def _selected_records(self) -> list[dict[str, object]]:
+        return list(self.selected_records())
 
     def _update_selection_state(self, *_args) -> None:
         checked_count = len(self._checked_rows())

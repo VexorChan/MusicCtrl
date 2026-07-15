@@ -735,6 +735,201 @@ class LibraryRepositoryTests(unittest.TestCase):
         self.assertTrue(all(isinstance(error, RepositoryThreadError) for error in errors))
         self.assertEqual(repository.list_assets(), ())
 
+    def test_latest_completed_audio_roots_choose_latest_stable_candidate_per_asset(self) -> None:
+        repository = self.create_repository()
+        root_a = self.root / "A"
+        nested_a = root_a / "Nested"
+        root_b = self.root / "B"
+        nested_asset = repository.upsert_asset(AssetUpsert(nested_a / "song.mp3", 1, 1))
+        a_asset = repository.upsert_asset(AssetUpsert(root_a / "a.mp3", 1, 1))
+        b_asset = repository.upsert_asset(AssetUpsert(root_b / "b.mp3", 1, 1))
+        no_history = repository.upsert_asset(AssetUpsert(root_b / "no-history.mp3", 1, 1))
+
+        old_a, _ = self.index_completed_session(
+            repository,
+            root_a,
+            (("Nested/song.mp3", 1, 1), ("a.mp3", 1, 1)),
+        )
+        b_session, _ = self.index_completed_session(repository, root_b, (("b.mp3", 1, 1),))
+        latest_nested, _ = self.index_completed_session(repository, nested_a, (("song.mp3", 1, 1),))
+        for session_id, day in ((old_a.id, 1), (b_session.id, 2), (latest_nested.id, 3)):
+            repository._connection.execute(
+                "UPDATE scan_sessions SET started_at = ?, completed_at = ? WHERE id = ?",
+                (f"2026-01-0{day}T00:00:00Z", f"2026-01-0{day}T00:00:01Z", session_id),
+            )
+
+        roots = repository.latest_completed_audio_roots(
+            (nested_asset.id, a_asset.id, b_asset.id, nested_asset.id, no_history.id)
+        )
+
+        self.assertEqual(roots[nested_asset.id], nested_a)
+        self.assertEqual(roots[a_asset.id], root_a)
+        self.assertEqual(roots[b_asset.id], root_b)
+        self.assertNotIn(no_history.id, roots)
+        self.assertEqual(set(roots), {nested_asset.id, a_asset.id, b_asset.id})
+
+    def test_latest_completed_audio_roots_order_by_completed_started_then_id(self) -> None:
+        repository = self.create_repository()
+        broad_root = self.root / "order"
+        narrow_root = broad_root / "nested"
+        asset = repository.upsert_asset(AssetUpsert(narrow_root / "song.mp3", 1, 1))
+        broad, _ = self.index_completed_session(
+            repository,
+            broad_root,
+            (("nested/song.mp3", 1, 1),),
+        )
+        narrow, _ = self.index_completed_session(repository, narrow_root, (("song.mp3", 1, 1),))
+
+        repository._connection.execute(
+            "UPDATE scan_sessions SET started_at = ?, completed_at = ? WHERE id = ?",
+            ("2026-01-01T00:00:00Z", "2026-01-03T00:00:00Z", broad.id),
+        )
+        repository._connection.execute(
+            "UPDATE scan_sessions SET started_at = ?, completed_at = ? WHERE id = ?",
+            ("2026-01-02T00:00:00Z", "2026-01-02T00:00:00Z", narrow.id),
+        )
+        self.assertEqual(repository.latest_completed_audio_roots((asset.id,))[asset.id], broad_root)
+
+        repository._connection.execute(
+            "UPDATE scan_sessions SET completed_at = ? WHERE id IN (?, ?)",
+            ("2026-01-03T00:00:00Z", broad.id, narrow.id),
+        )
+        self.assertEqual(repository.latest_completed_audio_roots((asset.id,))[asset.id], narrow_root)
+
+        repository._connection.execute(
+            "UPDATE scan_sessions SET started_at = ? WHERE id IN (?, ?)",
+            ("2026-01-02T00:00:00Z", broad.id, narrow.id),
+        )
+        expected_root = narrow_root if narrow.id > broad.id else broad_root
+        self.assertEqual(repository.latest_completed_audio_roots((asset.id,))[asset.id], expected_root)
+
+    def test_latest_completed_audio_roots_filter_mode_terminal_item_status_and_kind(self) -> None:
+        repository = self.create_repository()
+        root = self.root / "filters"
+        paths = {
+            name: root / f"{name}.mp3"
+            for name in ("cancelled", "failed", "running", "lyric", "waiting", "valid")
+        }
+        assets = {
+            name: repository.upsert_asset(AssetUpsert(path, 1, 1))
+            for name, path in paths.items()
+        }
+
+        for status in ("cancelled", "failed"):
+            session = repository.create_scan_session(mode="audio", source_folder=root)
+            repository.index_scan_batch(session.id, (IndexBatchItem(paths[status], 1, 1),))
+            repository.finish_scan_session(session.id, status=status)
+        running = repository.create_scan_session(mode="audio", source_folder=root)
+        repository.index_scan_batch(running.id, (IndexBatchItem(paths["running"], 1, 1),))
+        lyric = repository.create_scan_session(mode="lyric", source_folder=root)
+        repository.add_scan_items(lyric.id, (ScanItemInput(paths["lyric"], 1, status="indexed"),))
+        repository.finish_scan_session(lyric.id, status="completed")
+        waiting = repository.create_scan_session(mode="audio", source_folder=root)
+        repository.add_scan_items(waiting.id, (ScanItemInput(paths["waiting"], 1, status="waiting"),))
+        repository.finish_scan_session(waiting.id, status="completed")
+        self.index_completed_session(repository, root, (("valid.mp3", 1, 1),))
+        lyric_asset = repository.upsert_asset(AssetUpsert(root / "lyrics.lrc", 1, 1, kind="lyric"))
+
+        roots = repository.latest_completed_audio_roots(
+            tuple(asset.id for asset in assets.values()) + (lyric_asset.id, "missing-asset")
+        )
+
+        self.assertEqual(roots, {assets["valid"].id: root})
+        with self.assertRaises(RepositoryDataError):
+            repository.latest_completed_audio_roots(("",))
+        with self.assertRaises(RepositoryDataError):
+            repository.latest_completed_audio_roots((123,))  # type: ignore[arg-type]
+
+    @unittest.skipUnless(os.name == "nt", "Windows 路径规范化与跨盘规则")
+    def test_latest_completed_audio_roots_accept_equivalent_windows_paths_and_reject_cross_drive(self) -> None:
+        repository = self.create_repository()
+        root = self.root / "CaseRoot"
+        path = root / "Song.MP3"
+        asset = repository.upsert_asset(AssetUpsert(path, 1, 1))
+        session, _ = self.index_completed_session(repository, root, (("Song.MP3", 1, 1),))
+        repository._connection.execute(
+            "UPDATE scan_sessions SET source_folder = ? WHERE id = ?",
+            (os.fspath(root).swapcase().replace("\\", "/"), session.id),
+        )
+        repository._connection.execute(
+            "UPDATE scan_items SET source_path = ? WHERE session_id = ?",
+            (os.fspath(path).swapcase().replace("\\", "/"), session.id),
+        )
+        roots = repository.latest_completed_audio_roots((asset.id,))
+        self.assertEqual(os.path.normcase(os.fspath(roots[asset.id])), os.path.normcase(os.fspath(root)))
+
+        current_drive = root.drive.casefold()
+        other_drive = next(drive for drive in ("Z:", "Y:", "X:") if drive.casefold() != current_drive)
+        escaped_path = Path(other_drive + "\\escape.mp3")
+        escaped_asset = repository.upsert_asset(AssetUpsert(escaped_path, 1, 1))
+        corrupt = repository.create_scan_session(mode="audio", source_folder=root)
+        repository.finish_scan_session(corrupt.id, status="completed")
+        repository._connection.execute(
+            "INSERT INTO scan_items(id, session_id, source_path, size_bytes, status) VALUES (?, ?, ?, ?, ?)",
+            ("cross-drive-item", corrupt.id, escaped_asset.normalized_path, 1, "indexed"),
+        )
+        with self.assertRaises(RepositoryDataError):
+            repository.latest_completed_audio_roots((escaped_asset.id,))
+
+    def test_latest_completed_audio_roots_fail_closed_for_corrupt_root_or_root2_escape(self) -> None:
+        repository = self.create_repository()
+        root = self.root / "Root"
+        root2 = self.root / "Root2"
+        path = root2 / "escape.mp3"
+        asset = repository.upsert_asset(AssetUpsert(path, 1, 1))
+        session, _ = self.index_completed_session(repository, root2, (("escape.mp3", 1, 1),))
+
+        repository._connection.execute(
+            "UPDATE scan_sessions SET source_folder = ? WHERE id = ?",
+            (str(root), session.id),
+        )
+        with self.assertRaises(RepositoryDataError):
+            repository.latest_completed_audio_roots((asset.id,))
+
+        repository._connection.execute(
+            "UPDATE scan_sessions SET source_folder = ? WHERE id = ?",
+            ("relative/root", session.id),
+        )
+        with self.assertRaises(RepositoryDataError):
+            repository.latest_completed_audio_roots((asset.id,))
+
+    def test_latest_completed_audio_roots_is_read_only_single_connection_and_thread_owned(self) -> None:
+        repository = self.create_repository()
+        root = self.root / "readonly"
+        asset = repository.upsert_asset(AssetUpsert(root / "song.mp3", 1, 1))
+        self.index_completed_session(repository, root, (("song.mp3", 1, 1),))
+        changes_before = repository._connection.total_changes
+        statements: list[str] = []
+        repository._connection.set_trace_callback(statements.append)
+        try:
+            with patch(
+                "repositories.library_repository.open_database",
+                side_effect=AssertionError("不得创建第二连接"),
+            ):
+                self.assertEqual(
+                    repository.latest_completed_audio_roots((asset.id, asset.id)),
+                    {asset.id: root},
+                )
+        finally:
+            repository._connection.set_trace_callback(None)
+        self.assertEqual(repository._connection.total_changes, changes_before)
+        self.assertTrue(statements)
+        self.assertTrue(all(statement.lstrip().upper().startswith("SELECT") for statement in statements))
+
+        errors: list[BaseException] = []
+
+        def cross_thread() -> None:
+            try:
+                repository.latest_completed_audio_roots((asset.id,))
+            except BaseException as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=cross_thread)
+        thread.start()
+        thread.join()
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], RepositoryThreadError)
+
     def test_closed_repository_rejects_all_further_use(self) -> None:
         repository = self.create_repository()
         repository.close()

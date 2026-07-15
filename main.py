@@ -9,6 +9,7 @@ from PySide6.QtWidgets import QApplication
 
 from database import DatabaseConfig
 from services.library_scan_controller import LibraryScanController
+from services.metadata_preview import MetadataPreviewController
 from ui.main_window import MainWindow
 
 
@@ -55,7 +56,8 @@ def build_production_database_config() -> DatabaseConfig:
 def main() -> int:
     app = build_app()
     controller = LibraryScanController(build_production_database_config())
-    window = MainWindow(controller)
+    metadata_preview_controller = MetadataPreviewController()
+    window = MainWindow(controller, metadata_preview_controller)
     window.show()
     return app.exec()
 

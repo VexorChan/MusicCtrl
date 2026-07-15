@@ -26,13 +26,23 @@ def _human_size(size_bytes: int) -> str:
     return f"{size_bytes} B"
 
 
-def asset_to_music_record(asset: AssetRecord) -> dict[str, str]:
+def asset_to_music_record(
+    asset: AssetRecord,
+    *,
+    allowed_root: Path | None = None,
+) -> dict[str, object]:
     status = {
         "active": "未检查",
         "missing": "文件缺失",
         "external_changed": "外部变化",
     }.get(asset.file_state, "未检查")
     return {
+        "_asset_id": asset.id,
+        "_canonical_path": asset.canonical_path,
+        "_file_state": asset.file_state,
+        "_size_bytes": asset.size_bytes,
+        "_mtime_ns": asset.mtime_ns,
+        "_allowed_root": allowed_root,
         "title": Path(asset.file_name).stem,
         "artist": "待识别",
         "duration": "—",
@@ -65,10 +75,15 @@ class LibraryScanController(QObject):
     def _open_repository(self) -> LibraryRepository:
         return LibraryRepository(self._database_config)
 
-    def load_library(self) -> tuple[dict[str, str], ...]:
+    def load_library(self) -> tuple[dict[str, object], ...]:
         repository = self._open_repository()
         try:
-            return tuple(asset_to_music_record(asset) for asset in repository.list_assets(kind="audio"))
+            assets = repository.list_assets(kind="audio")
+            roots = repository.latest_completed_audio_roots(asset.id for asset in assets)
+            return tuple(
+                asset_to_music_record(asset, allowed_root=roots.get(asset.id))
+                for asset in assets
+            )
         finally:
             repository.close()
 

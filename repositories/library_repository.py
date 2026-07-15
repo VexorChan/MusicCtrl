@@ -410,6 +410,102 @@ class LibraryRepository:
         ).fetchall()
         return tuple(self._asset_from_row(row) for row in rows)
 
+    def latest_completed_audio_roots(
+        self,
+        asset_ids: Iterable[str],
+    ) -> dict[str, Path]:
+        """Return each audio asset's latest trustworthy completed scan root.
+
+        The provenance is reconstructed from the existing scan history.  This
+        method deliberately performs no writes and does not fall back to an
+        asset's parent directory when history is absent or invalid.
+        """
+
+        self._require_open_in_owner_thread()
+        requested: list[str] = []
+        seen_ids: set[str] = set()
+        for asset_id in asset_ids:
+            if not isinstance(asset_id, str) or not asset_id.strip():
+                raise RepositoryDataError("asset_id 必须是非空字符串")
+            if asset_id not in seen_ids:
+                requested.append(asset_id)
+                seen_ids.add(asset_id)
+        if not requested:
+            return {}
+
+        placeholders = ", ".join("?" for _ in requested)
+        asset_rows = self._connection.execute(
+            f"""
+            SELECT id, kind, canonical_path, normalized_path
+            FROM assets
+            WHERE id IN ({placeholders})
+            """,
+            requested,
+        ).fetchall()
+        normalized_to_ids: dict[str, list[str]] = {}
+        for row in asset_rows:
+            if row["kind"] != "audio":
+                continue
+            try:
+                _, normalized_path = _canonicalize_path(
+                    Path(row["canonical_path"]),
+                    field_name="assets.canonical_path",
+                )
+            except (RepositoryError, TypeError, ValueError) as exc:
+                raise RepositoryDataError("资产路径记录损坏，无法确认扫描来源") from exc
+            if normalized_path != row["normalized_path"]:
+                raise RepositoryDataError("资产规范路径记录不一致，无法确认扫描来源")
+            normalized_to_ids.setdefault(normalized_path, []).append(row["id"])
+
+        if not normalized_to_ids:
+            return {}
+
+        candidate_rows = self._connection.execute(
+            """
+            SELECT
+                si.source_path,
+                ss.id AS session_id,
+                ss.source_folder,
+                ss.started_at,
+                ss.completed_at
+            FROM scan_items AS si
+            JOIN scan_sessions AS ss ON ss.id = si.session_id
+            WHERE ss.mode = 'audio'
+              AND ss.status = 'completed'
+              AND si.status = 'indexed'
+            ORDER BY ss.completed_at DESC, ss.started_at DESC, ss.id DESC
+            """
+        ).fetchall()
+
+        roots: dict[str, Path] = {}
+        for row in candidate_rows:
+            if not isinstance(row["started_at"], str) or not row["started_at"]:
+                raise RepositoryDataError("扫描会话开始时间损坏，无法确认资产来源")
+            if not isinstance(row["completed_at"], str) or not row["completed_at"]:
+                raise RepositoryDataError("已完成扫描会话缺少完成时间")
+            try:
+                source_path, normalized_source = _canonicalize_path(
+                    Path(row["source_path"]),
+                    field_name="scan_items.source_path",
+                )
+                source_root, normalized_root = _canonicalize_path(
+                    Path(row["source_folder"]),
+                    field_name="scan_sessions.source_folder",
+                )
+                _require_path_within_root(
+                    normalized_source,
+                    normalized_root,
+                    field_name="扫描条目路径",
+                )
+            except (RepositoryError, TypeError, ValueError) as exc:
+                raise RepositoryDataError("扫描来源记录损坏，无法安全授权资产路径") from exc
+            matching_ids = normalized_to_ids.get(normalized_source)
+            if not matching_ids:
+                continue
+            for asset_id in matching_ids:
+                roots.setdefault(asset_id, source_root)
+        return roots
+
     def set_setting(self, key: str, value: object) -> SettingRecord:
         self._require_open_in_owner_thread()
         if not isinstance(key, str) or not key.strip():

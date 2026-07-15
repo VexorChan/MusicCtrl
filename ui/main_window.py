@@ -21,13 +21,22 @@ from ui.toolbars import GlobalToolbar
 
 if TYPE_CHECKING:
     from services.library_scan_controller import LibraryScanController
+    from services.metadata_preview import MetadataPreviewController
+
+from services.metadata_preview import MetadataPreviewInput
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, scan_controller: LibraryScanController | None = None) -> None:
+    def __init__(
+        self,
+        scan_controller: LibraryScanController | None = None,
+        metadata_preview_controller: MetadataPreviewController | None = None,
+    ) -> None:
         super().__init__()
         self._scan_controller = scan_controller
+        self._metadata_preview_controller = metadata_preview_controller
         self._scan_dialog: ReadOnlyScanDialog | None = None
+        self._rename_dialog: RenamePreviewDialog | None = None
         self._close_pending = False
         self.setWindowTitle("乐库整理助手")
         app = QApplication.instance()
@@ -80,11 +89,16 @@ class MainWindow(QMainWindow):
         self.navigate("所有音乐")
         if scan_controller is not None:
             scan_controller.library_changed.connect(self._replace_music_library)
-            scan_controller.running_changed.connect(self._scan_running_changed)
+            scan_controller.running_changed.connect(self._background_running_changed)
             try:
                 self._replace_music_library(scan_controller.load_library())
             except Exception as error:
                 scan_controller.warning.emit(f"无法加载音乐索引：{error}")
+        if metadata_preview_controller is not None:
+            metadata_preview_controller.results_ready.connect(self._metadata_results_ready)
+            metadata_preview_controller.cancelled.connect(self._metadata_cancelled)
+            metadata_preview_controller.failed.connect(self._metadata_failed)
+            metadata_preview_controller.running_changed.connect(self._metadata_running_changed)
 
     def _add_page(self, key: str, page: LibraryPage) -> None:
         self.pages[key] = page
@@ -133,6 +147,11 @@ class MainWindow(QMainWindow):
         self._scan_controller.failed.connect(dialog.show_failed)
         self._scan_controller.warning.connect(dialog.show_warning)
         self._scan_controller.running_changed.connect(dialog.set_running)
+        if self._metadata_preview_controller is not None and self._metadata_preview_controller.running:
+            dialog.show_warning("歌曲信息分析正在运行，请完成或取消后再开始扫描。")
+            dialog.set_running(False)
+            self._show_window(dialog)
+            return
         remembered = self._scan_controller.remembered_root()
         if remembered is not None:
             dialog.path_input.setText(str(remembered))
@@ -141,6 +160,10 @@ class MainWindow(QMainWindow):
 
     def _start_read_only_scan(self, root) -> None:
         if self._scan_controller is None:
+            return
+        if self._metadata_preview_controller is not None and self._metadata_preview_controller.running:
+            if self._scan_dialog is not None:
+                self._scan_dialog.show_failed("歌曲信息分析正在运行，不能同时开始扫描")
             return
         try:
             self._scan_controller.start_scan(root)
@@ -151,12 +174,83 @@ class MainWindow(QMainWindow):
     def _replace_music_library(self, records) -> None:
         self.pages["所有音乐"].replace_data(records)
 
-    def _scan_running_changed(self, running: bool) -> None:
-        if not running and self._close_pending:
+    def _background_running_changed(self, _running: bool) -> None:
+        if self._close_pending and not self._has_running_background_task():
             QTimer.singleShot(0, self.close)
 
     def open_rename(self) -> None:
-        self._show_window(RenamePreviewDialog(self))
+        if self._metadata_preview_controller is None or self._scan_controller is None:
+            self._show_window(RenamePreviewDialog(self))
+            return
+        if self._rename_dialog is not None:
+            self._rename_dialog.show()
+            self._rename_dialog.raise_()
+            self._rename_dialog.activateWindow()
+            return
+
+        dialog = RenamePreviewDialog(self, live_mode=True)
+        self._rename_dialog = dialog
+        dialog.destroyed.connect(lambda: setattr(self, "_rename_dialog", None))
+        dialog.cancel_requested.connect(self._metadata_preview_controller.request_cancel)
+        self._show_window(dialog)
+
+        page = self.pages["所有音乐"]
+        if self.stack.currentWidget() is not page:
+            dialog.show_warning("请先切换到“所有音乐”并明确选择要分析的音乐。")
+            return
+        if self._scan_controller.running:
+            dialog.show_warning("只读扫描正在运行，请完成或取消后再分析歌曲信息。")
+            return
+        records = page.selected_records()
+        if not records:
+            dialog.show_warning("请先勾选或选中至少一首音乐，再开始只读分析。")
+            return
+        try:
+            items = tuple(self._metadata_input_from_record(record) for record in records)
+            self._metadata_preview_controller.start(items)
+        except Exception as error:
+            dialog.show_failed(str(error))
+
+    @staticmethod
+    def _metadata_input_from_record(record: dict[str, object]) -> MetadataPreviewInput:
+        required = (
+            "_asset_id",
+            "_canonical_path",
+            "_allowed_root",
+            "_file_state",
+            "_size_bytes",
+            "_mtime_ns",
+        )
+        missing = [key for key in required if key not in record]
+        if missing:
+            raise ValueError(f"所选记录缺少 P1 索引信息：{', '.join(missing)}")
+        if record["_allowed_root"] is None:
+            raise ValueError("所选音乐缺少可验证的已完成扫描来源，请重新扫描其所在目录。")
+        return MetadataPreviewInput(
+            asset_id=record["_asset_id"],  # type: ignore[arg-type]
+            canonical_path=record["_canonical_path"],  # type: ignore[arg-type]
+            allowed_root=record["_allowed_root"],  # type: ignore[arg-type]
+            file_state=record["_file_state"],  # type: ignore[arg-type]
+            size_bytes=record["_size_bytes"],  # type: ignore[arg-type]
+            mtime_ns=record["_mtime_ns"],  # type: ignore[arg-type]
+        )
+
+    def _metadata_results_ready(self, results: object) -> None:
+        if self._rename_dialog is not None:
+            self._rename_dialog.show_results(results)
+
+    def _metadata_cancelled(self, count: int) -> None:
+        if self._rename_dialog is not None:
+            self._rename_dialog.show_cancelled(count)
+
+    def _metadata_failed(self, message: str) -> None:
+        if self._rename_dialog is not None:
+            self._rename_dialog.show_failed(message)
+
+    def _metadata_running_changed(self, running: bool) -> None:
+        if self._rename_dialog is not None:
+            self._rename_dialog.set_running(running)
+        self._background_running_changed(running)
 
     def open_lyrics_match(self) -> None:
         self._show_window(LyricsMatchDialog(self))
@@ -194,9 +288,21 @@ class MainWindow(QMainWindow):
         raise ValueError(f"不支持的页面类型：{page.kind}")
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        if self._scan_controller is not None and self._scan_controller.running:
+        if self._has_running_background_task():
             self._close_pending = True
-            self._scan_controller.request_cancel()
+            if self._scan_controller is not None and self._scan_controller.running:
+                self._scan_controller.request_cancel()
+            if self._metadata_preview_controller is not None and self._metadata_preview_controller.running:
+                self._metadata_preview_controller.request_cancel()
             event.ignore()
             return
         super().closeEvent(event)
+
+    def _has_running_background_task(self) -> bool:
+        return bool(
+            (self._scan_controller is not None and self._scan_controller.running)
+            or (
+                self._metadata_preview_controller is not None
+                and self._metadata_preview_controller.running
+            )
+        )
