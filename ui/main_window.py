@@ -681,21 +681,46 @@ class MainWindow(QMainWindow):
         answer = QMessageBox.warning(
             self._history_dialog,
             "确认永久清理",
-            "将永久删除超过 7 天且尚未恢复的备份文件。此操作不可撤销，是否继续？",
+            "将永久删除超过当前保留期限且尚未恢复的备份文件。此操作不可撤销，是否继续？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
         try:
-            self._backup_controller.start_cleanup(retention_days=7)
+            self._backup_controller.start_cleanup()
         except Exception as error:
             current = self.stack.currentWidget()
             if isinstance(current, LibraryPage):
                 current.status.setText(f"无法清理备份：{error}")
 
     def open_settings(self) -> None:
-        self._show_window(SettingsDialog(self))
+        if self._backup_controller is None:
+            self._show_window(SettingsDialog(self))
+            return
+        try:
+            dialog = SettingsDialog(
+                self,
+                live_mode=True,
+                retention_days=self._backup_controller.retention_days(),
+            )
+            dialog.save_requested.connect(self._save_settings)
+            dialog.cleanup_requested.connect(self._cleanup_backups)
+            self._show_window(dialog)
+        except Exception as error:
+            current = self.stack.currentWidget()
+            if isinstance(current, LibraryPage):
+                current.status.setText(f"无法打开设置：{error}")
+
+    def _save_settings(self, values: object) -> None:
+        if self._backup_controller is None or not isinstance(values, dict):
+            return
+        try:
+            self._backup_controller.set_retention_days(values.get("backup_retention_days"))
+        except Exception as error:
+            current = self.stack.currentWidget()
+            if isinstance(current, LibraryPage):
+                current.status.setText(f"设置保存失败：{error}")
 
     def _replace_playlists(self, names: object) -> None:
         if self._playlist_controller is None or not isinstance(names, (tuple, list)):

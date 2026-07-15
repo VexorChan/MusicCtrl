@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .venv/
+.venv-build/
 venv/
 
 # Local environment and secret configuration
@@ -28,3 +29,5 @@ Thumbs.db
 
 # Local scratch artifacts
 work/
+build/
+dist/

@@ -75,6 +75,13 @@ class BackupManagerTests(unittest.TestCase):
         self.assertEqual(self.file.read_bytes(), b"external")
         self.assertTrue(entry.backup_path.exists())
 
+    def test_retention_setting_round_trip(self) -> None:
+        self.assertEqual(self.controller.retention_days(), 7)
+        self.controller.set_retention_days(30)
+        self.assertEqual(self.controller.retention_days(), 30)
+        self.controller.set_retention_days(None)
+        self.assertIsNone(self.controller.retention_days())
+
 
 if __name__ == "__main__":
     unittest.main()

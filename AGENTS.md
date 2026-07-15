@@ -8,8 +8,8 @@
   - `docs/implementation-plan.md`
   - `docs/acceptance-criteria.md`
   - 涉及数据库时还必须阅读 `docs/database-design.md`
-- M1～P5 已通过功能门禁；当前活动阶段是 **P6 安全导入**。
-- P6 开发、自动化测试和独立验收只能使用 `TemporaryDirectory` 中由测试创建的源文件、目标目录与数据库；生产只处理用户在应用中显式选择的源根和目标根。
+- M1～P8 已通过功能门禁；当前处于 **本机自用稳定交付维护**。
+- P8 必须在独立构建目录生成 Windows 可执行程序，验证应用数据不写入安装目录，并创建可回读的桌面快捷方式。
 
 ## 技术栈
 

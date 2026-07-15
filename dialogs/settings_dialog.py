@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -19,12 +20,17 @@ from dialogs.common import PrototypeDialog, dialog_header
 
 
 class SettingsDialog(PrototypeDialog):
-    def __init__(self, parent: QWidget | None = None) -> None:
+    save_requested = Signal(object)
+    cleanup_requested = Signal()
+
+    def __init__(self, parent: QWidget | None = None, *, live_mode: bool = False, retention_days: int | None = 7) -> None:
         super().__init__("设置", (900, 650), parent)
         root = QVBoxLayout(self)
         root.setContentsMargins(22, 18, 22, 18)
         root.setSpacing(12)
-        root.addWidget(dialog_header("设置", "本阶段只展示设置结构，不会写入持久化配置。"))
+        self.live_mode = bool(live_mode)
+        self._initial_retention = retention_days
+        root.addWidget(dialog_header("设置", "设置保存到本机应用数据库。" if live_mode else "本阶段只展示设置结构，不会写入持久化配置。"))
 
         body = QHBoxLayout()
         nav = QListWidget()
@@ -48,7 +54,7 @@ class SettingsDialog(PrototypeDialog):
         cancel.clicked.connect(self.reject)
         save = QPushButton("保存")
         save.setObjectName("PrimaryButton")
-        save.clicked.connect(self.accept)
+        save.clicked.connect(self._save)
         footer.addWidget(cancel)
         footer.addWidget(save)
         root.addLayout(footer)
@@ -113,10 +119,10 @@ class SettingsDialog(PrototypeDialog):
         path = QLineEdit(r"应用本地数据目录\backup")
         path.setReadOnly(True)
         form.addRow("备份目录", path)
-        retention = QComboBox()
-        retention.addItems(["7 天", "15 天", "30 天", "永久保留"])
-        retention.setCurrentText("30 天")
-        form.addRow("备份保留时间", retention)
+        self.retention = QComboBox()
+        self.retention.addItems(["7 天", "15 天", "30 天", "永久保留"])
+        self.retention.setCurrentText("永久保留" if self._initial_retention is None else f"{self._initial_retention} 天")
+        form.addRow("备份保留时间", self.retention)
         form.addRow(QLabel("删除音乐时先移动到备份目录，不会立即永久删除。"))
         layout.addWidget(group)
         layout.addStretch(1)
@@ -141,8 +147,18 @@ class SettingsDialog(PrototypeDialog):
             labels.addWidget(small)
             row.addLayout(labels)
             row.addStretch(1)
-            row.addWidget(QPushButton("执行"))
+            execute = QPushButton("执行")
+            if text == "清理过期备份":
+                execute.clicked.connect(self.cleanup_requested)
+            row.addWidget(execute)
             group_layout.addLayout(row)
         layout.addWidget(group)
         layout.addStretch(1)
         return page
+
+    def _save(self) -> None:
+        if self.live_mode:
+            text = self.retention.currentText()
+            value = None if text == "永久保留" else int(text.split()[0])
+            self.save_requested.emit({"backup_retention_days": value})
+        self.accept()

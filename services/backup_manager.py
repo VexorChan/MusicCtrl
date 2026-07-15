@@ -18,6 +18,7 @@ from services.safe_import import import_one
 
 
 BACKUP_MANIFEST_KEY = "p7.backup_entries"
+BACKUP_RETENTION_KEY = "p7.retention_days"
 
 
 class BackupError(RuntimeError):
@@ -259,14 +260,31 @@ class BackupController(QObject):
         with self._repository_factory() as repository:
             return tuple(BackupWorker._load(repository))
 
+    def retention_days(self) -> int | None:
+        with self._repository_factory() as repository:
+            setting = repository.get_setting(BACKUP_RETENTION_KEY)
+        value = 7 if setting is None else setting.value
+        if value not in {7, 15, 30, None}:
+            raise BackupError("备份保留时间设置损坏")
+        return value
+
+    def set_retention_days(self, days: int | None) -> None:
+        if days not in {7, 15, 30, None}:
+            raise BackupError("备份保留时间只支持 7、15、30 天或永久")
+        with self._repository_factory() as repository:
+            repository.set_setting(BACKUP_RETENTION_KEY, days)
+
     def start_backup(self, items: tuple[BackupInput, ...]) -> None:
         self._start("backup", items)
 
     def start_restore(self, entry_ids: tuple[str, ...]) -> None:
         self._start("restore", entry_ids)
 
-    def start_cleanup(self, *, retention_days: int = 7) -> None:
-        self._start("cleanup", (), retention_days=retention_days)
+    def start_cleanup(self, *, retention_days: int | None = None) -> None:
+        effective = self.retention_days() if retention_days is None else retention_days
+        if effective is None:
+            raise BackupError("当前设置为永久保留，没有到期备份可清理")
+        self._start("cleanup", (), retention_days=effective)
 
     def _start(self, action: str, payload: tuple[object, ...], *, retention_days: int = 7) -> None:
         if self.running:
