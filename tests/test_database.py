@@ -43,7 +43,11 @@ class DatabaseTests(unittest.TestCase):
 
     def migrate_v1(self) -> sqlite3.Connection:
         connection = self.open()
-        result = apply_migrations(connection, self.database_path)
+        result = apply_migrations(
+            connection,
+            self.database_path,
+            migrations=(MIGRATIONS[0],),
+        )
         self.assertEqual(result.applied_versions, (1,))
         self.assertIsNone(result.backup_path)
         return connection
@@ -109,6 +113,218 @@ class DatabaseTests(unittest.TestCase):
         )
         self.assertIn("idx_assets_kind_state", indexes)
         self.assertIn("idx_scan_items_session", indexes)
+
+    def test_v2_creates_exact_rename_audit_schema_indexes_and_constraints(self) -> None:
+        self.assertGreaterEqual(len(MIGRATIONS), 2)
+        connection = self.open()
+
+        result = apply_migrations(connection, self.database_path)
+
+        self.assertEqual(result.applied_versions, (1, 2))
+        self.assertIsNone(result.backup_path)
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+        self.assertEqual(
+            tables,
+            {
+                "schema_migrations",
+                "assets",
+                "settings",
+                "scan_sessions",
+                "scan_items",
+                "operations",
+                "operation_items",
+            },
+        )
+        operation_columns = [row[1] for row in connection.execute("PRAGMA table_info(operations)")]
+        item_columns = [row[1] for row in connection.execute("PRAGMA table_info(operation_items)")]
+        self.assertEqual(
+            operation_columns,
+            [
+                "id",
+                "operation_type",
+                "status",
+                "success_count",
+                "failure_count",
+                "summary_json",
+                "created_at",
+                "started_at",
+                "completed_at",
+            ],
+        )
+        self.assertEqual(
+            item_columns,
+            [
+                "id",
+                "operation_id",
+                "asset_id",
+                "source_path",
+                "normalized_source_path",
+                "target_path",
+                "normalized_target_path",
+                "expected_size_bytes",
+                "expected_mtime_ns",
+                "result",
+                "error_code",
+                "error_message",
+                "before_json",
+                "after_json",
+                "created_at",
+                "completed_at",
+            ],
+        )
+
+        foreign_keys = {
+            row[3]: (row[2], row[6])
+            for row in connection.execute("PRAGMA foreign_key_list(operation_items)")
+        }
+        self.assertEqual(foreign_keys["operation_id"], ("operations", "CASCADE"))
+        self.assertEqual(foreign_keys["asset_id"], ("assets", "RESTRICT"))
+
+        index_rows = connection.execute("PRAGMA index_list(operation_items)").fetchall()
+        index_contracts: list[tuple[tuple[str, ...], bool, bool, str]] = []
+        for row in index_rows:
+            name = row[1]
+            columns = tuple(
+                info[2]
+                for info in connection.execute(f'PRAGMA index_info("{name}")')
+            )
+            sql_row = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+                (name,),
+            ).fetchone()
+            index_contracts.append(
+                (columns, bool(row[2]), bool(row[4]), "" if sql_row is None or sql_row[0] is None else sql_row[0])
+            )
+        self.assertIn((("operation_id", "result"), False, False), {
+            (columns, unique, partial) for columns, unique, partial, _sql in index_contracts
+        })
+        self.assertIn((("operation_id", "asset_id"), True, False), {
+            (columns, unique, partial) for columns, unique, partial, _sql in index_contracts
+        })
+        self.assertIn((("operation_id", "normalized_source_path"), True, False), {
+            (columns, unique, partial) for columns, unique, partial, _sql in index_contracts
+        })
+        self.assertIn((("operation_id", "normalized_target_path"), True, False), {
+            (columns, unique, partial) for columns, unique, partial, _sql in index_contracts
+        })
+        for active_column in ("asset_id", "normalized_target_path"):
+            matches = [
+                sql
+                for columns, unique, partial, sql in index_contracts
+                if columns == (active_column,) and unique and partial
+            ]
+            self.assertEqual(len(matches), 1)
+            self.assertIn("planned", matches[0])
+            self.assertIn("running", matches[0])
+
+        now = "2026-01-01T00:00:00Z"
+        connection.execute(
+            """
+            INSERT INTO assets(
+                id, kind, canonical_path, normalized_path, file_name, extension,
+                size_bytes, mtime_ns, file_state, created_at, updated_at
+            ) VALUES ('asset-v2', 'audio', 'C:/fixture/source.mp3', 'c:/fixture/source.mp3',
+                      'source.mp3', '.mp3', 10, 20, 'active', ?, ?)
+            """,
+            (now, now),
+        )
+        connection.execute(
+            "INSERT INTO operations(id, operation_type, status, summary_json, created_at) VALUES ('op-1', 'rename', 'planned', '{}', ?)",
+            (now,),
+        )
+        connection.execute(
+            """
+            INSERT INTO operation_items(
+                id, operation_id, asset_id, source_path, normalized_source_path,
+                target_path, normalized_target_path, expected_size_bytes,
+                expected_mtime_ns, result, before_json, created_at
+            ) VALUES ('item-1', 'op-1', 'asset-v2', 'C:/fixture/source.mp3',
+                      'c:/fixture/source.mp3', 'C:/fixture/target.mp3',
+                      'c:/fixture/target.mp3', 10, 20, 'planned', '{}', ?)
+            """,
+            (now,),
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO operations(id, operation_type, status, summary_json, created_at) VALUES ('bad-type', 'scan', 'planned', '{}', ?)",
+                (now,),
+            )
+        with self.assertRaises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO operations(id, operation_type, status, success_count, summary_json, created_at) VALUES ('bad-count', 'rename', 'planned', -1, '{}', ?)",
+                (now,),
+            )
+        with self.assertRaises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO operation_items(
+                    id, operation_id, asset_id, source_path, normalized_source_path,
+                    target_path, normalized_target_path, expected_size_bytes,
+                    result, before_json, created_at
+                ) VALUES ('bad-size', 'op-1', 'asset-v2', 'x', 'x', 'y', 'y', -1,
+                          'planned', '{}', ?)
+                """,
+                (now,),
+            )
+
+        again = apply_migrations(connection, self.database_path)
+        self.assertEqual(again.applied_versions, ())
+        self.assertIsNone(again.backup_path)
+
+    def test_formal_v2_upgrade_backs_up_v1_preserves_data_and_is_idempotent(self) -> None:
+        connection = self.migrate_v1()
+        connection.execute(
+            "INSERT INTO settings(key, value_json, updated_at) VALUES ('v1-sentinel', '1', 'now')"
+        )
+
+        result = apply_migrations(connection, self.database_path)
+
+        self.assertEqual(result.applied_versions, (2,))
+        self.assertIsNotNone(result.backup_path)
+        assert result.backup_path is not None
+        self.assertEqual(connection.execute("SELECT value_json FROM settings WHERE key='v1-sentinel'").fetchone()[0], "1")
+        backup = sqlite3.connect(result.backup_path)
+        try:
+            self.assertEqual(backup.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+            self.assertEqual(backup.execute("SELECT version FROM schema_migrations").fetchall(), [(1,)])
+            self.assertIsNone(
+                backup.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='operations'"
+                ).fetchone()
+            )
+        finally:
+            backup.close()
+        self.assertEqual(apply_migrations(connection, self.database_path).applied_versions, ())
+        self.assertEqual(len(list(self.root.glob("*.backup.sqlite3"))), 1)
+
+    def test_v2_database_is_rejected_by_older_v1_migration_set(self) -> None:
+        connection = self.open()
+        self.assertEqual(
+            apply_migrations(connection, self.database_path).applied_versions,
+            (1, 2),
+        )
+
+        with self.assertRaises(MigrationHistoryError):
+            apply_migrations(
+                connection,
+                self.database_path,
+                migrations=(MIGRATIONS[0],),
+            )
+
+        self.assertEqual(
+            [row[0] for row in connection.execute("SELECT version FROM schema_migrations")],
+            [1, 2],
+        )
+        self.assertIsNotNone(
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='operations'"
+            ).fetchone()
+        )
 
     def test_asset_constraints_and_normalized_path_uniqueness(self) -> None:
         connection = self.migrate_v1()
@@ -201,8 +417,8 @@ class DatabaseTests(unittest.TestCase):
 
     def test_v1_is_idempotent_and_does_not_create_backup(self) -> None:
         connection = self.open()
-        first = apply_migrations(connection, self.database_path)
-        second = apply_migrations(connection, self.database_path)
+        first = apply_migrations(connection, self.database_path, migrations=(MIGRATIONS[0],))
+        second = apply_migrations(connection, self.database_path, migrations=(MIGRATIONS[0],))
 
         self.assertEqual(first.applied_versions, (1,))
         self.assertIsNone(first.backup_path)
@@ -219,7 +435,7 @@ class DatabaseTests(unittest.TestCase):
         connection.execute(
             "INSERT INTO settings(key, value_json, updated_at) VALUES ('sentinel', '1', 'now')"
         )
-        migrations = MIGRATIONS + (
+        migrations = (MIGRATIONS[0],) + (
             Migration(2, "test v2", ("CREATE TABLE v2_marker (id INTEGER PRIMARY KEY)",)),
         )
 
@@ -261,7 +477,7 @@ class DatabaseTests(unittest.TestCase):
         connection.execute(
             "INSERT INTO settings(key, value_json, updated_at) VALUES ('sentinel', '1', 'now')"
         )
-        migrations = MIGRATIONS + (
+        migrations = (MIGRATIONS[0],) + (
             Migration(
                 2,
                 "failing test v2",
@@ -304,9 +520,71 @@ class DatabaseTests(unittest.TestCase):
         finally:
             backup.close()
 
+    def test_formal_v2_version_insert_failure_rolls_back_ddl_and_keeps_v1(self) -> None:
+        connection = self.migrate_v1()
+        connection.execute(
+            """
+            CREATE TRIGGER reject_formal_v2_version
+            BEFORE INSERT ON schema_migrations
+            WHEN NEW.version = 2
+            BEGIN
+                SELECT RAISE(ABORT, 'reject formal v2 version');
+            END
+            """
+        )
+
+        with self.assertRaisesRegex(MigrationApplyError, "v2.*回滚"):
+            apply_migrations(connection, self.database_path)
+
+        self.assertEqual(
+            [row[0] for row in connection.execute("SELECT version FROM schema_migrations")],
+            [1],
+        )
+        for table in ("operations", "operation_items"):
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                    (table,),
+                ).fetchone()
+            )
+        self.assertEqual(len(list(self.root.glob("*.backup.sqlite3"))), 1)
+
+    def test_formal_v2_commit_failure_rolls_back_ddl_version_and_keeps_connection_usable(self) -> None:
+        connection = self.migrate_v1()
+
+        class FailV2CommitProxy:
+            @property
+            def in_transaction(self):
+                return connection.in_transaction
+
+            def execute(self, sql, *args):
+                if sql == "COMMIT":
+                    raise sqlite3.OperationalError("formal v2 commit failure")
+                return connection.execute(sql, *args)
+
+            def backup(self, destination):
+                return connection.backup(destination)
+
+        proxy = FailV2CommitProxy()
+        with self.assertRaisesRegex(MigrationApplyError, "v2.*回滚"):
+            apply_migrations(proxy, self.database_path)  # type: ignore[arg-type]
+
+        self.assertFalse(connection.in_transaction)
+        self.assertEqual(
+            [row[0] for row in connection.execute("SELECT version FROM schema_migrations")],
+            [1],
+        )
+        self.assertIsNone(
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='operations'"
+            ).fetchone()
+        )
+        self.assertEqual(connection.execute("SELECT 1").fetchone()[0], 1)
+        self.assertEqual(len(list(self.root.glob("*.backup.sqlite3"))), 1)
+
     def test_backup_failure_prevents_v2_migration(self) -> None:
         connection = self.migrate_v1()
-        migrations = MIGRATIONS + (
+        migrations = (MIGRATIONS[0],) + (
             Migration(2, "test v2", ("CREATE TABLE must_not_exist(id INTEGER)",)),
         )
         original_connect = sqlite3.connect
@@ -358,7 +636,7 @@ class DatabaseTests(unittest.TestCase):
         )
 
     def test_future_and_gapped_migration_histories_are_rejected(self) -> None:
-        for versions in ((1, 3), (1, 2)):
+        for versions in ((1, 3), (1, 2, 3)):
             with self.subTest(versions=versions):
                 path = self.root / f"history-{'-'.join(map(str, versions))}.sqlite3"
                 connection = open_database(DatabaseConfig(path))

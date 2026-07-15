@@ -102,6 +102,70 @@ MIGRATIONS = (
             "CREATE INDEX idx_scan_items_session ON scan_items(session_id)",
         ),
     ),
+    Migration(
+        version=2,
+        description="P2 safe rename operations",
+        statements=(
+            """
+            CREATE TABLE operations (
+                id TEXT PRIMARY KEY NOT NULL,
+                operation_type TEXT NOT NULL
+                    CHECK (operation_type IN ('rename')),
+                status TEXT NOT NULL
+                    CHECK (status IN (
+                        'planned', 'running', 'success', 'partial', 'failed', 'cancelled'
+                    )),
+                success_count INTEGER NOT NULL DEFAULT 0 CHECK (success_count >= 0),
+                failure_count INTEGER NOT NULL DEFAULT 0 CHECK (failure_count >= 0),
+                summary_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT
+            )
+            """,
+            """
+            CREATE TABLE operation_items (
+                id TEXT PRIMARY KEY NOT NULL,
+                operation_id TEXT NOT NULL
+                    REFERENCES operations(id) ON DELETE CASCADE,
+                asset_id TEXT NOT NULL
+                    REFERENCES assets(id) ON DELETE RESTRICT,
+                source_path TEXT NOT NULL,
+                normalized_source_path TEXT NOT NULL,
+                target_path TEXT NOT NULL,
+                normalized_target_path TEXT NOT NULL,
+                expected_size_bytes INTEGER NOT NULL CHECK (expected_size_bytes >= 0),
+                expected_mtime_ns INTEGER
+                    CHECK (expected_mtime_ns IS NULL OR expected_mtime_ns >= 0),
+                result TEXT NOT NULL
+                    CHECK (result IN (
+                        'planned', 'running', 'success', 'failed',
+                        'rolled_back', 'rollback_failed', 'cancelled'
+                    )),
+                error_code TEXT,
+                error_message TEXT,
+                before_json TEXT NOT NULL,
+                after_json TEXT,
+                created_at TEXT NOT NULL,
+                completed_at TEXT,
+                UNIQUE(operation_id, asset_id),
+                UNIQUE(operation_id, normalized_source_path),
+                UNIQUE(operation_id, normalized_target_path)
+            )
+            """,
+            "CREATE INDEX idx_operation_items_operation ON operation_items(operation_id, result)",
+            """
+            CREATE UNIQUE INDEX uq_operation_items_active_asset
+            ON operation_items(asset_id)
+            WHERE result IN ('planned', 'running')
+            """,
+            """
+            CREATE UNIQUE INDEX uq_operation_items_active_target
+            ON operation_items(normalized_target_path)
+            WHERE result IN ('planned', 'running')
+            """,
+        ),
+    ),
 )
 
 

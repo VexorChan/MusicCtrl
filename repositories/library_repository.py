@@ -22,6 +22,22 @@ ASSET_STATES = frozenset({"active", "missing", "external_changed"})
 SCAN_MODES = frozenset({"audio", "lyric"})
 SCAN_SESSION_FINAL_STATES = frozenset({"cancelled", "completed", "failed"})
 SCAN_ITEM_STATES = frozenset({"waiting", "indexed", "skipped", "failed"})
+RENAME_OPERATION_STATES = frozenset(
+    {"planned", "running", "success", "partial", "failed", "cancelled"}
+)
+RENAME_ITEM_STATES = frozenset(
+    {
+        "planned",
+        "running",
+        "success",
+        "failed",
+        "rolled_back",
+        "rollback_failed",
+        "cancelled",
+    }
+)
+RENAME_ITEM_OUTCOMES = RENAME_ITEM_STATES - {"planned", "running", "success"}
+RENAME_FAILURE_RESULTS = frozenset({"failed", "rolled_back", "rollback_failed"})
 
 
 class RepositoryError(RuntimeError):
@@ -46,6 +62,15 @@ class RepositoryDataError(RepositoryError, ValueError):
 
 class RecordNotFoundError(RepositoryError):
     """Raised when an operation requires a record that does not exist."""
+
+
+class RepositoryCommitOutcomeUnknown(RepositoryError):
+    """Raised when COMMIT failed after SQLite left the transaction."""
+
+    def __init__(self, message: str, *, operation_id: str, item_id: str) -> None:
+        super().__init__(message)
+        self.operation_id = operation_id
+        self.item_id = item_id
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +159,48 @@ class ScanReconcileResult:
 
 
 @dataclass(frozen=True, slots=True)
+class RenamePlanItem:
+    asset_id: str
+    source_path: Path
+    target_path: Path
+    expected_size_bytes: int
+    expected_mtime_ns: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class RenameOperationRecord:
+    id: str
+    operation_type: str
+    status: str
+    success_count: int
+    failure_count: int
+    summary: object
+    created_at: str
+    started_at: str | None
+    completed_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class RenameOperationItemRecord:
+    id: str
+    operation_id: str
+    asset_id: str
+    source_path: Path
+    normalized_source_path: str
+    target_path: Path
+    normalized_target_path: str
+    expected_size_bytes: int
+    expected_mtime_ns: int | None
+    result: str
+    error_code: str | None
+    error_message: str | None
+    before: object
+    after: object | None
+    created_at: str
+    completed_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class _PreparedAsset:
     canonical_path: Path
     normalized_path: str
@@ -212,6 +279,53 @@ def _strict_json_loads(value_json: str) -> object:
         raise RepositoryDataError("设置包含损坏或非标准 JSON") from exc
 
 
+def _strict_json_dumps(value: object, *, field_name: str) -> str:
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise RepositoryDataError(f"{field_name} 必须兼容严格 JSON") from exc
+
+
+def _strict_json_field(value_json: str, *, field_name: str) -> object:
+    def reject_constant(value: str) -> Any:
+        raise ValueError(f"不允许的 JSON 常量：{value}")
+
+    try:
+        return json.loads(value_json, parse_constant=reject_constant)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RepositoryDataError(f"{field_name} 包含损坏或非标准 JSON") from exc
+
+
+def _windows_path_key(path: Path, *, field_name: str) -> tuple[Path, str]:
+    canonical_path, _ = _canonicalize_path(path, field_name=field_name)
+    parent_text = os.path.normcase(os.path.normpath(os.fspath(canonical_path.parent)))
+    parent_key = parent_text.replace("\\", "/").casefold().rstrip("/")
+    name_key = canonical_path.name.rstrip(" .").casefold()
+    return canonical_path, f"{parent_key}/{name_key}"
+
+
+def _validate_windows_leaf_name(path: Path, *, field_name: str) -> None:
+    name = path.name
+    if not name or name in {".", ".."}:
+        raise RepositoryPathError(f"{field_name} 缺少有效文件名")
+    if name.endswith((" ", ".")):
+        raise RepositoryPathError(f"{field_name} 不能以空格或句点结尾")
+    if any(ord(character) < 32 or character in '<>:"/\\|?*' for character in name):
+        raise RepositoryPathError(f"{field_name} 包含 Windows 非法字符")
+    device_name = name.split(".", 1)[0].rstrip(" .").casefold()
+    reserved = {"con", "prn", "aux", "nul"}
+    reserved.update(f"com{index}" for index in range(1, 10))
+    reserved.update(f"lpt{index}" for index in range(1, 10))
+    if device_name in reserved:
+        raise RepositoryPathError(f"{field_name} 使用了 Windows 保留设备名")
+
+
 class LibraryRepository:
     """Own one SQLite connection for exactly one creating thread."""
 
@@ -243,14 +357,31 @@ class LibraryRepository:
             raise RepositoryClosedError("LibraryRepository 已关闭")
 
     @contextmanager
-    def _transaction(self) -> Iterator[None]:
+    def _transaction(
+        self,
+        *,
+        operation_id: str | None = None,
+        item_id: str | None = None,
+    ) -> Iterator[None]:
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             yield
-            self._connection.execute("COMMIT")
         except BaseException:
             if self._connection.in_transaction:
                 self._connection.execute("ROLLBACK")
+            raise
+        try:
+            self._connection.execute("COMMIT")
+        except BaseException as exc:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+                raise
+            if operation_id is not None and item_id is not None:
+                raise RepositoryCommitOutcomeUnknown(
+                    "SQLite COMMIT 后发生异常，提交结果未知，必须重新读取确认",
+                    operation_id=operation_id,
+                    item_id=item_id,
+                ) from exc
             raise
 
     def close(self) -> None:
@@ -385,6 +516,550 @@ class LibraryRepository:
             (normalized_path,),
         ).fetchone()
         return None if row is None else self._asset_from_row(row)
+
+    def get_asset_by_id(self, asset_id: str) -> AssetRecord | None:
+        self._require_open_in_owner_thread()
+        if not isinstance(asset_id, str) or not asset_id.strip():
+            raise RepositoryDataError("asset_id 必须是非空字符串")
+        row = self._connection.execute(
+            "SELECT * FROM assets WHERE id = ?",
+            (asset_id,),
+        ).fetchone()
+        return None if row is None else self._asset_from_row(row)
+
+    @staticmethod
+    def _rename_operation_from_row(row: sqlite3.Row) -> RenameOperationRecord:
+        return RenameOperationRecord(
+            id=row["id"],
+            operation_type=row["operation_type"],
+            status=row["status"],
+            success_count=row["success_count"],
+            failure_count=row["failure_count"],
+            summary=_strict_json_field(row["summary_json"], field_name="summary_json"),
+            created_at=row["created_at"],
+            started_at=row["started_at"],
+            completed_at=row["completed_at"],
+        )
+
+    @staticmethod
+    def _rename_item_from_row(row: sqlite3.Row) -> RenameOperationItemRecord:
+        return RenameOperationItemRecord(
+            id=row["id"],
+            operation_id=row["operation_id"],
+            asset_id=row["asset_id"],
+            source_path=Path(row["source_path"]),
+            normalized_source_path=row["normalized_source_path"],
+            target_path=Path(row["target_path"]),
+            normalized_target_path=row["normalized_target_path"],
+            expected_size_bytes=row["expected_size_bytes"],
+            expected_mtime_ns=row["expected_mtime_ns"],
+            result=row["result"],
+            error_code=row["error_code"],
+            error_message=row["error_message"],
+            before=_strict_json_field(row["before_json"], field_name="before_json"),
+            after=(
+                None
+                if row["after_json"] is None
+                else _strict_json_field(row["after_json"], field_name="after_json")
+            ),
+            created_at=row["created_at"],
+            completed_at=row["completed_at"],
+        )
+
+    def get_rename_operation(self, operation_id: str) -> RenameOperationRecord | None:
+        self._require_open_in_owner_thread()
+        if not isinstance(operation_id, str) or not operation_id.strip():
+            raise RepositoryDataError("operation_id 必须是非空字符串")
+        row = self._connection.execute(
+            "SELECT * FROM operations WHERE id = ? AND operation_type = 'rename'",
+            (operation_id,),
+        ).fetchone()
+        return None if row is None else self._rename_operation_from_row(row)
+
+    def get_rename_operation_item(self, item_id: str) -> RenameOperationItemRecord | None:
+        self._require_open_in_owner_thread()
+        if not isinstance(item_id, str) or not item_id.strip():
+            raise RepositoryDataError("item_id 必须是非空字符串")
+        row = self._connection.execute(
+            "SELECT * FROM operation_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+        return None if row is None else self._rename_item_from_row(row)
+
+    def list_rename_operation_items(
+        self,
+        operation_id: str,
+    ) -> tuple[RenameOperationItemRecord, ...]:
+        self._require_open_in_owner_thread()
+        if not isinstance(operation_id, str) or not operation_id.strip():
+            raise RepositoryDataError("operation_id 必须是非空字符串")
+        rows = self._connection.execute(
+            """
+            SELECT * FROM operation_items
+            WHERE operation_id = ?
+            ORDER BY created_at, normalized_source_path, id
+            """,
+            (operation_id,),
+        ).fetchall()
+        return tuple(self._rename_item_from_row(row) for row in rows)
+
+    def create_rename_operation(
+        self,
+        *,
+        allowed_root: Path,
+        items: Iterable[RenamePlanItem],
+    ) -> tuple[RenameOperationRecord, tuple[RenameOperationItemRecord, ...]]:
+        self._require_open_in_owner_thread()
+        canonical_root, normalized_root = _canonicalize_path(
+            allowed_root,
+            field_name="allowed_root",
+        )
+        frozen_items = tuple(items)
+        if not frozen_items:
+            raise RepositoryDataError("重命名计划不能为空")
+
+        prepared: list[tuple[RenamePlanItem, Path, str, Path, str]] = []
+        asset_ids: set[str] = set()
+        source_keys: set[str] = set()
+        target_keys: set[str] = set()
+        for item in frozen_items:
+            if not isinstance(item, RenamePlanItem):
+                raise RepositoryDataError("重命名计划必须使用 RenamePlanItem")
+            if not isinstance(item.asset_id, str) or not item.asset_id.strip():
+                raise RepositoryDataError("asset_id 必须是非空字符串")
+            _require_non_negative_integer(
+                item.expected_size_bytes,
+                field_name="expected_size_bytes",
+                optional=False,
+            )
+            _require_non_negative_integer(
+                item.expected_mtime_ns,
+                field_name="expected_mtime_ns",
+                optional=True,
+            )
+            source_path, source_key = _windows_path_key(
+                item.source_path,
+                field_name="source_path",
+            )
+            _validate_windows_leaf_name(item.target_path, field_name="target_path")
+            target_path, target_key = _windows_path_key(
+                item.target_path,
+                field_name="target_path",
+            )
+            if source_path.suffix.casefold() != target_path.suffix.casefold():
+                raise RepositoryDataError("重命名不能更改音频文件扩展名")
+            _, normalized_source_for_root = _canonicalize_path(
+                source_path,
+                field_name="source_path",
+            )
+            _, normalized_target_for_root = _canonicalize_path(
+                target_path,
+                field_name="target_path",
+            )
+            _require_path_within_root(
+                normalized_source_for_root,
+                normalized_root,
+                field_name="source_path",
+            )
+            _require_path_within_root(
+                normalized_target_for_root,
+                normalized_root,
+                field_name="target_path",
+            )
+            _, source_parent = _canonicalize_path(
+                source_path.parent,
+                field_name="source_path.parent",
+            )
+            _, target_parent = _canonicalize_path(
+                target_path.parent,
+                field_name="target_path.parent",
+            )
+            if source_parent != target_parent:
+                raise RepositoryPathError("重命名目标必须与源文件位于同一目录")
+            if source_key == target_key:
+                raise RepositoryDataError("重命名目标不能与源文件相同")
+            if item.asset_id in asset_ids:
+                raise RepositoryDataError(f"重命名计划包含重复 asset_id：{item.asset_id}")
+            if source_key in source_keys:
+                raise RepositoryDataError(f"重命名计划包含 Windows 等价源路径：{source_path}")
+            if target_key in target_keys:
+                raise RepositoryDataError(f"重命名计划包含 Windows 等价目标路径：{target_path}")
+            asset_ids.add(item.asset_id)
+            source_keys.add(source_key)
+            target_keys.add(target_key)
+            prepared.append((item, source_path, source_key, target_path, target_key))
+
+        operation_id = str(uuid4())
+        now = _utc_now()
+        summary_json = _strict_json_dumps(
+            {
+                "allowed_root": os.fspath(canonical_root),
+                "item_count": len(prepared),
+                "operation_type": "rename",
+            },
+            field_name="summary_json",
+        )
+        with self._transaction():
+            asset_rows = self._connection.execute(
+                "SELECT * FROM assets WHERE kind = 'audio'"
+            ).fetchall()
+            assets_by_id = {row["id"]: row for row in asset_rows}
+            occupied_keys = {
+                _windows_path_key(Path(row["canonical_path"]), field_name="assets.canonical_path")[1]: row["id"]
+                for row in asset_rows
+            }
+            for item, source_path, source_key, target_path, target_key in prepared:
+                asset = assets_by_id.get(item.asset_id)
+                if asset is None:
+                    raise RecordNotFoundError(f"音频资产不存在：{item.asset_id}")
+                if asset["file_state"] != "active":
+                    raise RepositoryDataError(f"只有 active 音频可以创建重命名计划：{item.asset_id}")
+                asset_source_key = _windows_path_key(
+                    Path(asset["canonical_path"]),
+                    field_name="assets.canonical_path",
+                )[1]
+                if asset_source_key != source_key:
+                    raise RepositoryDataError(f"计划源路径与资产索引不一致：{source_path}")
+                if asset["size_bytes"] != item.expected_size_bytes or asset["mtime_ns"] != item.expected_mtime_ns:
+                    raise RepositoryDataError(f"计划指纹与资产索引不一致：{source_path}")
+                occupied_asset_id = occupied_keys.get(target_key)
+                if occupied_asset_id is not None and occupied_asset_id != item.asset_id:
+                    raise RepositoryDataError(f"重命名目标与现有资产冲突：{target_path}")
+
+            self._connection.execute(
+                """
+                INSERT INTO operations(
+                    id, operation_type, status, success_count, failure_count,
+                    summary_json, created_at, started_at, completed_at
+                ) VALUES (?, 'rename', 'planned', 0, 0, ?, ?, NULL, NULL)
+                """,
+                (
+                    operation_id,
+                    summary_json,
+                    now,
+                ),
+            )
+            for item, source_path, source_key, target_path, target_key in prepared:
+                asset = assets_by_id[item.asset_id]
+                before_json = _strict_json_dumps(
+                    {
+                        "asset_id": asset["id"],
+                        "canonical_path": asset["canonical_path"],
+                        "file_name": asset["file_name"],
+                        "file_state": asset["file_state"],
+                        "mtime_ns": asset["mtime_ns"],
+                        "normalized_path": asset["normalized_path"],
+                        "size_bytes": asset["size_bytes"],
+                    },
+                    field_name="before_json",
+                )
+                self._connection.execute(
+                    """
+                    INSERT INTO operation_items(
+                        id, operation_id, asset_id, source_path, normalized_source_path,
+                        target_path, normalized_target_path,
+                        expected_size_bytes, expected_mtime_ns, result,
+                        error_code, error_message, before_json, after_json,
+                        created_at, completed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned',
+                              NULL, NULL, ?, NULL, ?, NULL)
+                    """,
+                    (
+                        str(uuid4()),
+                        operation_id,
+                        item.asset_id,
+                        os.fspath(source_path),
+                        source_key,
+                        os.fspath(target_path),
+                        target_key,
+                        item.expected_size_bytes,
+                        item.expected_mtime_ns,
+                        before_json,
+                        now,
+                    ),
+                )
+
+        operation = self.get_rename_operation(operation_id)
+        if operation is None:
+            raise RepositoryDataError("重命名操作创建后无法读取")
+        return operation, self.list_rename_operation_items(operation_id)
+
+    def start_rename_operation(self, operation_id: str) -> RenameOperationRecord:
+        self._require_open_in_owner_thread()
+        now = _utc_now()
+        with self._transaction():
+            cursor = self._connection.execute(
+                """
+                UPDATE operations SET status = 'running', started_at = ?
+                WHERE id = ? AND operation_type = 'rename' AND status = 'planned'
+                """,
+                (now, operation_id),
+            )
+            if cursor.rowcount != 1:
+                raise RepositoryDataError("重命名操作不存在或不能启动")
+        record = self.get_rename_operation(operation_id)
+        if record is None:
+            raise RecordNotFoundError(f"重命名操作不存在：{operation_id}")
+        return record
+
+    def start_rename_item(
+        self,
+        operation_id: str,
+        item_id: str,
+    ) -> RenameOperationItemRecord:
+        self._require_open_in_owner_thread()
+        with self._transaction():
+            operation = self._connection.execute(
+                "SELECT status FROM operations WHERE id = ? AND operation_type = 'rename'",
+                (operation_id,),
+            ).fetchone()
+            if operation is None:
+                raise RecordNotFoundError(f"重命名操作不存在：{operation_id}")
+            if operation["status"] != "running":
+                raise RepositoryDataError("只有 running 重命名操作可以启动文件项")
+            cursor = self._connection.execute(
+                """
+                UPDATE operation_items SET result = 'running'
+                WHERE id = ? AND operation_id = ? AND result = 'planned'
+                """,
+                (item_id, operation_id),
+            )
+            if cursor.rowcount != 1:
+                raise RepositoryDataError("重命名文件项不存在或不能启动")
+        record = self.get_rename_operation_item(item_id)
+        if record is None:
+            raise RecordNotFoundError(f"重命名文件项不存在：{item_id}")
+        return record
+
+    def commit_rename_item(
+        self,
+        operation_id: str,
+        item_id: str,
+    ) -> tuple[AssetRecord, RenameOperationItemRecord]:
+        self._require_open_in_owner_thread()
+        now = _utc_now()
+        with self._transaction(operation_id=operation_id, item_id=item_id):
+            operation = self._connection.execute(
+                "SELECT status FROM operations WHERE id = ? AND operation_type = 'rename'",
+                (operation_id,),
+            ).fetchone()
+            if operation is None:
+                raise RecordNotFoundError(f"重命名操作不存在：{operation_id}")
+            if operation["status"] != "running":
+                raise RepositoryDataError("只有 running 重命名操作可以提交文件项")
+            item = self._connection.execute(
+                "SELECT * FROM operation_items WHERE id = ? AND operation_id = ?",
+                (item_id, operation_id),
+            ).fetchone()
+            if item is None:
+                raise RecordNotFoundError(f"重命名文件项不存在：{item_id}")
+            if item["result"] != "running":
+                raise RepositoryDataError("只有 running 文件项可以提交成功")
+            asset = self._connection.execute(
+                "SELECT * FROM assets WHERE id = ?",
+                (item["asset_id"],),
+            ).fetchone()
+            if asset is None:
+                raise RecordNotFoundError(f"音频资产不存在：{item['asset_id']}")
+            if asset["kind"] != "audio" or asset["file_state"] != "active":
+                raise RepositoryDataError("提交重命名时资产必须仍为 active audio")
+            asset_source_key = _windows_path_key(
+                Path(asset["canonical_path"]),
+                field_name="assets.canonical_path",
+            )[1]
+            if asset_source_key != item["normalized_source_path"]:
+                raise RepositoryDataError("提交重命名时资产源路径已经变化")
+            if asset["size_bytes"] != item["expected_size_bytes"] or asset["mtime_ns"] != item["expected_mtime_ns"]:
+                raise RepositoryDataError("提交重命名时资产指纹已经变化")
+
+            target_path, target_normalized = _canonicalize_path(
+                Path(item["target_path"]),
+                field_name="target_path",
+            )
+            conflict = self._connection.execute(
+                "SELECT id FROM assets WHERE normalized_path = ? AND id != ?",
+                (target_normalized, asset["id"]),
+            ).fetchone()
+            if conflict is not None:
+                raise RepositoryDataError("提交重命名时目标索引已经被占用")
+            after_json = _strict_json_dumps(
+                {
+                    "asset_id": asset["id"],
+                    "canonical_path": os.fspath(target_path),
+                    "file_name": target_path.name,
+                    "file_state": "active",
+                    "mtime_ns": asset["mtime_ns"],
+                    "normalized_path": target_normalized,
+                    "size_bytes": asset["size_bytes"],
+                },
+                field_name="after_json",
+            )
+            asset_cursor = self._connection.execute(
+                """
+                UPDATE assets
+                SET canonical_path = ?, normalized_path = ?, file_name = ?,
+                    extension = ?, file_state = 'active', updated_at = ?
+                WHERE id = ? AND normalized_path = ?
+                """,
+                (
+                    os.fspath(target_path),
+                    target_normalized,
+                    target_path.name,
+                    target_path.suffix.casefold(),
+                    now,
+                    asset["id"],
+                    asset["normalized_path"],
+                ),
+            )
+            if asset_cursor.rowcount != 1:
+                raise RepositoryDataError("重命名资产更新失败")
+            item_cursor = self._connection.execute(
+                """
+                UPDATE operation_items
+                SET result = 'success', error_code = NULL,
+                    error_message = NULL, after_json = ?, completed_at = ?
+                WHERE id = ? AND operation_id = ? AND result = 'running'
+                """,
+                (after_json, now, item_id, operation_id),
+            )
+            if item_cursor.rowcount != 1:
+                raise RepositoryDataError("重命名文件项成功状态更新失败")
+            self._connection.execute(
+                "UPDATE operations SET success_count = success_count + 1 WHERE id = ?",
+                (operation_id,),
+            )
+
+        asset_record = self.get_asset_by_id(item["asset_id"])
+        item_record = self.get_rename_operation_item(item_id)
+        if asset_record is None or item_record is None:
+            raise RepositoryDataError("重命名提交后无法读取结果")
+        return asset_record, item_record
+
+    def record_rename_item_outcome(
+        self,
+        operation_id: str,
+        item_id: str,
+        *,
+        result: str,
+        actual_path: Path | None,
+        error_code: str | None,
+        error_message: str | None,
+    ) -> RenameOperationItemRecord:
+        self._require_open_in_owner_thread()
+        _require_choice(result, RENAME_ITEM_OUTCOMES, field_name="result")
+        if actual_path is not None:
+            actual_path, _ = _canonicalize_path(actual_path, field_name="actual_path")
+        if error_code is not None and not isinstance(error_code, str):
+            raise RepositoryDataError("error_code 必须是字符串或 None")
+        if error_message is not None and not isinstance(error_message, str):
+            raise RepositoryDataError("error_message 必须是字符串或 None")
+        now = _utc_now()
+        with self._transaction():
+            operation = self._connection.execute(
+                "SELECT status FROM operations WHERE id = ? AND operation_type = 'rename'",
+                (operation_id,),
+            ).fetchone()
+            if operation is None:
+                raise RecordNotFoundError(f"重命名操作不存在：{operation_id}")
+            if operation["status"] != "running":
+                raise RepositoryDataError("只有 running 重命名操作可以记录文件结果")
+            item = self._connection.execute(
+                "SELECT result FROM operation_items WHERE id = ? AND operation_id = ?",
+                (item_id, operation_id),
+            ).fetchone()
+            if item is None:
+                raise RecordNotFoundError(f"重命名文件项不存在：{item_id}")
+            allowed_previous = {"planned"} if result == "cancelled" else {"running"}
+            if item["result"] not in allowed_previous:
+                raise RepositoryDataError("重命名文件项当前状态不能记录该结果")
+            after_json = _strict_json_dumps(
+                {
+                    "actual_path": None if actual_path is None else os.fspath(actual_path),
+                    "error_code": error_code,
+                    "error_message": error_message,
+                    "result": result,
+                },
+                field_name="after_json",
+            )
+            cursor = self._connection.execute(
+                """
+                UPDATE operation_items
+                SET result = ?, error_code = ?, error_message = ?,
+                    after_json = ?, completed_at = ?
+                WHERE id = ? AND operation_id = ? AND result = ?
+                """,
+                (
+                    result,
+                    error_code,
+                    error_message,
+                    after_json,
+                    now,
+                    item_id,
+                    operation_id,
+                    item["result"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RepositoryDataError("重命名文件结果更新失败")
+            if result in RENAME_FAILURE_RESULTS:
+                self._connection.execute(
+                    "UPDATE operations SET failure_count = failure_count + 1 WHERE id = ?",
+                    (operation_id,),
+                )
+        record = self.get_rename_operation_item(item_id)
+        if record is None:
+            raise RecordNotFoundError(f"重命名文件项不存在：{item_id}")
+        return record
+
+    def finish_rename_operation(self, operation_id: str) -> RenameOperationRecord:
+        self._require_open_in_owner_thread()
+        now = _utc_now()
+        with self._transaction():
+            operation = self._connection.execute(
+                "SELECT status FROM operations WHERE id = ? AND operation_type = 'rename'",
+                (operation_id,),
+            ).fetchone()
+            if operation is None:
+                raise RecordNotFoundError(f"重命名操作不存在：{operation_id}")
+            if operation["status"] != "running":
+                raise RepositoryDataError("只有 running 重命名操作可以终结")
+            rows = self._connection.execute(
+                """
+                SELECT result, COUNT(*) AS count FROM operation_items
+                WHERE operation_id = ? GROUP BY result
+                """,
+                (operation_id,),
+            ).fetchall()
+            counts = {row["result"]: int(row["count"]) for row in rows}
+            if counts.get("planned", 0) or counts.get("running", 0):
+                raise RepositoryDataError("存在 planned/running 文件项，不能终结重命名操作")
+            success_count = counts.get("success", 0)
+            failure_count = sum(counts.get(state, 0) for state in RENAME_FAILURE_RESULTS)
+            cancelled_count = counts.get("cancelled", 0)
+            if failure_count and success_count:
+                final_status = "partial"
+            elif failure_count:
+                final_status = "failed"
+            elif cancelled_count and success_count:
+                final_status = "partial"
+            elif cancelled_count:
+                final_status = "cancelled"
+            else:
+                final_status = "success"
+            cursor = self._connection.execute(
+                """
+                UPDATE operations
+                SET status = ?, success_count = ?, failure_count = ?, completed_at = ?
+                WHERE id = ? AND status = 'running'
+                """,
+                (final_status, success_count, failure_count, now, operation_id),
+            )
+            if cursor.rowcount != 1:
+                raise RepositoryDataError("重命名操作终结失败")
+        record = self.get_rename_operation(operation_id)
+        if record is None:
+            raise RecordNotFoundError(f"重命名操作不存在：{operation_id}")
+        return record
 
     def list_assets(
         self,

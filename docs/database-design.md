@@ -2,10 +2,11 @@
 
 ## 1. 文档状态与设计原则
 
-本文同时记录当前已经部署的 P1 v1 schema 和 P2～P7 的目标草案：
+本文同时记录当前已经部署的 P1 v1、P2-B1 v2 schema 和 P2-C～P7 的目标草案：
 
 - 标记为“P1 v1 已部署”的表、字段、约束、索引和事务已经存在于当前 migration。
-- 标记为“P2～P7 目标草案”的内容尚未落入任何 migration，不得作为当前数据库能力使用。
+- 标记为“P2-B1 v2 已部署”的重命名审计表和 repository 状态机已经存在于当前 migration；v2 本身不执行文件重命名。
+- 标记为“P2-C～P7 目标草案”的内容尚未落入任何 migration，不得作为当前数据库能力使用。
 - 后续新增正式字段或表时，必须先更新设计、增加连续 migration，并完成升级、回滚和数据保留测试。
 
 通用原则：
@@ -22,33 +23,37 @@
 
 ## 2. 关系概览
 
-### 2.1 当前已部署：P1 v1
+### 2.1 当前已部署：P1 v1 + P2-B1 v2
 
 ```text
 schema_migrations
 assets
 settings
 scan_sessions ── scan_items
+assets ── operation_items ── operations
 ```
 
-当前唯一持久化外键为 `scan_items.session_id → scan_sessions.id`，删除 session 时级联删除其 scan items。
+当前持久化外键为：
 
-### 2.2 尚未部署：P2～P7 目标草案
+- `scan_items.session_id → scan_sessions.id`，删除 session 时级联删除其 scan items；
+- `operation_items.operation_id → operations.id`，删除 operation 时级联删除其 items；
+- `operation_items.asset_id → assets.id`，使用 `ON DELETE RESTRICT` 保护审计引用。
+
+### 2.2 尚未部署：P2-C～P7 目标草案
 
 ```text
 assets
 ├── audio_tracks
 │   ├── lyrics_matches ── lyrics_files
 │   └── playlist_items ── playlists
-├── backup_entries
-└── operation_items ── operations
+└── backup_entries
 ```
 
-以上关系均未存在于当前 v1 schema，必须在对应阶段重新审查并通过新 migration 落地。
+以上关系均未存在于当前 v2 schema，必须在对应阶段重新审查并通过新 migration 落地。
 
 ## 3. 当前已部署的 P1 v1 规范
 
-当前正式 migration 仅包含 v1，共五张表。
+v1 共五张表；v2 在保留这五张表的基础上增加两张重命名审计表。
 
 ### 3.1 schema_migrations（P1 v1 已部署）
 
@@ -177,7 +182,7 @@ P1 当前只对 running audio session 执行 reconciliation；“同 mode”在 
 9. missing 只更新状态，不删除资产记录。
 10. missing 更新与当前 session completed 同事务提交，失败时一起回滚。
 
-## 6. P1 migration、备份与 fail-closed 规则
+## 6. migration、备份与 fail-closed 规则
 
 - migration 版本必须从 1 开始连续、唯一、升序，逐版本记录到 `schema_migrations`。
 - 全新数据库文件或真正空的 SQLite 数据库应用 v1 时不创建备份。
@@ -188,13 +193,69 @@ P1 当前只对 running audio session 执行 reconciliation；“同 mode”在 
 - migration 失败时回滚当前版本的 DDL 和版本记录；已经成功创建的升级前备份保留，供诊断和恢复。
 - 包含未知表或数据、但没有有效 `schema_migrations` 的非空数据库 fail-closed，不原地初始化，也不删除原数据。
 - migration 历史存在断档、版本高于当前程序支持范围或数据库损坏时 fail-closed。
-- 当前正式 migration 只有 v1；测试中注入的 v2 只用于验证升级备份和回滚机制，不代表已经部署 v2 schema。
+- 当前正式 migration 为连续的 `[1, 2]`。全新空库直接应用 v1+v2，不创建备份；已有受管 v1 升级 v2 前必须成功创建一份可打开且 `integrity_check=ok` 的 SQLite Backup API 备份。
+- v2 的 DDL、版本记录或 COMMIT 失败时整体回滚，v1 数据与迁移历史保持不变，升级前备份保留。
+- 已有 v2 幂等打开时不重复备份。旧版只支持 v1 的程序打开 v2 时必须把它视为 future version 并 0 写入；回退只能显式恢复 v1 备份副本，禁止原地 schema downgrade。
 
-## 7. P2～P7 未部署目标草案
+## 7. 当前已部署的 P2-B1 v2 重命名审计规范
 
-以下结构均未存在于当前 v1 数据库。字段、枚举、索引和外键必须在对应阶段重新审查；只有新增连续 migration 并通过升级、回滚和数据保留测试后，才能标记为已部署。
+v2 只提供“计划、逐项状态、数据库原子提交和恢复判定”基础，不打开或修改媒体文件；真实同目录重命名由后续 P2-B2 文件执行器完成。
 
-### 7.1 assets 后续扩展（P2、P6、P7 目标草案，未部署）
+### 7.1 operations（P2-B1 v2 已部署）
+
+| 字段 | 类型 | 当前约束 |
+|---|---|---|
+| id | TEXT | PRIMARY KEY，NOT NULL |
+| operation_type | TEXT | NOT NULL；当前仅 rename |
+| status | TEXT | NOT NULL；planned / running / success / partial / failed / cancelled |
+| success_count | INTEGER | NOT NULL，默认 0，且 `>= 0` |
+| failure_count | INTEGER | NOT NULL，默认 0，且 `>= 0` |
+| summary_json | TEXT | NOT NULL；repository 严格 JSON |
+| created_at | TEXT | NOT NULL |
+| started_at | TEXT | 允许为空 |
+| completed_at | TEXT | 允许为空 |
+
+### 7.2 operation_items（P2-B1 v2 已部署）
+
+| 字段 | 类型 | 当前约束 |
+|---|---|---|
+| id | TEXT | PRIMARY KEY，NOT NULL |
+| operation_id | TEXT | NOT NULL；引用 operations.id，ON DELETE CASCADE |
+| asset_id | TEXT | NOT NULL；引用 assets.id，ON DELETE RESTRICT |
+| source_path | TEXT | NOT NULL |
+| normalized_source_path | TEXT | NOT NULL |
+| target_path | TEXT | NOT NULL |
+| normalized_target_path | TEXT | NOT NULL |
+| expected_size_bytes | INTEGER | NOT NULL，且 `>= 0` |
+| expected_mtime_ns | INTEGER | 允许为空；非空时 `>= 0` |
+| result | TEXT | NOT NULL；planned / running / success / failed / cancelled / rolled_back / rollback_failed |
+| error_code | TEXT | 允许为空 |
+| error_message | TEXT | 允许为空 |
+| before_json | TEXT | NOT NULL；repository 严格 JSON |
+| after_json | TEXT | 允许为空；repository 严格 JSON |
+| created_at | TEXT | NOT NULL |
+| completed_at | TEXT | 允许为空 |
+
+当前约束和索引：
+
+- `UNIQUE(operation_id, asset_id)`、`UNIQUE(operation_id, normalized_source_path)`、`UNIQUE(operation_id, normalized_target_path)`；
+- `idx_operation_items_operation(operation_id, result)`；
+- 对 result 为 planned/running 的 `asset_id` 和 `normalized_target_path` 分别建立部分唯一索引，防止并行活动计划抢占同一资产或 Windows 等价目标；终态历史不阻塞后续计划。
+
+### 7.3 P2-B1 repository 事务边界
+
+1. 创建计划时，operation 与全部 items 在同一个 `BEGIN IMMEDIATE` 中写入；任一资产、路径、指纹、格式、根边界或冲突校验失败时 0 写入。
+2. operation 只允许 planned→running；item 只允许 planned→running。planned item 只能取消，失败、rolled_back 和 rollback_failed 只能从 running 记录。
+3. 单项成功提交在同一事务中重新核对资产源路径与 size/mtime，更新 asset 目标路径、item success/after_json/completed_at 和 operation.success_count；任一步确定失败全部回滚。
+4. operation 最终状态只能从实际 item 聚合推导：全 success→success，全 cancelled→cancelled，有 success 且存在非 success→partial，无 success 且存在失败类→failed；仍有 planned/running 时禁止终结。
+5. repository 在 COMMIT 抛错后检查连接事务状态：仍在事务中则 ROLLBACK，属于确定未提交；已经离开事务则抛 `RepositoryCommitOutcomeUnknown`，不得自动重试或声称回滚。后续执行器必须用新连接同时回读 asset 与 item，只有两者一致时才能决定接受提交或恢复文件，混合/不可读状态必须 fail-closed。
+6. `summary_json`、`before_json` 和 `after_json` 由 repository 使用 `allow_nan=False` 严格序列化/反序列化，不依赖 SQLite JSON1。
+
+## 8. P2-C～P7 未部署目标草案
+
+以下结构均未存在于当前 v2 数据库。字段、枚举、索引和外键必须在对应阶段重新审查；只有新增连续 migration 并通过升级、回滚和数据保留测试后，才能标记为已部署。
+
+### 8.1 assets 后续扩展（P2-C、P6、P7 目标草案，未部署）
 
 计划增加：
 
@@ -204,7 +265,7 @@ P1 当前只对 running audio session 执行 reconciliation；“同 mode”在 
 - `is_standardized`：0 / 1。
 - `deleted_at`：软删除时间。
 
-### 7.2 audio_tracks（P2 目标草案，未部署）
+### 8.2 audio_tracks（P2-C 目标草案，未部署）
 
 | 字段 | 类型 | 目标约束 |
 |---|---|---|
@@ -220,7 +281,7 @@ P1 当前只对 running audio session 执行 reconciliation；“同 mode”在 
 | rename_state | TEXT | unchecked / ready / manual / conflict / completed |
 | checked_at | TEXT | 允许为空 |
 
-### 7.3 lyrics_files（P4 目标草案，未部署）
+### 8.3 lyrics_files（P4 目标草案，未部署）
 
 | 字段 | 类型 | 目标约束 |
 |---|---|---|
@@ -231,7 +292,7 @@ P1 当前只对 running audio session 执行 reconciliation；“同 mode”在 
 | match_state | TEXT | unchecked / matched / possible / unmatched / conflict |
 | checked_at | TEXT | 允许为空 |
 
-### 7.4 lyrics_matches（P4 目标草案，未部署）
+### 8.4 lyrics_matches（P4 目标草案，未部署）
 
 | 字段 | 类型 | 目标约束 |
 |---|---|---|
@@ -265,7 +326,7 @@ ON lyrics_matches(lyric_asset_id)
 WHERE is_current = 1 AND lyric_asset_id IS NOT NULL;
 ```
 
-### 7.5 playlists（P5 目标草案，未部署）
+### 8.5 playlists（P5 目标草案，未部署）
 
 | 字段 | 类型 | 目标约束 |
 |---|---|---|
@@ -278,7 +339,7 @@ WHERE is_current = 1 AND lyric_asset_id IS NOT NULL;
 | updated_at | TEXT | NOT NULL |
 | deleted_at | TEXT | 允许为空 |
 
-### 7.6 playlist_items（P5 目标草案，未部署）
+### 8.6 playlist_items（P5 目标草案，未部署）
 
 | 字段 | 类型 | 目标约束 |
 |---|---|---|
@@ -294,7 +355,7 @@ WHERE is_current = 1 AND lyric_asset_id IS NOT NULL;
 
 目标约束：`UNIQUE(playlist_id, audio_asset_id)`。
 
-### 7.7 scan_sessions 与 scan_items 后续扩展（P6 目标草案，未部署）
+### 8.7 scan_sessions 与 scan_items 后续扩展（P6 目标草案，未部署）
 
 计划增加：
 
@@ -302,40 +363,25 @@ WHERE is_current = 1 AND lyric_asset_id IS NOT NULL;
 - `scan_items.suggested_path`、`sha256`、`selected`。
 - importable / rename_required / duplicate / conflict 等导入分析状态。
 
-### 7.8 operations（P2～P7 目标草案，未部署）
+### 8.8 operations 后续扩展（P2-C～P7 目标草案，未部署）
+
+以下字段和扩展枚举尚未部署；不能与上文 v2 已有字段混淆。
 
 | 字段 | 类型 | 目标约束 |
 |---|---|---|
-| id | TEXT | PRIMARY KEY |
-| operation_type | TEXT | scan / import / rename / match / playlist / delete / restore / undo / purge |
-| status | TEXT | planned / running / success / partial / failed / cancelled |
-| success_count | INTEGER | 默认 0 |
-| failure_count | INTEGER | 默认 0 |
+| operation_type 扩展 | TEXT | scan / import / match / playlist / delete / restore / undo / purge |
 | is_undoable | INTEGER | 0 / 1 |
 | undo_deadline | TEXT | 允许为空 |
 | parent_operation_id | TEXT | 引用 operations.id |
-| summary_json | TEXT | 批次摘要 |
-| started_at | TEXT | NOT NULL |
-| completed_at | TEXT | 允许为空 |
 
-### 7.9 operation_items（P2～P7 目标草案，未部署）
+### 8.9 operation_items 后续扩展（P2-C～P7 目标草案，未部署）
 
 | 字段 | 类型 | 目标约束 |
 |---|---|---|
-| id | TEXT | PRIMARY KEY |
-| operation_id | TEXT | 引用 operations.id |
-| asset_id | TEXT | 引用 assets.id，允许为空 |
-| source_path | TEXT | 允许为空 |
-| target_path | TEXT | 允许为空 |
 | backup_path | TEXT | 允许为空 |
-| result | TEXT | planned / success / skipped / failed / rolled_back |
-| error_code | TEXT | 允许为空 |
-| error_message | TEXT | 允许为空 |
-| before_json | TEXT | 操作前快照 |
-| after_json | TEXT | 操作后快照 |
-| created_at | TEXT | NOT NULL |
+| result 扩展 | TEXT | skipped 等后续操作状态，须由独立 migration 审查 |
 
-### 7.10 backup_entries（P7 目标草案，未部署）
+### 8.10 backup_entries（P7 目标草案，未部署）
 
 | 字段 | 类型 | 目标约束 |
 |---|---|---|
@@ -350,7 +396,7 @@ WHERE is_current = 1 AND lyric_asset_id IS NOT NULL;
 | purged_at | TEXT | 允许为空 |
 | created_at | TEXT | NOT NULL |
 
-## 8. P2～P7 未来事务目标
+## 9. P2-C～P7 未来事务目标
 
 以下规则尚未实现，落地时数据库事务不能替代文件系统回滚，应用层必须维护补偿步骤：
 
@@ -359,8 +405,9 @@ WHERE is_current = 1 AND lyric_asset_id IS NOT NULL;
 - 重命名：文件、元数据和快捷方式全部成功时提交成功；部分失败必须保留可恢复的操作明细。
 - 歌单快捷方式外部变化：更新未来的 `playlist_items.state`，不自动删除用户新增内容。
 
-## 9. 当前验证基线
+## 10. 当前验证基线
 
-- `tests/test_database.py`：五表、字段约束、命名索引、外键级联、无 WAL、migration 幂等、备份和回滚。
+- `tests/test_database.py`：v1 五表、v2 两张审计表、字段约束、命名索引、外键、无 WAL、migration 幂等、升级备份和回滚。
 - `tests/test_library_repository.py`：批次原子性、路径根边界、指纹状态、reconciliation 基线和事务回滚。
 - `tests/test_scan_worker.py`：成功、取消、失败、终态互斥、`committed_count` 及真实两轮 SQLite 重新校准。
+- `tests/test_rename_repository.py`：计划整批校验、状态机、成功原子提交、失败补偿记录、COMMIT 结果不明确与只读 readback。
