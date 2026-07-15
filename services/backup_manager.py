@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
+import hashlib
 import os
 from pathlib import Path
 import stat
@@ -13,7 +14,13 @@ from uuid import uuid4
 from PySide6.QtCore import QObject, QThread, Signal
 
 from repositories import LibraryRepository
-from services.file_safety import _is_reparse, _within_root
+from services.file_safety import (
+    _is_reparse,
+    _locked_directory_chain,
+    _path_key,
+    _validate_directory_chain,
+    _within_root,
+)
 from services.safe_import import import_one
 
 
@@ -76,9 +83,48 @@ def _entry_from_json(value: object) -> BackupEntry:
         )
     except Exception as error:
         raise BackupError("备份清单项字段损坏") from error
-    if not entry.id or not entry.original_path.is_absolute() or not entry.backup_path.is_absolute():
+    if (
+        not entry.id
+        or Path(entry.id).name != entry.id
+        or entry.id in {".", ".."}
+        or not entry.asset_id
+        or entry.kind not in {"audio", "lyric"}
+        or not entry.original_path.is_absolute()
+        or not entry.backup_path.is_absolute()
+        or len(entry.sha256) != 64
+        or any(character not in "0123456789abcdefABCDEF" for character in entry.sha256)
+    ):
         raise BackupError("备份清单包含无效路径或标识")
     return entry
+
+
+def _file_identity(metadata: os.stat_result) -> tuple[int, int, int, int]:
+    return (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+    )
+
+
+def _verified_file_sha256(path: Path) -> str:
+    """Hash one unchanged, ordinary file without following a link/reparse point."""
+
+    before = os.lstat(path)
+    if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode) or _is_reparse(before):
+        raise BackupError("备份路径不是普通文件")
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        opened = os.fstat(handle.fileno())
+        if _file_identity(opened) != _file_identity(before):
+            raise BackupError("备份文件在打开前发生变化")
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+        if _file_identity(os.fstat(handle.fileno())) != _file_identity(opened):
+            raise BackupError("备份文件在校验期间发生变化")
+    if _file_identity(os.lstat(path)) != _file_identity(opened):
+        raise BackupError("备份路径在校验期间发生变化")
+    return digest.hexdigest()
 
 
 class BackupWorker(QThread):
@@ -101,7 +147,8 @@ class BackupWorker(QThread):
         repository = None
         try:
             repository = self._repository_factory()
-            entries = self._load(repository)
+            self._validate_backup_root()
+            entries = self._load(repository, self._backup_root)
             if self._action == "backup":
                 result = self._backup(repository, entries)
             elif self._action == "restore":
@@ -118,13 +165,65 @@ class BackupWorker(QThread):
                 repository.close()
 
     @staticmethod
-    def _load(repository: LibraryRepository) -> list[BackupEntry]:
+    def _validate_backup_root_path(backup_root: Path) -> None:
+        if not isinstance(backup_root, Path) or not backup_root.is_absolute():
+            raise BackupError("备份根目录必须是绝对 Path")
+        try:
+            _validate_directory_chain(backup_root, backup_root)
+        except (OSError, RuntimeError) as error:
+            raise BackupError(f"备份根目录不安全：{error}") from error
+
+    def _validate_backup_root(self) -> None:
+        self._validate_backup_root_path(self._backup_root)
+
+    @staticmethod
+    def _validate_entry(
+        repository: LibraryRepository,
+        backup_root: Path,
+        entry: BackupEntry,
+    ) -> None:
+        expected_parent = backup_root / entry.id
+        if (
+            _path_key(entry.backup_path.parent) != _path_key(expected_parent)
+            or not _within_root(entry.backup_path, expected_parent)
+            or entry.backup_path.name != entry.original_path.name
+        ):
+            raise BackupError("备份清单路径与条目标识不一致")
+        asset = repository.get_asset_by_id(entry.asset_id)
+        if (
+            asset is None
+            or asset.kind != entry.kind
+            or _path_key(asset.canonical_path) != _path_key(entry.original_path)
+        ):
+            raise BackupError("备份清单与索引资产不一致")
+        if expected_parent.exists():
+            try:
+                _validate_directory_chain(backup_root, expected_parent)
+            except (OSError, RuntimeError) as error:
+                raise BackupError(f"备份目录链不安全：{error}") from error
+
+    @classmethod
+    def _load(
+        cls,
+        repository: LibraryRepository,
+        backup_root: Path,
+    ) -> list[BackupEntry]:
         setting = repository.get_setting(BACKUP_MANIFEST_KEY)
         if setting is None:
             return []
         if not isinstance(setting.value, list):
             raise BackupError("备份清单不是列表")
-        return [_entry_from_json(value) for value in setting.value]
+        cls._validate_backup_root_path(backup_root)
+        entries = [_entry_from_json(value) for value in setting.value]
+        ids: set[str] = set()
+        paths: set[str] = set()
+        for entry in entries:
+            if entry.id in ids or _path_key(entry.backup_path) in paths:
+                raise BackupError("备份清单包含重复条目")
+            ids.add(entry.id)
+            paths.add(_path_key(entry.backup_path))
+            cls._validate_entry(repository, backup_root, entry)
+        return entries
 
     @staticmethod
     def _save(repository: LibraryRepository, entries: list[BackupEntry]) -> None:
@@ -171,12 +270,24 @@ class BackupWorker(QThread):
                     moved.sha256,
                     datetime.now(timezone.utc).isoformat(),
                 )
+                self._validate_entry(repository, self._backup_root, entry)
                 candidate_entries = entries + [entry]
                 try:
                     self._save(repository, candidate_entries)
-                except Exception:
-                    import_one(moved.target_path, source_root=directory, target_root=value.source_path.parent)
-                    directory.rmdir()
+                except Exception as save_error:
+                    rollback = import_one(
+                        moved.target_path,
+                        source_root=directory,
+                        target_root=value.source_path.parent,
+                    )
+                    if rollback.status != "success" or _path_key(rollback.target_path) != _path_key(value.source_path):
+                        raise BackupError(
+                            f"备份清单保存失败且源文件恢复失败：{rollback.message}"
+                        ) from save_error
+                    try:
+                        directory.rmdir()
+                    except OSError:
+                        pass
                     raise
                 entries.append(entry)
                 successes += 1
@@ -191,23 +302,53 @@ class BackupWorker(QThread):
         messages: list[str] = []
         updated = list(entries)
         for index, entry in enumerate(entries):
+            if self._cancel.is_set():
+                break
             if entry.id not in wanted or entry.restored_at is not None:
                 continue
             try:
+                self._validate_entry(repository, self._backup_root, entry)
                 if entry.original_path.exists():
                     raise BackupError("原路径已存在，禁止覆盖")
+                with _locked_directory_chain(self._backup_root, entry.backup_path.parent):
+                    if _verified_file_sha256(entry.backup_path) != entry.sha256:
+                        raise BackupError("备份文件 SHA-256 与清单不一致，拒绝恢复")
                 result = import_one(
                     entry.backup_path,
                     source_root=entry.backup_path.parent,
                     target_root=entry.original_path.parent,
                 )
-                if result.status != "success" or result.sha256 != entry.sha256:
-                    raise BackupError("恢复文件哈希不一致")
-                updated[index] = BackupEntry(**{**asdict(entry), "restored_at": datetime.now(timezone.utc).isoformat()})
                 try:
+                    if (
+                        result.status != "success"
+                        or result.sha256 != entry.sha256
+                        or _path_key(result.target_path) != _path_key(entry.original_path)
+                    ):
+                        raise BackupError("恢复文件落位结果与清单不一致")
+                    with _locked_directory_chain(entry.original_path.parent, entry.original_path.parent):
+                        if _verified_file_sha256(entry.original_path) != entry.sha256:
+                            raise BackupError("恢复文件落位后 SHA-256 校验失败")
+                    updated[index] = BackupEntry(
+                        **{
+                            **asdict(entry),
+                            "restored_at": datetime.now(timezone.utc).isoformat(),
+                        }
+                    )
                     self._save(repository, updated)
-                except Exception:
-                    import_one(entry.original_path, source_root=entry.original_path.parent, target_root=entry.backup_path.parent)
+                except Exception as restore_error:
+                    rollback = import_one(
+                        entry.original_path,
+                        source_root=entry.original_path.parent,
+                        target_root=entry.backup_path.parent,
+                    )
+                    updated[index] = entry
+                    if (
+                        rollback.status != "success"
+                        or _path_key(rollback.target_path) != _path_key(entry.backup_path)
+                    ):
+                        raise BackupError(
+                            f"恢复失败且备份文件回滚失败：{rollback.message}"
+                        ) from restore_error
                     raise
                 successes += 1
             except Exception as error:
@@ -217,26 +358,48 @@ class BackupWorker(QThread):
 
     def _cleanup(self, repository: LibraryRepository, entries: list[BackupEntry]) -> BackupRunResult:
         threshold = datetime.now(timezone.utc) - timedelta(days=self._retention_days)
-        kept: list[BackupEntry] = []
+        current = list(entries)
         successes = failures = 0
         messages: list[str] = []
         for entry in entries:
+            if self._cancel.is_set():
+                break
             created = datetime.fromisoformat(entry.created_at)
             if entry.restored_at is not None or created > threshold:
-                kept.append(entry)
                 continue
             try:
-                metadata = os.lstat(entry.backup_path)
-                if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode) or _is_reparse(metadata):
-                    raise BackupError("备份路径不是普通文件")
-                os.unlink(entry.backup_path)
-                entry.backup_path.parent.rmdir()
+                self._validate_entry(repository, self._backup_root, entry)
+                tombstone = entry.backup_path.parent / f".{entry.backup_path.name}.{uuid4().hex}.cleanup"
+                with _locked_directory_chain(self._backup_root, entry.backup_path.parent):
+                    if _verified_file_sha256(entry.backup_path) != entry.sha256:
+                        raise BackupError("备份文件 SHA-256 与清单不一致，拒绝清理")
+                    os.rename(entry.backup_path, tombstone)
+                    candidate = [value for value in current if value.id != entry.id]
+                    try:
+                        self._save(repository, candidate)
+                    except Exception:
+                        os.rename(tombstone, entry.backup_path)
+                        raise
+                    try:
+                        os.unlink(tombstone)
+                    except Exception as unlink_error:
+                        os.rename(tombstone, entry.backup_path)
+                        try:
+                            self._save(repository, current)
+                        except Exception as manifest_error:
+                            raise BackupError(
+                                f"清理失败且清单恢复失败：{manifest_error}"
+                            ) from unlink_error
+                        raise
+                    current = candidate
+                try:
+                    entry.backup_path.parent.rmdir()
+                except OSError:
+                    pass
                 successes += 1
             except Exception as error:
-                kept.append(entry)
                 failures += 1
                 messages.append(f"{entry.backup_path.name}：{error}")
-        self._save(repository, kept)
         return BackupRunResult("cleanup", successes, failures, tuple(messages))
 
 
@@ -258,7 +421,7 @@ class BackupController(QObject):
 
     def list_entries(self) -> tuple[BackupEntry, ...]:
         with self._repository_factory() as repository:
-            return tuple(BackupWorker._load(repository))
+            return tuple(BackupWorker._load(repository, self._backup_root))
 
     def retention_days(self) -> int | None:
         with self._repository_factory() as repository:
