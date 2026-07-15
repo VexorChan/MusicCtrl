@@ -1,0 +1,546 @@
+"""Thread-owned repository for the P1 read-only library index."""
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import sqlite3
+import threading
+from collections.abc import Iterable, Iterator
+from typing import Any
+from uuid import uuid4
+
+from database import DatabaseConfig, apply_migrations, open_database
+
+
+ASSET_KINDS = frozenset({"audio", "lyric"})
+ASSET_STATES = frozenset({"active", "missing", "external_changed"})
+SCAN_MODES = frozenset({"audio", "lyric"})
+SCAN_SESSION_FINAL_STATES = frozenset({"cancelled", "completed", "failed"})
+SCAN_ITEM_STATES = frozenset({"waiting", "indexed", "skipped", "failed"})
+
+
+class RepositoryError(RuntimeError):
+    """Base error for repository boundary violations and corrupt data."""
+
+
+class RepositoryPathError(RepositoryError, ValueError):
+    """Raised when a caller supplies a non-absolute path."""
+
+
+class RepositoryThreadError(RepositoryError):
+    """Raised when a repository is used outside its creating thread."""
+
+
+class RepositoryClosedError(RepositoryError):
+    """Raised when a closed repository is used again."""
+
+
+class RepositoryDataError(RepositoryError, ValueError):
+    """Raised for invalid input data or corrupt persisted JSON."""
+
+
+class RecordNotFoundError(RepositoryError):
+    """Raised when an operation requires a record that does not exist."""
+
+
+@dataclass(frozen=True, slots=True)
+class AssetUpsert:
+    canonical_path: Path
+    size_bytes: int
+    mtime_ns: int | None = None
+    kind: str = "audio"
+    file_state: str = "active"
+
+
+@dataclass(frozen=True, slots=True)
+class AssetRecord:
+    id: str
+    kind: str
+    canonical_path: Path
+    normalized_path: str
+    file_name: str
+    extension: str
+    size_bytes: int
+    mtime_ns: int | None
+    file_state: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class SettingRecord:
+    key: str
+    value: object
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class ScanSessionRecord:
+    id: str
+    mode: str
+    source_folder: Path
+    status: str
+    started_at: str
+    completed_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ScanItemInput:
+    source_path: Path
+    size_bytes: int | None
+    status: str = "waiting"
+    reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ScanItemRecord:
+    id: str
+    session_id: str
+    source_path: Path
+    size_bytes: int | None
+    status: str
+    reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedAsset:
+    canonical_path: Path
+    normalized_path: str
+    file_name: str
+    extension: str
+    size_bytes: int
+    mtime_ns: int | None
+    kind: str
+    file_state: str
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedScanItem:
+    source_path: Path
+    normalized_path: str
+    size_bytes: int | None
+    status: str
+    reason: str | None
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _canonicalize_path(path: Path, *, field_name: str) -> tuple[Path, str]:
+    if not isinstance(path, Path):
+        raise RepositoryPathError(f"{field_name} 必须使用 pathlib.Path")
+    if not path.is_absolute():
+        raise RepositoryPathError(f"{field_name} 必须是绝对路径：{path}")
+
+    canonical_text = os.path.abspath(os.fspath(path))
+    canonical_text = os.path.normpath(canonical_text)
+    canonical_path = Path(canonical_text)
+    normalized_path = os.path.normcase(canonical_text).replace("\\", "/")
+    return canonical_path, normalized_path
+
+
+def _require_non_negative_integer(value: int | None, *, field_name: str, optional: bool) -> None:
+    if value is None and optional:
+        return
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        qualifier = "非负整数或 None" if optional else "非负整数"
+        raise RepositoryDataError(f"{field_name} 必须是{qualifier}")
+
+
+def _require_choice(value: str, choices: frozenset[str], *, field_name: str) -> None:
+    if value not in choices:
+        allowed = "、".join(sorted(choices))
+        raise RepositoryDataError(f"{field_name} 必须是以下值之一：{allowed}")
+
+
+def _strict_json_loads(value_json: str) -> object:
+    def reject_constant(value: str) -> Any:
+        raise ValueError(f"不允许的 JSON 常量：{value}")
+
+    try:
+        return json.loads(value_json, parse_constant=reject_constant)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RepositoryDataError("设置包含损坏或非标准 JSON") from exc
+
+
+class LibraryRepository:
+    """Own one SQLite connection for exactly one creating thread."""
+
+    def __init__(self, config: DatabaseConfig):
+        self._owner_thread_id = threading.get_ident()
+        self._closed = False
+        self._connection = open_database(config)
+        try:
+            apply_migrations(self._connection, config.path)
+        except Exception:
+            self._connection.close()
+            self._closed = True
+            raise
+
+    def __enter__(self) -> LibraryRepository:
+        self._require_open_in_owner_thread()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
+
+    def _require_owner_thread(self) -> None:
+        if threading.get_ident() != self._owner_thread_id:
+            raise RepositoryThreadError("LibraryRepository 只能在创建它的线程中使用和关闭")
+
+    def _require_open_in_owner_thread(self) -> None:
+        self._require_owner_thread()
+        if self._closed:
+            raise RepositoryClosedError("LibraryRepository 已关闭")
+
+    @contextmanager
+    def _transaction(self) -> Iterator[None]:
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+            self._connection.execute("COMMIT")
+        except BaseException:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
+
+    def close(self) -> None:
+        self._require_owner_thread()
+        if self._closed:
+            raise RepositoryClosedError("LibraryRepository 已关闭")
+        self._connection.close()
+        self._closed = True
+
+    def _prepare_asset(self, item: AssetUpsert) -> _PreparedAsset:
+        if not isinstance(item, AssetUpsert):
+            raise RepositoryDataError("资产必须使用 AssetUpsert")
+        canonical_path, normalized_path = _canonicalize_path(
+            item.canonical_path,
+            field_name="canonical_path",
+        )
+        _require_non_negative_integer(item.size_bytes, field_name="size_bytes", optional=False)
+        _require_non_negative_integer(item.mtime_ns, field_name="mtime_ns", optional=True)
+        _require_choice(item.kind, ASSET_KINDS, field_name="kind")
+        _require_choice(item.file_state, ASSET_STATES, field_name="file_state")
+        return _PreparedAsset(
+            canonical_path=canonical_path,
+            normalized_path=normalized_path,
+            file_name=canonical_path.name,
+            extension=canonical_path.suffix.casefold(),
+            size_bytes=item.size_bytes,
+            mtime_ns=item.mtime_ns,
+            kind=item.kind,
+            file_state=item.file_state,
+        )
+
+    @staticmethod
+    def _asset_from_row(row: sqlite3.Row) -> AssetRecord:
+        return AssetRecord(
+            id=row["id"],
+            kind=row["kind"],
+            canonical_path=Path(row["canonical_path"]),
+            normalized_path=row["normalized_path"],
+            file_name=row["file_name"],
+            extension=row["extension"],
+            size_bytes=row["size_bytes"],
+            mtime_ns=row["mtime_ns"],
+            file_state=row["file_state"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def upsert_asset(self, item: AssetUpsert) -> AssetRecord:
+        self._require_open_in_owner_thread()
+        return self.upsert_assets((item,))[0]
+
+    def upsert_assets(self, items: Iterable[AssetUpsert]) -> tuple[AssetRecord, ...]:
+        self._require_open_in_owner_thread()
+        prepared = tuple(self._prepare_asset(item) for item in items)
+        if not prepared:
+            return ()
+
+        records: list[AssetRecord] = []
+        with self._transaction():
+            for item in prepared:
+                now = _utc_now()
+                self._connection.execute(
+                    """
+                    INSERT INTO assets(
+                        id, kind, canonical_path, normalized_path, file_name, extension,
+                        size_bytes, mtime_ns, file_state, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(normalized_path) DO UPDATE SET
+                        kind = excluded.kind,
+                        canonical_path = excluded.canonical_path,
+                        file_name = excluded.file_name,
+                        extension = excluded.extension,
+                        size_bytes = excluded.size_bytes,
+                        mtime_ns = excluded.mtime_ns,
+                        file_state = excluded.file_state,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        str(uuid4()),
+                        item.kind,
+                        os.fspath(item.canonical_path),
+                        item.normalized_path,
+                        item.file_name,
+                        item.extension,
+                        item.size_bytes,
+                        item.mtime_ns,
+                        item.file_state,
+                        now,
+                        now,
+                    ),
+                )
+                row = self._connection.execute(
+                    "SELECT * FROM assets WHERE normalized_path = ?",
+                    (item.normalized_path,),
+                ).fetchone()
+                if row is None:
+                    raise RepositoryDataError("资产写入后无法读取")
+                records.append(self._asset_from_row(row))
+        return tuple(records)
+
+    def get_asset_by_path(self, canonical_path: Path) -> AssetRecord | None:
+        self._require_open_in_owner_thread()
+        _, normalized_path = _canonicalize_path(canonical_path, field_name="canonical_path")
+        row = self._connection.execute(
+            "SELECT * FROM assets WHERE normalized_path = ?",
+            (normalized_path,),
+        ).fetchone()
+        return None if row is None else self._asset_from_row(row)
+
+    def list_assets(
+        self,
+        *,
+        kind: str | None = None,
+        file_state: str | None = None,
+    ) -> tuple[AssetRecord, ...]:
+        self._require_open_in_owner_thread()
+        clauses: list[str] = []
+        parameters: list[str] = []
+        if kind is not None:
+            _require_choice(kind, ASSET_KINDS, field_name="kind")
+            clauses.append("kind = ?")
+            parameters.append(kind)
+        if file_state is not None:
+            _require_choice(file_state, ASSET_STATES, field_name="file_state")
+            clauses.append("file_state = ?")
+            parameters.append(file_state)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._connection.execute(
+            f"SELECT * FROM assets{where} ORDER BY normalized_path, id",
+            parameters,
+        ).fetchall()
+        return tuple(self._asset_from_row(row) for row in rows)
+
+    def set_setting(self, key: str, value: object) -> SettingRecord:
+        self._require_open_in_owner_thread()
+        if not isinstance(key, str) or not key.strip():
+            raise RepositoryDataError("设置 key 必须是非空字符串")
+        try:
+            value_json = json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        except (TypeError, ValueError) as exc:
+            raise RepositoryDataError("设置值必须兼容标准 JSON，且不能包含 NaN 或 Infinity") from exc
+
+        updated_at = _utc_now()
+        with self._transaction():
+            self._connection.execute(
+                """
+                INSERT INTO settings(key, value_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value_json = excluded.value_json,
+                    updated_at = excluded.updated_at
+                """,
+                (key, value_json, updated_at),
+            )
+        return SettingRecord(key=key, value=_strict_json_loads(value_json), updated_at=updated_at)
+
+    def get_setting(self, key: str) -> SettingRecord | None:
+        self._require_open_in_owner_thread()
+        if not isinstance(key, str) or not key.strip():
+            raise RepositoryDataError("设置 key 必须是非空字符串")
+        row = self._connection.execute(
+            "SELECT key, value_json, updated_at FROM settings WHERE key = ?",
+            (key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return SettingRecord(
+            key=row["key"],
+            value=_strict_json_loads(row["value_json"]),
+            updated_at=row["updated_at"],
+        )
+
+    @staticmethod
+    def _scan_session_from_row(row: sqlite3.Row) -> ScanSessionRecord:
+        return ScanSessionRecord(
+            id=row["id"],
+            mode=row["mode"],
+            source_folder=Path(row["source_folder"]),
+            status=row["status"],
+            started_at=row["started_at"],
+            completed_at=row["completed_at"],
+        )
+
+    def create_scan_session(self, *, mode: str, source_folder: Path) -> ScanSessionRecord:
+        self._require_open_in_owner_thread()
+        _require_choice(mode, SCAN_MODES, field_name="mode")
+        canonical_folder, _ = _canonicalize_path(source_folder, field_name="source_folder")
+        session_id = str(uuid4())
+        started_at = _utc_now()
+        with self._transaction():
+            self._connection.execute(
+                """
+                INSERT INTO scan_sessions(id, mode, source_folder, status, started_at)
+                VALUES (?, ?, ?, 'running', ?)
+                """,
+                (session_id, mode, os.fspath(canonical_folder), started_at),
+            )
+        return ScanSessionRecord(
+            id=session_id,
+            mode=mode,
+            source_folder=canonical_folder,
+            status="running",
+            started_at=started_at,
+            completed_at=None,
+        )
+
+    def get_scan_session(self, session_id: str) -> ScanSessionRecord | None:
+        self._require_open_in_owner_thread()
+        row = self._connection.execute(
+            "SELECT * FROM scan_sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        return None if row is None else self._scan_session_from_row(row)
+
+    def finish_scan_session(self, session_id: str, *, status: str) -> ScanSessionRecord:
+        self._require_open_in_owner_thread()
+        _require_choice(status, SCAN_SESSION_FINAL_STATES, field_name="status")
+        completed_at = _utc_now()
+        with self._transaction():
+            cursor = self._connection.execute(
+                """
+                UPDATE scan_sessions
+                SET status = ?, completed_at = ?
+                WHERE id = ? AND status = 'running'
+                """,
+                (status, completed_at, session_id),
+            )
+            if cursor.rowcount != 1:
+                existing = self._connection.execute(
+                    "SELECT status FROM scan_sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if existing is None:
+                    raise RecordNotFoundError(f"扫描会话不存在：{session_id}")
+                raise RepositoryDataError(
+                    f"扫描会话已经结束，不能重复终结：{session_id}"
+                )
+        record = self.get_scan_session(session_id)
+        if record is None:
+            raise RecordNotFoundError(f"扫描会话不存在：{session_id}")
+        return record
+
+    def _prepare_scan_item(self, item: ScanItemInput) -> _PreparedScanItem:
+        if not isinstance(item, ScanItemInput):
+            raise RepositoryDataError("扫描条目必须使用 ScanItemInput")
+        canonical_path, normalized_path = _canonicalize_path(
+            item.source_path,
+            field_name="source_path",
+        )
+        _require_non_negative_integer(item.size_bytes, field_name="size_bytes", optional=True)
+        _require_choice(item.status, SCAN_ITEM_STATES, field_name="status")
+        if item.reason is not None and not isinstance(item.reason, str):
+            raise RepositoryDataError("reason 必须是字符串或 None")
+        return _PreparedScanItem(
+            source_path=canonical_path,
+            normalized_path=normalized_path,
+            size_bytes=item.size_bytes,
+            status=item.status,
+            reason=item.reason,
+        )
+
+    @staticmethod
+    def _scan_item_from_row(row: sqlite3.Row) -> ScanItemRecord:
+        return ScanItemRecord(
+            id=row["id"],
+            session_id=row["session_id"],
+            source_path=Path(row["source_path"]),
+            size_bytes=row["size_bytes"],
+            status=row["status"],
+            reason=row["reason"],
+        )
+
+    def add_scan_items(
+        self,
+        session_id: str,
+        items: Iterable[ScanItemInput],
+    ) -> tuple[ScanItemRecord, ...]:
+        self._require_open_in_owner_thread()
+        prepared = tuple(self._prepare_scan_item(item) for item in items)
+        if not prepared:
+            return ()
+        records: list[ScanItemRecord] = []
+        with self._transaction():
+            session = self._connection.execute(
+                "SELECT status FROM scan_sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if session is None:
+                raise RecordNotFoundError(f"扫描会话不存在：{session_id}")
+            if session["status"] != "running":
+                raise RepositoryDataError(
+                    f"扫描会话已经结束，不能继续写入条目：{session_id}"
+                )
+            for item in prepared:
+                item_id = str(uuid4())
+                self._connection.execute(
+                    """
+                    INSERT INTO scan_items(
+                        id, session_id, source_path, size_bytes, status, reason
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        item_id,
+                        session_id,
+                        item.normalized_path,
+                        item.size_bytes,
+                        item.status,
+                        item.reason,
+                    ),
+                )
+                row = self._connection.execute(
+                    "SELECT * FROM scan_items WHERE id = ?",
+                    (item_id,),
+                ).fetchone()
+                if row is None:
+                    raise RepositoryDataError("扫描条目写入后无法读取")
+                records.append(self._scan_item_from_row(row))
+        return tuple(records)
+
+    def list_scan_items(self, session_id: str) -> tuple[ScanItemRecord, ...]:
+        self._require_open_in_owner_thread()
+        rows = self._connection.execute(
+            """
+            SELECT * FROM scan_items
+            WHERE session_id = ?
+            ORDER BY source_path COLLATE NOCASE, source_path, id
+            """,
+            (session_id,),
+        ).fetchall()
+        return tuple(self._scan_item_from_row(row) for row in rows)
