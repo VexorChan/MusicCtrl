@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QCloseEvent
-from PySide6.QtWidgets import QApplication, QDialog, QHBoxLayout, QMainWindow, QMessageBox, QStackedWidget, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QHBoxLayout, QMainWindow, QMessageBox, QStackedWidget, QVBoxLayout, QWidget
 
 from dialogs.delete_confirm_dialog import DeleteConfirmDialog, DeleteLyricsConfirmDialog, RemovePlaylistItemsDialog
 from dialogs.history_dialog import HistoryDialog
@@ -25,9 +25,11 @@ if TYPE_CHECKING:
     from services.lyrics_match_controller import LyricsMatchController
     from services.metadata_preview import MetadataPreviewController
     from services.safe_rename import SafeRenameController
+    from services.playlist_controller import PlaylistController
 
 from services.metadata_preview import MetadataPreviewInput
 from services.safe_rename import SafeRenameInput
+from services.playlist_controller import PlaylistAudioInput, PlaylistRemovalInput
 
 
 class MainWindow(QMainWindow):
@@ -37,6 +39,7 @@ class MainWindow(QMainWindow):
         metadata_preview_controller: MetadataPreviewController | None = None,
         safe_rename_controller: SafeRenameController | None = None,
         lyrics_match_controller: LyricsMatchController | None = None,
+        playlist_controller: PlaylistController | None = None,
         *,
         use_model_view: bool = False,
     ) -> None:
@@ -45,6 +48,7 @@ class MainWindow(QMainWindow):
         self._metadata_preview_controller = metadata_preview_controller
         self._safe_rename_controller = safe_rename_controller
         self._lyrics_match_controller = lyrics_match_controller
+        self._playlist_controller = playlist_controller
         self._use_model_view = bool(use_model_view)
         self._scan_dialog: ReadOnlyScanDialog | None = None
         self._rename_dialog: RenamePreviewDialog | None = None
@@ -52,6 +56,7 @@ class MainWindow(QMainWindow):
         self._close_pending = False
         self._metadata_inputs_by_asset: dict[str, MetadataPreviewInput] = {}
         self._metadata_results_by_asset: dict[str, object] = {}
+        self._playlist_add_queue: list[tuple[str, tuple[PlaylistAudioInput, ...]]] = []
         self.setWindowTitle("乐库整理助手")
         app = QApplication.instance()
         if app is not None and not app.windowIcon().isNull():
@@ -68,7 +73,7 @@ class MainWindow(QMainWindow):
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.setSpacing(0)
 
-        self.sidebar = Sidebar()
+        self.sidebar = Sidebar(live_mode=playlist_controller is not None)
         self.sidebar.navigation_requested.connect(self.navigate)
         self.sidebar.create_playlist_requested.connect(self.create_playlist)
         root_layout.addWidget(self.sidebar)
@@ -108,12 +113,13 @@ class MainWindow(QMainWindow):
             LibraryPage("所有歌词", lyrics_data, kind="lyrics", display_count=lyrics_count),
         )
         display_counts = {"我喜欢的": 62, "粤语": 36, "通勤": 28, "怀旧": 41, "古巨基": 17}
-        for name, indices in PLAYLIST_MAP.items():
-            records = [SONGS[index] for index in indices]
-            self._add_page(
-                f"playlist:{name}",
-                LibraryPage(name, records, display_count=display_counts.get(name, len(records)), playlist_name=name),
-            )
+        if playlist_controller is None:
+            for name, indices in PLAYLIST_MAP.items():
+                records = [SONGS[index] for index in indices]
+                self._add_page(
+                    f"playlist:{name}",
+                    LibraryPage(name, records, display_count=display_counts.get(name, len(records)), playlist_name=name),
+                )
         self.navigate("所有音乐")
         if scan_controller is not None:
             scan_controller.library_changed.connect(self._replace_music_library)
@@ -144,12 +150,24 @@ class MainWindow(QMainWindow):
                 self._replace_lyrics_library(lyrics_match_controller.load_lyrics_library())
             except Exception as error:
                 lyrics_match_controller.warning.emit(f"无法加载歌词索引：{error}")
+        if playlist_controller is not None:
+            playlist_controller.playlists_changed.connect(self._replace_playlists)
+            playlist_controller.playlist_changed.connect(self._replace_playlist)
+            playlist_controller.completed.connect(self._playlist_completed)
+            playlist_controller.cancelled.connect(self._playlist_cancelled)
+            playlist_controller.failed.connect(self._playlist_failed)
+            playlist_controller.running_changed.connect(self._background_running_changed)
+            try:
+                self._replace_playlists(playlist_controller.list_playlists())
+            except Exception as error:
+                playlist_controller.failed.emit(f"无法加载歌单：{error}")
 
     def _add_page(self, key: str, page: LibraryPage) -> None:
         self.pages[key] = page
         self.stack.addWidget(page)
         page.delete_requested.connect(lambda records, p=page: self._confirm_delete(p, records))
         page.new_playlist_requested.connect(self.create_playlist)
+        page.add_to_playlists_requested.connect(self._add_to_playlists)
 
     def navigate(self, key: str) -> None:
         page = self.pages.get(key)
@@ -331,6 +349,7 @@ class MainWindow(QMainWindow):
             (self._metadata_preview_controller is not None and self._metadata_preview_controller.running)
             or (self._safe_rename_controller is not None and self._safe_rename_controller.running)
             or (self._lyrics_match_controller is not None and self._lyrics_match_controller.running)
+            or (self._playlist_controller is not None and self._playlist_controller.running)
         )
 
     def _start_safe_rename(self, requests: object) -> None:
@@ -537,6 +556,106 @@ class MainWindow(QMainWindow):
     def open_settings(self) -> None:
         self._show_window(SettingsDialog(self))
 
+    def _replace_playlists(self, names: object) -> None:
+        if self._playlist_controller is None or not isinstance(names, (tuple, list)):
+            return
+        clean_names = tuple(str(name) for name in names)
+        wanted = {f"playlist:{name}" for name in clean_names}
+        for key in tuple(self.pages):
+            if not key.startswith("playlist:") or key in wanted:
+                continue
+            page = self.pages.pop(key)
+            self.stack.removeWidget(page)
+            page.deleteLater()
+        self.sidebar.set_playlists(clean_names)
+        for name in clean_names:
+            key = f"playlist:{name}"
+            if key not in self.pages:
+                self._add_page(
+                    key,
+                    LibraryPage(
+                        name,
+                        (),
+                        display_count=0,
+                        playlist_name=name,
+                        live_mode=True,
+                        use_model_view=self._use_model_view,
+                        playlist_names=clean_names,
+                    ),
+                )
+            try:
+                self._replace_playlist(name, self._playlist_controller.load_playlist(name))
+            except Exception as error:
+                self.pages[key].status.setText(f"无法读取歌单：{error}")
+        for page in self.pages.values():
+            page.set_playlist_names(clean_names)
+
+    def _replace_playlist(self, name: str, records: object) -> None:
+        page = self.pages.get(f"playlist:{name}")
+        if page is not None and isinstance(records, (tuple, list)):
+            page.replace_data(records)
+
+    def _add_to_playlists(self, records: object, names: object) -> None:
+        if self._playlist_controller is None:
+            return
+        if self._has_running_background_task():
+            self.pages["所有音乐"].status.setText("已有后台任务运行，请完成后再添加歌单。")
+            return
+        if not isinstance(records, list) or not isinstance(names, list) or not records or not names:
+            self.pages["所有音乐"].status.setText("请选择音乐和至少一个歌单。")
+            return
+        try:
+            inputs = tuple(self._playlist_audio_input(record) for record in records)
+        except Exception as error:
+            self.pages["所有音乐"].status.setText(f"无法添加到歌单：{error}")
+            return
+        self._playlist_add_queue = [(str(name), inputs) for name in names]
+        self._start_next_playlist_add()
+
+    @staticmethod
+    def _playlist_audio_input(record: dict[str, object]) -> PlaylistAudioInput:
+        required = ("_asset_id", "_canonical_path", "_allowed_root", "_file_state")
+        missing = [key for key in required if key not in record]
+        if missing or record.get("_allowed_root") is None:
+            raise ValueError("所选音乐缺少可验证的 P1 扫描来源，请重新扫描")
+        return PlaylistAudioInput(
+            asset_id=record["_asset_id"],  # type: ignore[arg-type]
+            target_path=record["_canonical_path"],  # type: ignore[arg-type]
+            audio_root=record["_allowed_root"],  # type: ignore[arg-type]
+            file_state=record["_file_state"],  # type: ignore[arg-type]
+        )
+
+    def _start_next_playlist_add(self) -> None:
+        if self._playlist_controller is None or not self._playlist_add_queue:
+            return
+        name, inputs = self._playlist_add_queue.pop(0)
+        try:
+            self._playlist_controller.start_add(name, inputs)
+        except Exception as error:
+            self._playlist_add_queue.clear()
+            self.pages["所有音乐"].status.setText(f"无法添加到歌单：{error}")
+
+    def _playlist_completed(self, result: object) -> None:
+        page = self.pages.get("所有音乐")
+        if page is not None:
+            success = getattr(result, "success_count", 0)
+            skipped = getattr(result, "skipped_count", 0)
+            failed = getattr(result, "failure_count", 0)
+            page.status.setText(f"歌单操作完成：成功 {success}，跳过 {skipped}，失败 {failed}")
+        QTimer.singleShot(0, self._start_next_playlist_add)
+
+    def _playlist_cancelled(self, result: object) -> None:
+        self._playlist_add_queue.clear()
+        page = self.pages.get("所有音乐")
+        if page is not None:
+            page.status.setText(f"歌单操作已取消；已完成 {getattr(result, 'success_count', 0)} 项")
+
+    def _playlist_failed(self, message: str) -> None:
+        self._playlist_add_queue.clear()
+        page = self.pages.get("所有音乐")
+        if page is not None:
+            page.status.setText(f"歌单操作失败：{message}")
+
     def create_playlist(self) -> None:
         dialog = CreatePlaylistDialog(self)
         if dialog.exec() != dialog.DialogCode.Accepted:
@@ -544,15 +663,46 @@ class MainWindow(QMainWindow):
         name = dialog.name_input.text().strip()
         if not name:
             return
-        self.sidebar.add_playlist(name)
-        page = LibraryPage(name, [], display_count=0, playlist_name=name)
-        self._add_page(f"playlist:{name}", page)
-        self.navigate(f"playlist:{name}")
+        if self._playlist_controller is None:
+            self.sidebar.add_playlist(name)
+            page = LibraryPage(name, [], display_count=0, playlist_name=name)
+            self._add_page(f"playlist:{name}", page)
+            self.navigate(f"playlist:{name}")
+            return
+        if self._playlist_controller.running:
+            return
+        try:
+            if self._playlist_controller.remembered_root() is None:
+                selected = QFileDialog.getExistingDirectory(self, "选择歌单根目录")
+                if not selected:
+                    return
+                self._playlist_controller.set_root(Path(selected))
+            created = self._playlist_controller.create_playlist(name)
+            self.navigate(f"playlist:{created}")
+        except Exception as error:
+            self.pages["所有音乐"].status.setText(f"无法创建歌单：{error}")
 
     def _confirm_delete(self, page: LibraryPage, records: list[dict]) -> None:
         if not records:
             return
-        self._create_delete_dialog(page, records).exec()
+        dialog = self._create_delete_dialog(page, records)
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
+        if page.playlist_name and self._playlist_controller is not None:
+            try:
+                items = tuple(
+                    PlaylistRemovalInput(
+                        shortcut_path=record["_shortcut_path"],  # type: ignore[arg-type]
+                        expected_target=record["_target_path"],  # type: ignore[arg-type]
+                    )
+                    for record in records
+                    if record.get("_target_path") is not None
+                )
+                if len(items) != len(records):
+                    raise ValueError("损坏或目标未索引的快捷方式需要先修复，不能盲目移除")
+                self._playlist_controller.start_remove(page.playlist_name, items)
+            except Exception as error:
+                page.status.setText(f"无法从歌单移除：{error}")
 
     def _create_delete_dialog(self, page: LibraryPage, records: list[dict]) -> QDialog:
         if page.playlist_name:
@@ -574,6 +724,8 @@ class MainWindow(QMainWindow):
                 self._safe_rename_controller.request_cancel()
             if self._lyrics_match_controller is not None and self._lyrics_match_controller.running:
                 self._lyrics_match_controller.request_cancel()
+            if self._playlist_controller is not None and self._playlist_controller.running:
+                self._playlist_controller.request_cancel()
             event.ignore()
             return
         super().closeEvent(event)
@@ -592,5 +744,9 @@ class MainWindow(QMainWindow):
             or (
                 self._lyrics_match_controller is not None
                 and self._lyrics_match_controller.running
+            )
+            or (
+                self._playlist_controller is not None
+                and self._playlist_controller.running
             )
         )

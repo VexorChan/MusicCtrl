@@ -8,8 +8,10 @@ import unittest
 from services.windows_shortcuts import (
     ShortcutBoundaryError,
     ShortcutConflictError,
+    create_playlist_directory,
     create_shortcut,
     read_shortcut,
+    remove_shortcut,
 )
 
 
@@ -86,6 +88,53 @@ class WindowsShortcutTests(unittest.TestCase):
         outside.write_bytes(b"not a shortcut")
         with self.assertRaises(ShortcutBoundaryError):
             read_shortcut(outside, playlist_root=self.playlist_root)
+
+    def test_playlist_directory_and_remove_only_touch_the_shortcut(self) -> None:
+        folder = create_playlist_directory(playlist_root=self.playlist_root, name="通勤")
+        self.assertEqual(
+            create_playlist_directory(playlist_root=self.playlist_root, name="通勤"),
+            folder,
+        )
+        destination = folder / "晴天-周杰伦.lnk"
+        create_shortcut(
+            target_path=self.target,
+            audio_root=self.audio_root,
+            shortcut_path=destination,
+            playlist_root=self.playlist_root,
+        )
+        audio_snapshot = (self.target.read_bytes(), self.target.stat().st_mtime_ns)
+
+        remove_shortcut(
+            shortcut_path=destination,
+            playlist_root=self.playlist_root,
+            expected_target=self.target,
+        )
+
+        self.assertFalse(destination.exists())
+        self.assertEqual((self.target.read_bytes(), self.target.stat().st_mtime_ns), audio_snapshot)
+
+    def test_playlist_name_and_changed_target_fail_closed(self) -> None:
+        for name in ("", "bad/name", "bad."):
+            with self.subTest(name=name):
+                with self.assertRaises(ShortcutBoundaryError):
+                    create_playlist_directory(playlist_root=self.playlist_root, name=name)
+        folder = create_playlist_directory(playlist_root=self.playlist_root, name="通勤")
+        destination = folder / "song.lnk"
+        create_shortcut(
+            target_path=self.target,
+            audio_root=self.audio_root,
+            shortcut_path=destination,
+            playlist_root=self.playlist_root,
+        )
+        other = self.audio_root / "other.mp3"
+        other.write_bytes(b"other")
+        with self.assertRaises(ShortcutBoundaryError):
+            remove_shortcut(
+                shortcut_path=destination,
+                playlist_root=self.playlist_root,
+                expected_target=other,
+            )
+        self.assertTrue(destination.exists())
 
 
 if __name__ == "__main__":

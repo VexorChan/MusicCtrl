@@ -243,6 +243,7 @@ class LibraryTableModel(QAbstractTableModel):
 class LibraryPage(QWidget):
     delete_requested = Signal(list)
     new_playlist_requested = Signal()
+    add_to_playlists_requested = Signal(object, object)
 
     def __init__(
         self,
@@ -254,6 +255,7 @@ class LibraryPage(QWidget):
         playlist_name: str | None = None,
         use_model_view: bool = False,
         live_mode: bool = False,
+        playlist_names: Iterable[str] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -262,6 +264,7 @@ class LibraryPage(QWidget):
         self.playlist_name = playlist_name
         self.use_model_view = bool(use_model_view)
         self.live_mode = bool(live_mode)
+        self._playlist_names = tuple(PLAYLISTS if playlist_names is None else playlist_names)
         self.all_data = [dict(item, _index=index) for index, item in enumerate(data)]
         self.visible_data = list(self.all_data)
         self.sort_key: str | None = None
@@ -380,6 +383,9 @@ class LibraryPage(QWidget):
         self.visible_data = self._matching_rows(self.search.text())
         self.count_label.setText(f"共 {len(self.all_data)} 首")
         self._populate_table()
+
+    def set_playlist_names(self, names: Iterable[str]) -> None:
+        self._playlist_names = tuple(names)
 
     def _columns(self) -> list[str]:
         if self.kind == "lyrics":
@@ -596,7 +602,7 @@ class LibraryPage(QWidget):
         menu.exec(self.sort_button.mapToGlobal(QPoint(0, self.sort_button.height())))
 
     def create_playlist_menu(self) -> PlaylistAddMenu:
-        menu = PlaylistAddMenu(PLAYLISTS, self)
+        menu = PlaylistAddMenu(self._playlist_names, self)
         menu.create_requested.connect(self.new_playlist_requested)
         menu.confirmed.connect(self._simulate_add_to_playlists)
         return menu
@@ -606,7 +612,11 @@ class LibraryPage(QWidget):
         menu.exec(self.add_button.mapToGlobal(QPoint(0, self.add_button.height())))
 
     def _simulate_add_to_playlists(self, playlists: list[str]) -> None:
-        item_count = len(self._selected_records())
+        records = self._selected_records()
+        if self.live_mode:
+            self.add_to_playlists_requested.emit(records, list(playlists))
+            return
+        item_count = len(records)
         self.status.setText(
             f"已模拟将 {item_count} 项添加到 {len(playlists)} 个歌单    ·    已存在的快捷方式会自动跳过"
         )

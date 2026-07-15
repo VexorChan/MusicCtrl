@@ -487,6 +487,7 @@ class P2RenameIntegrationTests(unittest.TestCase):
         metadata_controller = Mock()
         safe_controller = Mock()
         lyrics_controller = Mock()
+        playlist_controller = Mock()
         with (
             patch.object(main_module, "build_app", return_value=app),
             patch.object(
@@ -514,6 +515,11 @@ class P2RenameIntegrationTests(unittest.TestCase):
                 "LyricsMatchController",
                 return_value=lyrics_controller,
             ),
+            patch.object(
+                main_module,
+                "PlaylistController",
+                return_value=playlist_controller,
+            ),
             patch.object(main_module, "MainWindow", return_value=window) as window_type,
         ):
             self.assertEqual(main_module.main(), 23)
@@ -530,6 +536,7 @@ class P2RenameIntegrationTests(unittest.TestCase):
                 metadata_controller,
                 safe_controller,
                 lyrics_controller,
+                playlist_controller,
                 use_model_view=True,
             )
         window.show.assert_called_once_with()

@@ -27,7 +27,7 @@ class Sidebar(QWidget):
     navigation_requested = Signal(str)
     create_playlist_requested = Signal()
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, parent: QWidget | None = None, *, live_mode: bool = False) -> None:
         super().__init__(parent)
         self.setObjectName("Sidebar")
         self.setFixedWidth(216)
@@ -105,7 +105,7 @@ class Sidebar(QWidget):
         self.playlist_layout = QVBoxLayout(scroll_host)
         self.playlist_layout.setContentsMargins(0, 0, 0, 0)
         self.playlist_layout.setSpacing(4)
-        for playlist in PLAYLISTS:
+        for playlist in (() if live_mode else PLAYLISTS):
             button = self._nav_button(f"playlist:{playlist}", playlist)
             self._playlist_buttons[playlist] = button
             self.playlist_layout.addWidget(button)
@@ -113,7 +113,7 @@ class Sidebar(QWidget):
         scroll.setWidget(scroll_host)
         root.addWidget(scroll, 1)
 
-        version = QLabel("仅 UI 演示 · 不会操作真实文件")
+        version = QLabel("本地文件管理" if live_mode else "仅 UI 演示 · 不会操作真实文件")
         version.setObjectName("Hint")
         version.setAlignment(Qt.AlignmentFlag.AlignCenter)
         root.addWidget(version)
@@ -145,3 +145,14 @@ class Sidebar(QWidget):
         button = self._nav_button(f"playlist:{name}", name)
         self._playlist_buttons[name] = button
         self.playlist_layout.insertWidget(self.playlist_layout.count() - 1, button)
+
+    def set_playlists(self, names: tuple[str, ...] | list[str]) -> None:
+        for name, button in tuple(self._playlist_buttons.items()):
+            self._group.removeButton(button)
+            self._buttons.pop(f"playlist:{name}", None)
+            self.playlist_layout.removeWidget(button)
+            button.deleteLater()
+        self._playlist_buttons.clear()
+        for name in names:
+            self.add_playlist(name)
+        self._filter_playlists(self.search.text())
