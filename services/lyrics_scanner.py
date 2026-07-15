@@ -9,6 +9,8 @@ from pathlib import Path
 import re
 import stat
 
+from mutagen import File as MutagenFile
+
 from services.file_safety import (
     _identity,
     _is_reparse,
@@ -171,6 +173,62 @@ def _read_lrc(path: Path, root: Path) -> LyricsFileEntry:
         title=title,
         artist=artist,
     )
+
+
+def detect_embedded_lyrics(path: Path, *, allowed_root: Path) -> bool:
+    """Read embedded lyric tags through one verified, read-only file handle."""
+
+    if not isinstance(path, Path) or not isinstance(allowed_root, Path):
+        raise LyricsScanError("音频路径和允许根必须使用 pathlib.Path")
+    if not path.is_absolute() or not allowed_root.is_absolute():
+        raise LyricsScanError("音频路径和允许根必须是绝对路径")
+    if not _within_root(path, allowed_root):
+        raise LyricsScanError("音频路径超出 P1 授权根")
+    _validate_root(allowed_root, allowed_root)
+    try:
+        with _locked_directory_chain(allowed_root, path.parent):
+            before = os.lstat(path)
+            if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode) or _is_reparse(before):
+                raise LyricsScanError(f"音频路径不是普通文件：{path}")
+            with path.open("rb") as stream:
+                if _identity(os.fstat(stream.fileno())) != _identity(before):
+                    raise LyricsScanError(f"安全检查与打开之间音频发生变化：{path}")
+                media = MutagenFile(stream, easy=False)
+                if _identity(os.fstat(stream.fileno())) != _identity(before):
+                    raise LyricsScanError(f"读取内嵌歌词期间音频发生变化：{path}")
+            after = os.lstat(path)
+            if _identity(after) != _identity(before):
+                raise LyricsScanError(f"读取后音频路径发生变化：{path}")
+    except LyricsScanError:
+        raise
+    except OSError as error:
+        raise LyricsScanError(f"无法安全读取音频内嵌歌词：{path}") from error
+    except Exception as error:
+        raise LyricsScanError(f"音频标签无法解析：{path}") from error
+
+    tags = None if media is None else getattr(media, "tags", None)
+    if tags is None:
+        return False
+    try:
+        items = tags.items()
+    except AttributeError:
+        return False
+    for key, value in items:
+        normalized_key = str(key).casefold()
+        if not (
+            normalized_key.startswith("uslt")
+            or normalized_key.startswith("sylt")
+            or "lyrics" in normalized_key
+            or normalized_key in {"©lyr", "\xa9lyr"}
+        ):
+            continue
+        text = getattr(value, "text", value)
+        if isinstance(text, (list, tuple)):
+            if any(str(item).strip() for item in text):
+                return True
+        elif str(text).strip():
+            return True
+    return False
 
 
 def iter_lrc_files(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QTimer, Qt
@@ -21,6 +22,7 @@ from ui.toolbars import GlobalToolbar
 
 if TYPE_CHECKING:
     from services.library_scan_controller import LibraryScanController
+    from services.lyrics_match_controller import LyricsMatchController
     from services.metadata_preview import MetadataPreviewController
     from services.safe_rename import SafeRenameController
 
@@ -34,6 +36,7 @@ class MainWindow(QMainWindow):
         scan_controller: LibraryScanController | None = None,
         metadata_preview_controller: MetadataPreviewController | None = None,
         safe_rename_controller: SafeRenameController | None = None,
+        lyrics_match_controller: LyricsMatchController | None = None,
         *,
         use_model_view: bool = False,
     ) -> None:
@@ -41,9 +44,11 @@ class MainWindow(QMainWindow):
         self._scan_controller = scan_controller
         self._metadata_preview_controller = metadata_preview_controller
         self._safe_rename_controller = safe_rename_controller
+        self._lyrics_match_controller = lyrics_match_controller
         self._use_model_view = bool(use_model_view)
         self._scan_dialog: ReadOnlyScanDialog | None = None
         self._rename_dialog: RenamePreviewDialog | None = None
+        self._lyrics_dialog: LyricsMatchDialog | None = None
         self._close_pending = False
         self._metadata_inputs_by_asset: dict[str, MetadataPreviewInput] = {}
         self._metadata_results_by_asset: dict[str, object] = {}
@@ -96,7 +101,12 @@ class MainWindow(QMainWindow):
                 live_mode=scan_controller is not None,
             ),
         )
-        self._add_page("所有歌词", LibraryPage("所有歌词", LYRICS, kind="lyrics", display_count=214))
+        lyrics_data = LYRICS if lyrics_match_controller is None else []
+        lyrics_count = 214 if lyrics_match_controller is None else 0
+        self._add_page(
+            "所有歌词",
+            LibraryPage("所有歌词", lyrics_data, kind="lyrics", display_count=lyrics_count),
+        )
         display_counts = {"我喜欢的": 62, "粤语": 36, "通勤": 28, "怀旧": 41, "古巨基": 17}
         for name, indices in PLAYLIST_MAP.items():
             records = [SONGS[index] for index in indices]
@@ -122,6 +132,18 @@ class MainWindow(QMainWindow):
             safe_rename_controller.cancelled.connect(self._safe_rename_cancelled)
             safe_rename_controller.failed.connect(self._safe_rename_failed)
             safe_rename_controller.running_changed.connect(self._safe_rename_running_changed)
+        if lyrics_match_controller is not None:
+            lyrics_match_controller.lyrics_changed.connect(self._replace_lyrics_library)
+            lyrics_match_controller.results_ready.connect(self._lyrics_results_ready)
+            lyrics_match_controller.cancelled.connect(self._lyrics_cancelled)
+            lyrics_match_controller.failed.connect(self._lyrics_failed)
+            lyrics_match_controller.warning.connect(self._lyrics_warning)
+            lyrics_match_controller.match_changed.connect(self._lyrics_warning)
+            lyrics_match_controller.running_changed.connect(self._lyrics_running_changed)
+            try:
+                self._replace_lyrics_library(lyrics_match_controller.load_lyrics_library())
+            except Exception as error:
+                lyrics_match_controller.warning.emit(f"无法加载歌词索引：{error}")
 
     def _add_page(self, key: str, page: LibraryPage) -> None:
         self.pages[key] = page
@@ -197,6 +219,9 @@ class MainWindow(QMainWindow):
     def _replace_music_library(self, records) -> None:
         self.pages["所有音乐"].replace_data(records)
 
+    def _replace_lyrics_library(self, records) -> None:
+        self.pages["所有歌词"].replace_data(records)
+
     def _background_running_changed(self, _running: bool) -> None:
         if self._close_pending and not self._has_running_background_task():
             QTimer.singleShot(0, self.close)
@@ -229,6 +254,9 @@ class MainWindow(QMainWindow):
             return
         if self._scan_controller.running:
             dialog.show_warning("只读扫描正在运行，请完成或取消后再分析歌曲信息。")
+            return
+        if self._lyrics_match_controller is not None and self._lyrics_match_controller.running:
+            dialog.show_warning("歌词扫描与匹配正在运行，请完成或取消后再分析歌曲信息。")
             return
         if self._safe_rename_controller is not None and self._safe_rename_controller.running:
             dialog.show_warning("安全重命名正在运行，请等待当前任务结束。")
@@ -302,6 +330,7 @@ class MainWindow(QMainWindow):
         return bool(
             (self._metadata_preview_controller is not None and self._metadata_preview_controller.running)
             or (self._safe_rename_controller is not None and self._safe_rename_controller.running)
+            or (self._lyrics_match_controller is not None and self._lyrics_match_controller.running)
         )
 
     def _start_safe_rename(self, requests: object) -> None:
@@ -312,6 +341,9 @@ class MainWindow(QMainWindow):
             return
         if self._metadata_preview_controller is not None and self._metadata_preview_controller.running:
             self._rename_dialog.show_warning("歌曲信息分析尚未结束，不能开始重命名。")
+            return
+        if self._lyrics_match_controller is not None and self._lyrics_match_controller.running:
+            self._rename_dialog.show_warning("歌词扫描与匹配正在运行，不能同时重命名。")
             return
         if self._safe_rename_controller.running:
             self._rename_dialog.show_warning("已有安全重命名任务正在运行。")
@@ -426,7 +458,78 @@ class MainWindow(QMainWindow):
                 self._rename_dialog.show_warning(f"重命名结果已记录，但列表刷新失败：{error}")
 
     def open_lyrics_match(self) -> None:
-        self._show_window(LyricsMatchDialog(self))
+        if self._lyrics_match_controller is None:
+            self._show_window(LyricsMatchDialog(self))
+            return
+        if self._lyrics_dialog is not None:
+            self._lyrics_dialog.show()
+            self._lyrics_dialog.raise_()
+            self._lyrics_dialog.activateWindow()
+            return
+        dialog = LyricsMatchDialog(self, live_mode=True)
+        self._lyrics_dialog = dialog
+        dialog.destroyed.connect(lambda: setattr(self, "_lyrics_dialog", None))
+        dialog.scan_requested.connect(self._start_lyrics_scan)
+        dialog.candidate_requested.connect(self._commit_lyrics_candidate)
+        dialog.cancel_match_requested.connect(self._cancel_lyrics_match)
+        dialog.cancel_scan_requested.connect(self._lyrics_match_controller.request_cancel)
+        remembered = self._lyrics_match_controller.remembered_root()
+        if remembered is not None:
+            dialog.path_input.setText(str(remembered))
+        dialog.set_running(self._lyrics_match_controller.running)
+        self._show_window(dialog)
+
+    def _start_lyrics_scan(self, root: Path) -> None:
+        controller = self._lyrics_match_controller
+        if controller is None or self._lyrics_dialog is None:
+            return
+        if (
+            (self._scan_controller is not None and self._scan_controller.running)
+            or self._has_running_rename_task()
+        ):
+            self._lyrics_dialog.show_warning("音频扫描、信息分析或重命名正在运行，请完成后再匹配歌词。")
+            return
+        try:
+            controller.start_scan(root)
+        except Exception as error:
+            self._lyrics_dialog.show_warning(f"无法开始歌词扫描：{error}")
+
+    def _lyrics_results_ready(self, result: object) -> None:
+        if self._lyrics_dialog is not None:
+            self._lyrics_dialog.show_results(result)
+
+    def _lyrics_cancelled(self, count: int) -> None:
+        if self._lyrics_dialog is not None:
+            self._lyrics_dialog.show_warning(f"歌词扫描已取消；已安全提交 {count} 个索引。")
+
+    def _lyrics_failed(self, message: str) -> None:
+        if self._lyrics_dialog is not None:
+            self._lyrics_dialog.show_warning(f"歌词扫描失败：{message}")
+
+    def _lyrics_warning(self, message: str) -> None:
+        if self._lyrics_dialog is not None:
+            self._lyrics_dialog.show_warning(message)
+
+    def _lyrics_running_changed(self, running: bool) -> None:
+        if self._lyrics_dialog is not None:
+            self._lyrics_dialog.set_running(running)
+        self._background_running_changed(running)
+
+    def _commit_lyrics_candidate(self, token: str) -> None:
+        if self._lyrics_match_controller is None or self._lyrics_dialog is None:
+            return
+        try:
+            self._lyrics_match_controller.commit_candidate(token)
+        except Exception as error:
+            self._lyrics_dialog.show_warning(f"无法保存歌词匹配：{error}")
+
+    def _cancel_lyrics_match(self, audio_asset_id: str) -> None:
+        if self._lyrics_match_controller is None or self._lyrics_dialog is None:
+            return
+        try:
+            self._lyrics_match_controller.cancel_current_match(audio_asset_id)
+        except Exception as error:
+            self._lyrics_dialog.show_warning(f"无法取消歌词匹配：{error}")
 
     def open_history(self) -> None:
         self._show_window(HistoryDialog(self))
@@ -469,6 +572,8 @@ class MainWindow(QMainWindow):
                 self._metadata_preview_controller.request_cancel()
             if self._safe_rename_controller is not None and self._safe_rename_controller.running:
                 self._safe_rename_controller.request_cancel()
+            if self._lyrics_match_controller is not None and self._lyrics_match_controller.running:
+                self._lyrics_match_controller.request_cancel()
             event.ignore()
             return
         super().closeEvent(event)
@@ -483,5 +588,9 @@ class MainWindow(QMainWindow):
             or (
                 self._safe_rename_controller is not None
                 and self._safe_rename_controller.running
+            )
+            or (
+                self._lyrics_match_controller is not None
+                and self._lyrics_match_controller.running
             )
         )

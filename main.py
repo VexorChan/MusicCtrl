@@ -10,6 +10,7 @@ from PySide6.QtWidgets import QApplication
 from database import DatabaseConfig
 from repositories import LibraryRepository
 from services.library_scan_controller import LibraryScanController
+from services.lyrics_match_controller import LyricsMatchController
 from services.metadata_preview import MetadataPreviewController
 from services.safe_rename import SafeRenameController
 from ui.main_window import MainWindow
@@ -63,10 +64,12 @@ def main() -> int:
     safe_rename_controller = SafeRenameController(
         lambda: LibraryRepository(database_config)
     )
+    lyrics_match_controller = LyricsMatchController(database_config)
     window = MainWindow(
         controller,
         metadata_preview_controller,
         safe_rename_controller,
+        lyrics_match_controller,
         use_model_view=True,
     )
     window.show()

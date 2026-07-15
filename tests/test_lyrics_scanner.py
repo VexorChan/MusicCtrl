@@ -5,12 +5,17 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import threading
 import unittest
+import wave
+
+from mutagen.id3 import USLT
+from mutagen.wave import WAVE
 
 from services.lyrics_scanner import (
     AudioLyricsInput,
     LyricsScanCancelled,
     LyricsScanError,
     build_lyrics_candidates,
+    detect_embedded_lyrics,
     enumerate_lrc_files,
     iter_lrc_files,
 )
@@ -42,6 +47,27 @@ class LyricsScannerTests(unittest.TestCase):
         self.assertEqual([(item.title, item.artist) for item in result], [("富士山下", "陈奕迅"), ("晴天", "周杰伦")])
         for path, snapshot in snapshots.items():
             self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), snapshot)
+
+    def test_embedded_lyrics_use_verified_read_only_handle_and_preserve_audio(self) -> None:
+        path = self.root / "embedded.wav"
+        with wave.open(os.fspath(path), "wb") as stream:
+            stream.setnchannels(1)
+            stream.setsampwidth(1)
+            stream.setframerate(8000)
+            stream.writeframes(b"\x80" * 32)
+        media = WAVE(os.fspath(path))
+        media.add_tags()
+        media.tags.add(USLT(encoding=3, lang="zho", desc="", text="内嵌歌词"))
+        media.save()
+        snapshot = (path.read_bytes(), path.stat().st_size, path.stat().st_mtime_ns)
+
+        self.assertTrue(detect_embedded_lyrics(path, allowed_root=self.root))
+        self.assertEqual(
+            (path.read_bytes(), path.stat().st_size, path.stat().st_mtime_ns),
+            snapshot,
+        )
+        with self.assertRaises(LyricsScanError):
+            detect_embedded_lyrics(path, allowed_root=self.root / "other")
 
     def test_utf8_bom_gb18030_and_big5_are_decoded_without_writing(self) -> None:
         paths = (

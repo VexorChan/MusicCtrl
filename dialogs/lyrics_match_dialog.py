@@ -1,13 +1,20 @@
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from pathlib import Path
+
+from PySide6.QtCore import Signal, Qt
+from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
+    QFileDialog,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QPushButton,
     QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -18,8 +25,25 @@ from ui.components import make_status_badge
 
 
 class LyricsMatchDialog(PrototypeDialog):
-    def __init__(self, parent: QWidget | None = None) -> None:
+    scan_requested = Signal(object)
+    candidate_requested = Signal(str)
+    cancel_match_requested = Signal(str)
+    cancel_scan_requested = Signal()
+
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        live_mode: bool = False,
+        initial_root: Path | None = None,
+    ) -> None:
         super().__init__("歌词匹配", (1020, 660), parent)
+        self.live_mode = bool(live_mode)
+        self._running = False
+        self._close_pending = False
+        if self.live_mode:
+            self._build_live(initial_root)
+            return
         root = QVBoxLayout(self)
         root.setContentsMargins(22, 18, 22, 18)
         root.setSpacing(12)
@@ -45,6 +69,162 @@ class LyricsMatchDialog(PrototypeDialog):
         close.clicked.connect(self.close)
         close_row.addWidget(close)
         root.addLayout(close_row)
+
+    def _build_live(self, initial_root: Path | None) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(22, 18, 22, 18)
+        root.setSpacing(12)
+        root.addWidget(dialog_header("歌词匹配", "只扫描你明确选择的 LRC 目录；高置信度自动匹配，其余由你确认。"))
+
+        path_row = QHBoxLayout()
+        self.path_input = QLineEdit()
+        self.path_input.setPlaceholderText("选择包含 .lrc 的文件夹")
+        if initial_root is not None:
+            self.path_input.setText(str(initial_root))
+        browse = QPushButton("选择文件夹")
+        browse.clicked.connect(self._browse_root)
+        self.start_button = QPushButton("开始扫描并匹配")
+        self.start_button.setObjectName("PrimaryButton")
+        self.start_button.clicked.connect(self._start_live_scan)
+        path_row.addWidget(self.path_input, 1)
+        path_row.addWidget(browse)
+        path_row.addWidget(self.start_button)
+        root.addLayout(path_row)
+
+        self.summary = QLabel("请选择目录后开始；不会修改歌词或音频文件。")
+        self.summary.setWordWrap(True)
+        root.addWidget(self.summary)
+
+        self.results = QTableWidget(0, 5)
+        self.results.setHorizontalHeaderLabels(["音频", "歌词候选", "置信度", "状态", "说明"])
+        self.results.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.results.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.results.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.results.horizontalHeader().setStretchLastSection(True)
+        self.results.setColumnWidth(0, 220)
+        self.results.setColumnWidth(1, 240)
+        self.results.setColumnWidth(2, 80)
+        self.results.setColumnWidth(3, 120)
+        self.results.currentCellChanged.connect(lambda *_args: self._update_live_actions())
+        root.addWidget(self.results, 1)
+
+        actions = QHBoxLayout()
+        self.use_button = QPushButton("确认使用所选歌词")
+        self.use_button.setObjectName("PrimaryButton")
+        self.use_button.clicked.connect(self._use_selected)
+        self.cancel_match_button = QPushButton("取消当前匹配")
+        self.cancel_match_button.clicked.connect(self._cancel_selected_match)
+        actions.addWidget(self.use_button)
+        actions.addWidget(self.cancel_match_button)
+        actions.addStretch(1)
+        self.close_button = QPushButton("关闭")
+        self.close_button.clicked.connect(self.close)
+        actions.addWidget(self.close_button)
+        root.addLayout(actions)
+        self._update_live_actions()
+
+    def _browse_root(self) -> None:
+        selected = QFileDialog.getExistingDirectory(self, "选择 LRC 歌词目录", self.path_input.text())
+        if selected:
+            self.path_input.setText(selected)
+
+    def _start_live_scan(self) -> None:
+        text = self.path_input.text().strip()
+        if not text:
+            self.show_warning("请先选择 LRC 歌词目录")
+            return
+        path = Path(text)
+        if not path.is_absolute():
+            self.show_warning("歌词目录必须是绝对路径")
+            return
+        self.scan_requested.emit(path)
+
+    def set_running(self, running: bool) -> None:
+        if not self.live_mode:
+            return
+        self._running = bool(running)
+        self.path_input.setEnabled(not running)
+        self.start_button.setEnabled(not running)
+        self.start_button.setText("正在扫描…" if running else "开始扫描并匹配")
+        if running:
+            self.results.setRowCount(0)
+            self.summary.setText("正在后台扫描、索引并匹配；关闭窗口会安全取消。")
+        self._update_live_actions()
+        if not running and self._close_pending:
+            self._close_pending = False
+            self.close()
+
+    def show_results(self, result: object) -> None:
+        if not self.live_mode:
+            return
+        items = tuple(getattr(result, "items", ()))
+        self.results.setRowCount(len(items))
+        for row, item in enumerate(items):
+            candidate = "内嵌歌词" if getattr(item, "source_kind", "") == "embedded" else (
+                "—" if getattr(item, "lyric_path", None) is None else Path(item.lyric_path).name
+            )
+            values = (
+                getattr(item, "audio_label", ""),
+                candidate,
+                f"{getattr(item, 'confidence', 0)}%",
+                getattr(item, "status", ""),
+                getattr(item, "message", ""),
+            )
+            for column, value in enumerate(values):
+                cell = QTableWidgetItem(str(value))
+                cell.setData(Qt.ItemDataRole.UserRole, getattr(item, "token", ""))
+                cell.setData(Qt.ItemDataRole.UserRole + 1, getattr(item, "audio_asset_id", ""))
+                cell.setData(Qt.ItemDataRole.UserRole + 2, bool(getattr(item, "lyric_asset_id", None)))
+                cell.setData(
+                    Qt.ItemDataRole.UserRole + 3,
+                    bool(getattr(item, "requires_confirmation", False)),
+                )
+                self.results.setItem(row, column, cell)
+        self.summary.setText(
+            f"已索引 {getattr(result, 'indexed_count', 0)} 个 LRC，"
+            f"自动匹配 {getattr(result, 'automatic_count', 0)} 项；其余请人工确认。"
+        )
+        if items:
+            self.results.selectRow(0)
+        self._update_live_actions()
+
+    def show_warning(self, message: str) -> None:
+        if self.live_mode:
+            self.summary.setText(message)
+
+    def _selected_cell(self) -> QTableWidgetItem | None:
+        row = self.results.currentRow() if self.live_mode else -1
+        return None if row < 0 else self.results.item(row, 0)
+
+    def _update_live_actions(self) -> None:
+        if not self.live_mode:
+            return
+        cell = self._selected_cell()
+        has_manual_candidate = bool(
+            cell
+            and cell.data(Qt.ItemDataRole.UserRole + 2)
+            and cell.data(Qt.ItemDataRole.UserRole + 3)
+        )
+        self.use_button.setEnabled(not self._running and has_manual_candidate)
+        self.cancel_match_button.setEnabled(not self._running and cell is not None)
+
+    def _use_selected(self) -> None:
+        cell = self._selected_cell()
+        if cell is not None:
+            self.candidate_requested.emit(str(cell.data(Qt.ItemDataRole.UserRole)))
+
+    def _cancel_selected_match(self) -> None:
+        cell = self._selected_cell()
+        if cell is not None:
+            self.cancel_match_requested.emit(str(cell.data(Qt.ItemDataRole.UserRole + 1)))
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        if self.live_mode and self._running:
+            self._close_pending = True
+            self.cancel_scan_requested.emit()
+            event.ignore()
+            return
+        super().closeEvent(event)
 
     def _match_panel(self, conflict: bool) -> QWidget:
         panel = QWidget()
@@ -103,4 +283,3 @@ class LyricsMatchDialog(PrototypeDialog):
         splitter.setSizes([320, 620])
         layout.addWidget(splitter)
         return panel
-
