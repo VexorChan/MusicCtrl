@@ -166,6 +166,45 @@ MIGRATIONS = (
             """,
         ),
     ),
+    Migration(
+        version=3,
+        description="P4 lyrics match history",
+        statements=(
+            """
+            CREATE TABLE lyrics_matches (
+                id TEXT PRIMARY KEY NOT NULL,
+                audio_asset_id TEXT NOT NULL
+                    REFERENCES assets(id) ON DELETE RESTRICT,
+                lyric_asset_id TEXT
+                    REFERENCES assets(id) ON DELETE RESTRICT,
+                source_kind TEXT NOT NULL
+                    CHECK (source_kind IN ('embedded', 'external')),
+                confidence INTEGER NOT NULL CHECK (confidence BETWEEN 0 AND 100),
+                method TEXT NOT NULL CHECK (method IN ('automatic', 'manual')),
+                state TEXT NOT NULL CHECK (state IN ('matched', 'cancelled')),
+                is_current INTEGER NOT NULL CHECK (is_current IN (0, 1)),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                CHECK (is_current = 0 OR state = 'matched'),
+                CHECK (
+                    (source_kind = 'embedded' AND lyric_asset_id IS NULL)
+                    OR (source_kind = 'external' AND lyric_asset_id IS NOT NULL)
+                )
+            )
+            """,
+            """
+            CREATE UNIQUE INDEX uq_current_lyrics_by_audio
+            ON lyrics_matches(audio_asset_id)
+            WHERE is_current = 1
+            """,
+            """
+            CREATE UNIQUE INDEX uq_current_audio_by_external_lyric
+            ON lyrics_matches(lyric_asset_id)
+            WHERE is_current = 1 AND lyric_asset_id IS NOT NULL
+            """,
+            "CREATE INDEX idx_lyrics_matches_audio_history ON lyrics_matches(audio_asset_id, created_at)",
+        ),
+    ),
 )
 
 

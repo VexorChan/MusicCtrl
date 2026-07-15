@@ -118,7 +118,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertGreaterEqual(len(MIGRATIONS), 2)
         connection = self.open()
 
-        result = apply_migrations(connection, self.database_path)
+        result = apply_migrations(connection, self.database_path, migrations=MIGRATIONS[:2])
 
         self.assertEqual(result.applied_versions, (1, 2))
         self.assertIsNone(result.backup_path)
@@ -272,7 +272,7 @@ class DatabaseTests(unittest.TestCase):
                 (now,),
             )
 
-        again = apply_migrations(connection, self.database_path)
+        again = apply_migrations(connection, self.database_path, migrations=MIGRATIONS[:2])
         self.assertEqual(again.applied_versions, ())
         self.assertIsNone(again.backup_path)
 
@@ -282,7 +282,7 @@ class DatabaseTests(unittest.TestCase):
             "INSERT INTO settings(key, value_json, updated_at) VALUES ('v1-sentinel', '1', 'now')"
         )
 
-        result = apply_migrations(connection, self.database_path)
+        result = apply_migrations(connection, self.database_path, migrations=MIGRATIONS[:2])
 
         self.assertEqual(result.applied_versions, (2,))
         self.assertIsNotNone(result.backup_path)
@@ -299,13 +299,144 @@ class DatabaseTests(unittest.TestCase):
             )
         finally:
             backup.close()
-        self.assertEqual(apply_migrations(connection, self.database_path).applied_versions, ())
+        self.assertEqual(
+            apply_migrations(
+                connection,
+                self.database_path,
+                migrations=MIGRATIONS[:2],
+            ).applied_versions,
+            (),
+        )
         self.assertEqual(len(list(self.root.glob("*.backup.sqlite3"))), 1)
+
+    def test_v3_adds_lyrics_history_with_backup_constraints_and_indexes(self) -> None:
+        connection = self.open()
+        self.assertEqual(
+            apply_migrations(
+                connection,
+                self.database_path,
+                migrations=MIGRATIONS[:2],
+            ).applied_versions,
+            (1, 2),
+        )
+        now = "2026-01-01T00:00:00Z"
+        for asset_id, kind, suffix in (
+            ("audio-v3", "audio", ".mp3"),
+            ("lyric-v3", "lyric", ".lrc"),
+        ):
+            connection.execute(
+                """
+                INSERT INTO assets(
+                    id, kind, canonical_path, normalized_path, file_name, extension,
+                    size_bytes, mtime_ns, file_state, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 10, 20, 'active', ?, ?)
+                """,
+                (
+                    asset_id,
+                    kind,
+                    f"C:/fixture/{asset_id}{suffix}",
+                    f"c:/fixture/{asset_id}{suffix}",
+                    f"{asset_id}{suffix}",
+                    suffix,
+                    now,
+                    now,
+                ),
+            )
+
+        result = apply_migrations(connection, self.database_path)
+
+        self.assertEqual(result.applied_versions, (3,))
+        self.assertIsNotNone(result.backup_path)
+        assert result.backup_path is not None
+        backup = sqlite3.connect(result.backup_path)
+        try:
+            self.assertEqual(backup.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+            self.assertEqual(
+                backup.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall(),
+                [(1,), (2,)],
+            )
+            self.assertIsNone(
+                backup.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lyrics_matches'"
+                ).fetchone()
+            )
+        finally:
+            backup.close()
+
+        columns = [row[1] for row in connection.execute("PRAGMA table_info(lyrics_matches)")]
+        self.assertEqual(
+            columns,
+            [
+                "id",
+                "audio_asset_id",
+                "lyric_asset_id",
+                "source_kind",
+                "confidence",
+                "method",
+                "state",
+                "is_current",
+                "created_at",
+                "updated_at",
+            ],
+        )
+        foreign_keys = {
+            row[3]: (row[2], row[6])
+            for row in connection.execute("PRAGMA foreign_key_list(lyrics_matches)")
+        }
+        self.assertEqual(foreign_keys["audio_asset_id"], ("assets", "RESTRICT"))
+        self.assertEqual(foreign_keys["lyric_asset_id"], ("assets", "RESTRICT"))
+        indexes = {
+            row[1] for row in connection.execute("PRAGMA index_list(lyrics_matches)")
+        }
+        self.assertTrue(
+            {
+                "uq_current_lyrics_by_audio",
+                "uq_current_audio_by_external_lyric",
+                "idx_lyrics_matches_audio_history",
+            }.issubset(indexes)
+        )
+        connection.execute(
+            """
+            INSERT INTO lyrics_matches(
+                id, audio_asset_id, lyric_asset_id, source_kind, confidence,
+                method, state, is_current, created_at, updated_at
+            ) VALUES ('match-v3', 'audio-v3', 'lyric-v3', 'external', 100,
+                      'automatic', 'matched', 1, ?, ?)
+            """,
+            (now, now),
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO lyrics_matches(
+                    id, audio_asset_id, source_kind, confidence, method,
+                    state, is_current, created_at, updated_at
+                ) VALUES ('bad-external', 'audio-v3', 'external', 100, 'manual',
+                          'matched', 0, ?, ?)
+                """,
+                (now, now),
+            )
+        with self.assertRaises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO lyrics_matches(
+                    id, audio_asset_id, source_kind, confidence, method,
+                    state, is_current, created_at, updated_at
+                ) VALUES ('bad-current', 'audio-v3', 'embedded', 100, 'manual',
+                          'cancelled', 1, ?, ?)
+                """,
+                (now, now),
+            )
+        self.assertEqual(apply_migrations(connection, self.database_path).applied_versions, ())
 
     def test_v2_database_is_rejected_by_older_v1_migration_set(self) -> None:
         connection = self.open()
         self.assertEqual(
-            apply_migrations(connection, self.database_path).applied_versions,
+            apply_migrations(
+                connection,
+                self.database_path,
+                migrations=MIGRATIONS[:2],
+            ).applied_versions,
             (1, 2),
         )
 
@@ -636,7 +767,7 @@ class DatabaseTests(unittest.TestCase):
         )
 
     def test_future_and_gapped_migration_histories_are_rejected(self) -> None:
-        for versions in ((1, 3), (1, 2, 3)):
+        for versions in ((1, 3), (1, 2, 4)):
             with self.subTest(versions=versions):
                 path = self.root / f"history-{'-'.join(map(str, versions))}.sqlite3"
                 connection = open_database(DatabaseConfig(path))

@@ -38,6 +38,8 @@ RENAME_ITEM_STATES = frozenset(
 )
 RENAME_ITEM_OUTCOMES = RENAME_ITEM_STATES - {"planned", "running", "success"}
 RENAME_FAILURE_RESULTS = frozenset({"failed", "rolled_back", "rollback_failed"})
+LYRICS_MATCH_SOURCES = frozenset({"embedded", "external"})
+LYRICS_MATCH_METHODS = frozenset({"automatic", "manual"})
 
 
 class RepositoryError(RuntimeError):
@@ -198,6 +200,20 @@ class RenameOperationItemRecord:
     after: object | None
     created_at: str
     completed_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class LyricsMatchRecord:
+    id: str
+    audio_asset_id: str
+    lyric_asset_id: str | None
+    source_kind: str
+    confidence: int
+    method: str
+    state: str
+    is_current: bool
+    created_at: str
+    updated_at: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -1211,6 +1227,172 @@ class LibraryRepository:
             for asset_id in matching_ids:
                 roots.setdefault(asset_id, source_root)
         return roots
+
+    @staticmethod
+    def _lyrics_match_from_row(row: sqlite3.Row) -> LyricsMatchRecord:
+        return LyricsMatchRecord(
+            id=row["id"],
+            audio_asset_id=row["audio_asset_id"],
+            lyric_asset_id=row["lyric_asset_id"],
+            source_kind=row["source_kind"],
+            confidence=int(row["confidence"]),
+            method=row["method"],
+            state=row["state"],
+            is_current=bool(row["is_current"]),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def list_lyrics_matches(
+        self,
+        *,
+        audio_asset_id: str | None = None,
+        current_only: bool = False,
+    ) -> tuple[LyricsMatchRecord, ...]:
+        self._require_open_in_owner_thread()
+        if audio_asset_id is not None and (
+            not isinstance(audio_asset_id, str) or not audio_asset_id.strip()
+        ):
+            raise RepositoryDataError("audio_asset_id 必须是非空字符串或 None")
+        clauses: list[str] = []
+        parameters: list[object] = []
+        if audio_asset_id is not None:
+            clauses.append("audio_asset_id = ?")
+            parameters.append(audio_asset_id)
+        if current_only:
+            clauses.append("is_current = 1")
+        where = "" if not clauses else " WHERE " + " AND ".join(clauses)
+        rows = self._connection.execute(
+            "SELECT * FROM lyrics_matches"
+            + where
+            + " ORDER BY created_at ASC, id ASC",
+            tuple(parameters),
+        ).fetchall()
+        return tuple(self._lyrics_match_from_row(row) for row in rows)
+
+    def commit_lyrics_match(
+        self,
+        *,
+        audio_asset_id: str,
+        lyric_asset_id: str | None,
+        source_kind: str,
+        confidence: int,
+        method: str,
+    ) -> LyricsMatchRecord:
+        """Replace one current match while retaining the previous row as history."""
+
+        self._require_open_in_owner_thread()
+        if not isinstance(audio_asset_id, str) or not audio_asset_id.strip():
+            raise RepositoryDataError("audio_asset_id 不能为空")
+        _require_choice(source_kind, LYRICS_MATCH_SOURCES, field_name="source_kind")
+        _require_choice(method, LYRICS_MATCH_METHODS, field_name="method")
+        if isinstance(confidence, bool) or not isinstance(confidence, int) or not 0 <= confidence <= 100:
+            raise RepositoryDataError("confidence 必须是 0～100 的整数")
+        if method == "automatic" and confidence < 95:
+            raise RepositoryDataError("低置信度歌词禁止自动提交")
+        if source_kind == "embedded":
+            if lyric_asset_id is not None:
+                raise RepositoryDataError("内嵌歌词不能绑定外部歌词资产")
+            if confidence != 100:
+                raise RepositoryDataError("内嵌歌词提交置信度必须为 100")
+        elif not isinstance(lyric_asset_id, str) or not lyric_asset_id.strip():
+            raise RepositoryDataError("外部歌词必须提供 lyric_asset_id")
+
+        now = _utc_now()
+        match_id = str(uuid4())
+        with self._transaction():
+            audio = self._connection.execute(
+                "SELECT kind, file_state FROM assets WHERE id = ?",
+                (audio_asset_id,),
+            ).fetchone()
+            if audio is None:
+                raise RecordNotFoundError(f"音频资产不存在：{audio_asset_id}")
+            if audio["kind"] != "audio" or audio["file_state"] != "active":
+                raise RepositoryDataError("歌词匹配只允许 active audio")
+            current = self._connection.execute(
+                "SELECT source_kind FROM lyrics_matches WHERE audio_asset_id = ? AND is_current = 1",
+                (audio_asset_id,),
+            ).fetchone()
+            if current is not None and current["source_kind"] == "embedded" and source_kind == "external":
+                raise RepositoryDataError("已有内嵌歌词时禁止外部歌词覆盖")
+            if source_kind == "external":
+                lyric = self._connection.execute(
+                    "SELECT kind, file_state FROM assets WHERE id = ?",
+                    (lyric_asset_id,),
+                ).fetchone()
+                if lyric is None:
+                    raise RecordNotFoundError(f"歌词资产不存在：{lyric_asset_id}")
+                if lyric["kind"] != "lyric" or lyric["file_state"] != "active":
+                    raise RepositoryDataError("外部歌词匹配只允许 active lyric")
+                claimed = self._connection.execute(
+                    """
+                    SELECT audio_asset_id FROM lyrics_matches
+                    WHERE lyric_asset_id = ? AND is_current = 1 AND audio_asset_id != ?
+                    """,
+                    (lyric_asset_id, audio_asset_id),
+                ).fetchone()
+                if claimed is not None:
+                    raise RepositoryDataError("该外部 LRC 已被另一首音频占用")
+            self._connection.execute(
+                """
+                UPDATE lyrics_matches SET is_current = 0, updated_at = ?
+                WHERE audio_asset_id = ? AND is_current = 1
+                """,
+                (now, audio_asset_id),
+            )
+            self._connection.execute(
+                """
+                INSERT INTO lyrics_matches(
+                    id, audio_asset_id, lyric_asset_id, source_kind,
+                    confidence, method, state, is_current, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'matched', 1, ?, ?)
+                """,
+                (
+                    match_id,
+                    audio_asset_id,
+                    lyric_asset_id,
+                    source_kind,
+                    confidence,
+                    method,
+                    now,
+                    now,
+                ),
+            )
+        rows = self._connection.execute(
+            "SELECT * FROM lyrics_matches WHERE id = ?",
+            (match_id,),
+        ).fetchone()
+        if rows is None:
+            raise RepositoryDataError("歌词匹配提交后无法读取结果")
+        return self._lyrics_match_from_row(rows)
+
+    def cancel_current_lyrics_match(self, audio_asset_id: str) -> LyricsMatchRecord:
+        self._require_open_in_owner_thread()
+        if not isinstance(audio_asset_id, str) or not audio_asset_id.strip():
+            raise RepositoryDataError("audio_asset_id 不能为空")
+        now = _utc_now()
+        with self._transaction():
+            row = self._connection.execute(
+                "SELECT id FROM lyrics_matches WHERE audio_asset_id = ? AND is_current = 1",
+                (audio_asset_id,),
+            ).fetchone()
+            if row is None:
+                raise RecordNotFoundError("当前歌词匹配不存在")
+            self._connection.execute(
+                """
+                UPDATE lyrics_matches
+                SET state = 'cancelled', is_current = 0, updated_at = ?
+                WHERE id = ? AND is_current = 1
+                """,
+                (now, row["id"]),
+            )
+        result = self._connection.execute(
+            "SELECT * FROM lyrics_matches WHERE id = ?",
+            (row["id"],),
+        ).fetchone()
+        if result is None:
+            raise RepositoryDataError("取消歌词匹配后无法读取结果")
+        return self._lyrics_match_from_row(result)
 
     def set_setting(self, key: str, value: object) -> SettingRecord:
         self._require_open_in_owner_thread()
