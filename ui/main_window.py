@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QDialog, QHBoxLayout, QMainWindow, QStackedWidget, QVBoxLayout, QWidget
 
 from dialogs.delete_confirm_dialog import DeleteConfirmDialog, DeleteLyricsConfirmDialog, RemovePlaylistItemsDialog
@@ -80,14 +81,18 @@ class MainWindow(QMainWindow):
         self.sidebar.select_key(key)
 
     def _show_window(self, window: QWidget) -> None:
+        window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self._open_windows.append(window)
-        window.destroyed.connect(lambda: self._prune_windows())
+        window_id = id(window)
+        window.destroyed.connect(
+            lambda _object=None, tracked_id=window_id: self._remove_open_window(tracked_id)
+        )
         window.show()
         window.raise_()
         window.activateWindow()
 
-    def _prune_windows(self) -> None:
-        self._open_windows = [window for window in self._open_windows if window is not None and not window.isHidden()]
+    def _remove_open_window(self, tracked_id: int) -> None:
+        self._open_windows = [window for window in self._open_windows if id(window) != tracked_id]
 
     def open_import(self) -> None:
         self._show_window(ImportDialog(self))

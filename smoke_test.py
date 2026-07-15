@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import os
+import sys
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QCoreApplication, QEvent, QPoint, Qt
 from PySide6.QtGui import QFont, QFontMetrics
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QCheckBox, QLabel, QLineEdit
@@ -47,6 +48,11 @@ def run() -> None:
             assert "C:\\Users\\" not in text
 
     app = build_app()
+
+    def flush_deferred_deletes() -> None:
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        app.processEvents()
+
     assert not app.windowIcon().isNull()
     window = MainWindow()
     assert not window.windowIcon().isNull()
@@ -351,18 +357,59 @@ def run() -> None:
         "操作历史": HistoryDialog,
         "设置": SettingsDialog,
     }
-    for text, expected_type in opened_window_types.items():
-        button = window.toolbar.buttons_by_text[text]
+    for _cycle in range(3):
+        for text, expected_type in opened_window_types.items():
+            button = window.toolbar.buttons_by_text[text]
+            QTest.mouseClick(button, Qt.MouseButton.LeftButton)
+            app.processEvents()
+            assert len(window._open_windows) == 1
+            opened_window = window._open_windows[0]
+            assert type(opened_window) is expected_type
+            assert opened_window.isVisible()
+            assert opened_window.testAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+            opened_window.close()
+            flush_deferred_deletes()
+            assert window._open_windows == []
+
+    for text, action_name in (
+        ("重命名", "accept"),
+        ("重命名", "reject"),
+        ("设置", "accept"),
+        ("设置", "reject"),
+    ):
+        QTest.mouseClick(window.toolbar.buttons_by_text[text], Qt.MouseButton.LeftButton)
+        app.processEvents()
+        assert len(window._open_windows) == 1
+        opened_window = window._open_windows[0]
+        getattr(opened_window, action_name)()
+        flush_deferred_deletes()
+        assert window._open_windows == []
+
+    lifecycle_window = MainWindow()
+    lifecycle_window.show()
+    app.processEvents()
+    for button in lifecycle_window.toolbar.buttons_by_text.values():
         QTest.mouseClick(button, Qt.MouseButton.LeftButton)
         app.processEvents()
-        assert window._open_windows
-        opened_window = window._open_windows[-1]
-        assert type(opened_window) is expected_type
-        assert opened_window.isVisible()
-        opened_window.close()
-        window._open_windows.remove(opened_window)
-        opened_window.deleteLater()
-        app.processEvents()
+    assert len(lifecycle_window._open_windows) == len(opened_window_types)
+
+    tracked_windows = list(lifecycle_window._open_windows)
+    closed_window = tracked_windows[2]
+    expected_remaining_ids = {id(item) for item in tracked_windows if item is not closed_window}
+    closed_window.close()
+    flush_deferred_deletes()
+    assert {id(item) for item in lifecycle_window._open_windows} == expected_remaining_ids
+
+    lifecycle_errors: list[BaseException] = []
+    previous_excepthook = sys.excepthook
+    sys.excepthook = lambda _type, value, _traceback: lifecycle_errors.append(value)
+    try:
+        lifecycle_window.close()
+        lifecycle_window.deleteLater()
+        flush_deferred_deletes()
+    finally:
+        sys.excepthook = previous_excepthook
+    assert lifecycle_errors == []
 
     import_dialog = ImportDialog(window)
     rename_dialog = RenamePreviewDialog(window)
