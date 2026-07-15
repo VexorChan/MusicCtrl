@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+import re
 
 from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtGui import QCloseEvent
@@ -18,15 +19,18 @@ _READ_ONLY_FLAGS = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
 
 class RenamePreviewDialog(PrototypeDialog):
     cancel_requested = Signal()
+    execution_requested = Signal(object)
 
     def __init__(
         self,
         parent: QWidget | None = None,
         *,
         live_mode: bool = False,
+        execution_enabled: bool = False,
     ) -> None:
         super().__init__("重命名预览", (980, 620), parent)
         self.live_mode = live_mode
+        self.execution_enabled = bool(live_mode and execution_enabled)
         self._running = False
         self._close_pending = False
         self._results: tuple[MetadataPreviewResult, ...] = ()
@@ -35,7 +39,9 @@ class RenamePreviewDialog(PrototypeDialog):
         root.setContentsMargins(22, 18, 22, 18)
         root.setSpacing(12)
         subtitle = (
-            "只读分析已选择的索引音乐；建议名称可以编辑，但本阶段不会修改文件名或音频标签。"
+            "只读分析完成后可编辑建议名称；只有再次确认才会执行同目录重命名，绝不覆盖目标，不写音频标签。"
+            if self.execution_enabled
+            else "只读分析已选择的索引音乐；建议名称可以编辑，但本阶段不会修改文件名或音频标签。"
             if live_mode
             else "只检查尚未完成规范化标记的音乐文件；执行前始终显示完整预览。"
         )
@@ -55,8 +61,12 @@ class RenamePreviewDialog(PrototypeDialog):
         self.summary.setWordWrap(True)
         root.addWidget(self.summary)
 
-        primary_text = "完成预览" if live_mode else "应用重命名"
+        primary_text = "确认并重命名" if self.execution_enabled else "完成预览" if live_mode else "应用重命名"
         footer, self.primary_button = footer_buttons(self, primary_text)
+        if self.execution_enabled:
+            self.primary_button.clicked.disconnect()
+            self.primary_button.clicked.connect(self._request_execution)
+            self.primary_button.setEnabled(False)
         root.addWidget(footer)
 
         if live_mode:
@@ -117,7 +127,16 @@ class RenamePreviewDialog(PrototypeDialog):
         self.table.setRowCount(len(self._results))
         for row, result in enumerate(self._results):
             check = QTableWidgetItem()
-            check.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
+            executable = result.suggested_stem is not None and result.status in {
+                "可预览",
+                "待手动确认",
+                "外部变化",
+            }
+            check.setFlags(
+                Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable
+                if executable
+                else _READ_ONLY_FLAGS
+            )
             check.setCheckState(
                 Qt.CheckState.Checked
                 if result.status == "可预览" and not result.requires_confirmation
@@ -140,6 +159,64 @@ class RenamePreviewDialog(PrototypeDialog):
             self.table.setItem(row, 5, status_item)
             self.table.setCellWidget(row, 5, make_status_badge(result.status))
         self.summary.setText(f"只读分析完成：{len(self._results)} 项。仅预览，未修改任何文件或标签。")
+        if self.execution_enabled:
+            self.primary_button.setEnabled(any(
+                self.table.item(row, 0) is not None
+                and bool(self.table.item(row, 0).flags() & Qt.ItemFlag.ItemIsUserCheckable)
+                for row in range(self.table.rowCount())
+            ))
+
+    @staticmethod
+    def _validate_stem(stem: str) -> str | None:
+        if not stem or stem != stem.strip():
+            return "建议名称不能为空，也不能包含首尾空格"
+        if stem.endswith((".", " ")):
+            return "建议名称不能以点或空格结尾"
+        if re.search(r'[<>:"/\\|?*\x00-\x1f]', stem):
+            return "建议名称包含 Windows 不允许的字符"
+        device = stem.split(".", 1)[0].rstrip(" .").casefold()
+        reserved = {"con", "prn", "aux", "nul"} | {
+            f"com{index}" for index in range(1, 10)
+        } | {f"lpt{index}" for index in range(1, 10)}
+        if device in reserved:
+            return "建议名称使用了 Windows 保留设备名"
+        return None
+
+    def selected_execution_requests(self) -> tuple[tuple[str, str], ...]:
+        if not self.execution_enabled:
+            raise RuntimeError("当前预览窗口没有真实重命名入口")
+        selected: list[tuple[str, str]] = []
+        targets: set[tuple[str, str]] = set()
+        for row, result in enumerate(self._results):
+            check = self.table.item(row, 0)
+            if check is None or check.checkState() != Qt.CheckState.Checked:
+                continue
+            if not bool(check.flags() & Qt.ItemFlag.ItemIsUserCheckable):
+                raise ValueError(f"该项目不能执行：{result.original_name}")
+            suggestion = self.table.item(row, 2)
+            stem = "" if suggestion is None else suggestion.text()
+            error = self._validate_stem(stem)
+            if error is not None:
+                raise ValueError(f"{result.original_name}：{error}")
+            target_key = (
+                str(result.canonical_path.parent).casefold(),
+                (stem + result.extension).rstrip(" .").casefold(),
+            )
+            if target_key in targets:
+                raise ValueError(f"批次包含 Windows 等价目标：{stem}{result.extension}")
+            targets.add(target_key)
+            selected.append((result.asset_id, stem))
+        if not selected:
+            raise ValueError("请至少勾选一个可执行的重命名项")
+        return tuple(selected)
+
+    def _request_execution(self) -> None:
+        try:
+            requests = self.selected_execution_requests()
+        except ValueError as error:
+            self.show_warning(str(error))
+            return
+        self.execution_requested.emit(requests)
 
     def show_results(self, results: object) -> None:
         if not isinstance(results, (tuple, list)):
@@ -160,9 +237,28 @@ class RenamePreviewDialog(PrototypeDialog):
         self._running = running
         self.primary_button.setEnabled(not running)
         if running:
-            self.summary.setText("正在后台只读分析所选音乐…")
+            self.summary.setText(
+                "正在后台安全重命名；已开始的文件项会完成提交或补偿…"
+                if self.execution_enabled and self._results
+                else "正在后台只读分析所选音乐…"
+            )
         elif self._close_pending:
             QTimer.singleShot(0, self.close)
+
+    def show_rename_completed(self, result: object) -> None:
+        success = int(getattr(result, "success_count", 0))
+        failure = int(getattr(result, "failure_count", 0))
+        cancelled = int(getattr(result, "cancelled_count", 0))
+        self.summary.setText(
+            f"重命名完成：成功 {success} 项，失败或已恢复 {failure} 项，取消 {cancelled} 项。"
+        )
+        self.primary_button.setEnabled(False)
+
+    def show_rename_cancelled(self, result: object) -> None:
+        success = int(getattr(result, "success_count", 0))
+        cancelled = int(getattr(result, "cancelled_count", 0))
+        self.summary.setText(f"已取消后续重命名；此前安全完成 {success} 项，取消 {cancelled} 项。")
+        self.primary_button.setEnabled(False)
 
     def reject(self) -> None:
         if self.live_mode and self._running:

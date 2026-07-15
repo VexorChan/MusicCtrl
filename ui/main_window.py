@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QCloseEvent
-from PySide6.QtWidgets import QApplication, QDialog, QHBoxLayout, QMainWindow, QStackedWidget, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QDialog, QHBoxLayout, QMainWindow, QMessageBox, QStackedWidget, QVBoxLayout, QWidget
 
 from dialogs.delete_confirm_dialog import DeleteConfirmDialog, DeleteLyricsConfirmDialog, RemovePlaylistItemsDialog
 from dialogs.history_dialog import HistoryDialog
@@ -22,8 +22,10 @@ from ui.toolbars import GlobalToolbar
 if TYPE_CHECKING:
     from services.library_scan_controller import LibraryScanController
     from services.metadata_preview import MetadataPreviewController
+    from services.safe_rename import SafeRenameController
 
 from services.metadata_preview import MetadataPreviewInput
+from services.safe_rename import SafeRenameInput
 
 
 class MainWindow(QMainWindow):
@@ -31,13 +33,17 @@ class MainWindow(QMainWindow):
         self,
         scan_controller: LibraryScanController | None = None,
         metadata_preview_controller: MetadataPreviewController | None = None,
+        safe_rename_controller: SafeRenameController | None = None,
     ) -> None:
         super().__init__()
         self._scan_controller = scan_controller
         self._metadata_preview_controller = metadata_preview_controller
+        self._safe_rename_controller = safe_rename_controller
         self._scan_dialog: ReadOnlyScanDialog | None = None
         self._rename_dialog: RenamePreviewDialog | None = None
         self._close_pending = False
+        self._metadata_inputs_by_asset: dict[str, MetadataPreviewInput] = {}
+        self._metadata_results_by_asset: dict[str, object] = {}
         self.setWindowTitle("乐库整理助手")
         app = QApplication.instance()
         if app is not None and not app.windowIcon().isNull():
@@ -99,6 +105,11 @@ class MainWindow(QMainWindow):
             metadata_preview_controller.cancelled.connect(self._metadata_cancelled)
             metadata_preview_controller.failed.connect(self._metadata_failed)
             metadata_preview_controller.running_changed.connect(self._metadata_running_changed)
+        if safe_rename_controller is not None:
+            safe_rename_controller.completed.connect(self._safe_rename_completed)
+            safe_rename_controller.cancelled.connect(self._safe_rename_cancelled)
+            safe_rename_controller.failed.connect(self._safe_rename_failed)
+            safe_rename_controller.running_changed.connect(self._safe_rename_running_changed)
 
     def _add_page(self, key: str, page: LibraryPage) -> None:
         self.pages[key] = page
@@ -147,8 +158,8 @@ class MainWindow(QMainWindow):
         self._scan_controller.failed.connect(dialog.show_failed)
         self._scan_controller.warning.connect(dialog.show_warning)
         self._scan_controller.running_changed.connect(dialog.set_running)
-        if self._metadata_preview_controller is not None and self._metadata_preview_controller.running:
-            dialog.show_warning("歌曲信息分析正在运行，请完成或取消后再开始扫描。")
+        if self._has_running_rename_task():
+            dialog.show_warning("歌曲信息分析或重命名正在运行，请完成或取消后再开始扫描。")
             dialog.set_running(False)
             self._show_window(dialog)
             return
@@ -161,9 +172,9 @@ class MainWindow(QMainWindow):
     def _start_read_only_scan(self, root) -> None:
         if self._scan_controller is None:
             return
-        if self._metadata_preview_controller is not None and self._metadata_preview_controller.running:
+        if self._has_running_rename_task():
             if self._scan_dialog is not None:
-                self._scan_dialog.show_failed("歌曲信息分析正在运行，不能同时开始扫描")
+                self._scan_dialog.show_failed("歌曲信息分析或重命名正在运行，不能同时开始扫描")
             return
         try:
             self._scan_controller.start_scan(root)
@@ -188,10 +199,16 @@ class MainWindow(QMainWindow):
             self._rename_dialog.activateWindow()
             return
 
-        dialog = RenamePreviewDialog(self, live_mode=True)
+        dialog = RenamePreviewDialog(
+            self,
+            live_mode=True,
+            execution_enabled=self._safe_rename_controller is not None,
+        )
         self._rename_dialog = dialog
         dialog.destroyed.connect(lambda: setattr(self, "_rename_dialog", None))
-        dialog.cancel_requested.connect(self._metadata_preview_controller.request_cancel)
+        dialog.cancel_requested.connect(self._cancel_active_rename_task)
+        if self._safe_rename_controller is not None:
+            dialog.execution_requested.connect(self._start_safe_rename)
         self._show_window(dialog)
 
         page = self.pages["所有音乐"]
@@ -201,12 +218,17 @@ class MainWindow(QMainWindow):
         if self._scan_controller.running:
             dialog.show_warning("只读扫描正在运行，请完成或取消后再分析歌曲信息。")
             return
+        if self._safe_rename_controller is not None and self._safe_rename_controller.running:
+            dialog.show_warning("安全重命名正在运行，请等待当前任务结束。")
+            return
         records = page.selected_records()
         if not records:
             dialog.show_warning("请先勾选或选中至少一首音乐，再开始只读分析。")
             return
         try:
             items = tuple(self._metadata_input_from_record(record) for record in records)
+            self._metadata_inputs_by_asset = {item.asset_id: item for item in items}
+            self._metadata_results_by_asset.clear()
             self._metadata_preview_controller.start(items)
         except Exception as error:
             dialog.show_failed(str(error))
@@ -236,6 +258,12 @@ class MainWindow(QMainWindow):
         )
 
     def _metadata_results_ready(self, results: object) -> None:
+        if isinstance(results, (tuple, list)):
+            self._metadata_results_by_asset = {
+                result.asset_id: result
+                for result in results
+                if hasattr(result, "asset_id")
+            }
         if self._rename_dialog is not None:
             self._rename_dialog.show_results(results)
 
@@ -251,6 +279,112 @@ class MainWindow(QMainWindow):
         if self._rename_dialog is not None:
             self._rename_dialog.set_running(running)
         self._background_running_changed(running)
+
+    def _cancel_active_rename_task(self) -> None:
+        if self._safe_rename_controller is not None and self._safe_rename_controller.running:
+            self._safe_rename_controller.request_cancel()
+        elif self._metadata_preview_controller is not None and self._metadata_preview_controller.running:
+            self._metadata_preview_controller.request_cancel()
+
+    def _has_running_rename_task(self) -> bool:
+        return bool(
+            (self._metadata_preview_controller is not None and self._metadata_preview_controller.running)
+            or (self._safe_rename_controller is not None and self._safe_rename_controller.running)
+        )
+
+    def _start_safe_rename(self, requests: object) -> None:
+        if self._safe_rename_controller is None or self._rename_dialog is None:
+            return
+        if self._scan_controller is not None and self._scan_controller.running:
+            self._rename_dialog.show_warning("只读扫描正在运行，不能同时重命名。")
+            return
+        if self._metadata_preview_controller is not None and self._metadata_preview_controller.running:
+            self._rename_dialog.show_warning("歌曲信息分析尚未结束，不能开始重命名。")
+            return
+        if self._safe_rename_controller.running:
+            self._rename_dialog.show_warning("已有安全重命名任务正在运行。")
+            return
+        if not isinstance(requests, (tuple, list)):
+            self._rename_dialog.show_warning("重命名选择格式无效。")
+            return
+        try:
+            items: list[SafeRenameInput] = []
+            for request in requests:
+                if not isinstance(request, tuple) or len(request) != 2:
+                    raise ValueError("重命名选择格式无效")
+                asset_id, suggested_stem = request
+                if not isinstance(asset_id, str) or not isinstance(suggested_stem, str):
+                    raise ValueError("重命名选择字段无效")
+                preview_input = self._metadata_inputs_by_asset.get(asset_id)
+                preview_result = self._metadata_results_by_asset.get(asset_id)
+                if preview_input is None or preview_result is None:
+                    raise ValueError("预览快照已失效，请重新分析")
+                if getattr(preview_result, "canonical_path", None) != preview_input.canonical_path:
+                    raise ValueError("预览路径与索引快照不一致，请重新分析")
+                extension = getattr(preview_result, "extension", None)
+                if not isinstance(extension, str) or not extension:
+                    raise ValueError("预览扩展名无效")
+                items.append(
+                    SafeRenameInput(
+                        asset_id=asset_id,
+                        source_path=preview_input.canonical_path,
+                        target_path=preview_input.canonical_path.parent / f"{suggested_stem}{extension}",
+                        allowed_root=preview_input.allowed_root,
+                        expected_size_bytes=preview_input.size_bytes,
+                        expected_mtime_ns=preview_input.mtime_ns,
+                    )
+                )
+            if not items:
+                raise ValueError("请至少选择一个重命名项")
+        except Exception as error:
+            self._rename_dialog.show_warning(str(error))
+            return
+
+        answer = QMessageBox.question(
+            self._rename_dialog,
+            "确认安全重命名",
+            f"将实际修改 {len(items)} 个文件名。\n\n"
+            "所有文件只在原目录内重命名，目标存在时绝不覆盖；本步骤不会写入音频标签。\n"
+            "是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self._rename_dialog.show_warning("已取消确认；没有创建操作，也没有修改文件。")
+            return
+        try:
+            self._safe_rename_controller.start(tuple(items))
+        except Exception as error:
+            self._rename_dialog.show_failed(str(error))
+
+    def _safe_rename_completed(self, result: object) -> None:
+        if self._rename_dialog is not None:
+            self._rename_dialog.show_rename_completed(result)
+        self._reload_library_after_rename()
+
+    def _safe_rename_cancelled(self, result: object) -> None:
+        if self._rename_dialog is not None:
+            self._rename_dialog.show_rename_cancelled(result)
+        self._reload_library_after_rename()
+
+    def _safe_rename_failed(self, message: str) -> None:
+        if self._rename_dialog is not None:
+            self._rename_dialog.show_failed(f"重命名失败：{message}")
+        self._reload_library_after_rename()
+
+    def _safe_rename_running_changed(self, running: bool) -> None:
+        if self._rename_dialog is not None:
+            self._rename_dialog.set_running(running)
+        self._background_running_changed(running)
+
+    def _reload_library_after_rename(self) -> None:
+        if self._scan_controller is None:
+            return
+        try:
+            self._replace_music_library(self._scan_controller.load_library())
+        except Exception as error:
+            if self._rename_dialog is not None:
+                self._rename_dialog.show_warning(f"重命名结果已记录，但列表刷新失败：{error}")
 
     def open_lyrics_match(self) -> None:
         self._show_window(LyricsMatchDialog(self))
@@ -294,6 +428,8 @@ class MainWindow(QMainWindow):
                 self._scan_controller.request_cancel()
             if self._metadata_preview_controller is not None and self._metadata_preview_controller.running:
                 self._metadata_preview_controller.request_cancel()
+            if self._safe_rename_controller is not None and self._safe_rename_controller.running:
+                self._safe_rename_controller.request_cancel()
             event.ignore()
             return
         super().closeEvent(event)
@@ -304,5 +440,9 @@ class MainWindow(QMainWindow):
             or (
                 self._metadata_preview_controller is not None
                 and self._metadata_preview_controller.running
+            )
+            or (
+                self._safe_rename_controller is not None
+                and self._safe_rename_controller.running
             )
         )
