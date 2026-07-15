@@ -125,6 +125,15 @@ class IndexBatchRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class ScanReconcileResult:
+    session_id: str
+    seen_count: int
+    active_count: int
+    external_changed_count: int
+    missing_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class _PreparedAsset:
     canonical_path: Path
     normalized_path: str
@@ -160,6 +169,23 @@ def _canonicalize_path(path: Path, *, field_name: str) -> tuple[Path, str]:
     canonical_path = Path(canonical_text)
     normalized_path = os.path.normcase(canonical_text).replace("\\", "/")
     return canonical_path, normalized_path
+
+
+def _require_path_within_root(
+    normalized_path: str,
+    normalized_root: str,
+    *,
+    field_name: str,
+) -> None:
+    try:
+        common_path = os.path.commonpath((normalized_root, normalized_path))
+    except ValueError as exc:
+        raise RepositoryPathError(
+            f"{field_name} 不在扫描根目录内：{normalized_path}"
+        ) from exc
+    normalized_common = os.path.normcase(os.path.normpath(common_path)).replace("\\", "/")
+    if normalized_common != normalized_root:
+        raise RepositoryPathError(f"{field_name} 不在扫描根目录内：{normalized_path}")
 
 
 def _require_non_negative_integer(value: int | None, *, field_name: str, optional: bool) -> None:
@@ -311,6 +337,29 @@ class LibraryRepository:
         if row is None:
             raise RepositoryDataError("资产写入后无法读取")
         return self._asset_from_row(row)
+
+    def _upsert_indexed_asset(self, item: _PreparedAsset) -> AssetRecord:
+        existing = self._connection.execute(
+            "SELECT size_bytes, mtime_ns FROM assets WHERE normalized_path = ?",
+            (item.normalized_path,),
+        ).fetchone()
+        file_state = "active"
+        if existing is not None and (
+            existing["size_bytes"] != item.size_bytes
+            or existing["mtime_ns"] != item.mtime_ns
+        ):
+            file_state = "external_changed"
+        indexed_item = _PreparedAsset(
+            canonical_path=item.canonical_path,
+            normalized_path=item.normalized_path,
+            file_name=item.file_name,
+            extension=item.extension,
+            size_bytes=item.size_bytes,
+            mtime_ns=item.mtime_ns,
+            kind=item.kind,
+            file_state=file_state,
+        )
+        return self._upsert_prepared_asset(indexed_item)
 
     def upsert_asset(self, item: AssetUpsert) -> AssetRecord:
         self._require_open_in_owner_thread()
@@ -506,15 +555,87 @@ class LibraryRepository:
             reason=row["reason"],
         )
 
-    def _require_running_session(self, session_id: str) -> None:
+    def _require_running_session(self, session_id: str) -> sqlite3.Row:
         session = self._connection.execute(
-            "SELECT status FROM scan_sessions WHERE id = ?",
+            "SELECT * FROM scan_sessions WHERE id = ?",
             (session_id,),
         ).fetchone()
         if session is None:
             raise RecordNotFoundError(f"扫描会话不存在：{session_id}")
         if session["status"] != "running":
             raise RepositoryDataError(f"扫描会话已经结束，不能继续写入条目：{session_id}")
+        return session
+
+    @staticmethod
+    def _normalized_session_root(session: sqlite3.Row) -> str:
+        _, normalized_root = _canonicalize_path(
+            Path(session["source_folder"]),
+            field_name="source_folder",
+        )
+        return normalized_root
+
+    def _validated_session_paths(
+        self,
+        session_id: str,
+        normalized_root: str,
+    ) -> set[str]:
+        rows = self._connection.execute(
+            "SELECT source_path FROM scan_items WHERE session_id = ?",
+            (session_id,),
+        ).fetchall()
+        paths: set[str] = set()
+        for row in rows:
+            _, normalized_path = _canonicalize_path(
+                Path(row["source_path"]),
+                field_name="scan_items.source_path",
+            )
+            _require_path_within_root(
+                normalized_path,
+                normalized_root,
+                field_name="扫描条目路径",
+            )
+            paths.add(normalized_path)
+        return paths
+
+    def _previous_completed_session_id(
+        self,
+        current_session_id: str,
+        normalized_root: str,
+    ) -> str | None:
+        rows = self._connection.execute(
+            """
+            SELECT id, source_folder
+            FROM scan_sessions
+            WHERE mode = 'audio' AND status = 'completed' AND id != ?
+            ORDER BY completed_at DESC, started_at DESC, id DESC
+            """,
+            (current_session_id,),
+        ).fetchall()
+        for row in rows:
+            _, candidate_root = _canonicalize_path(
+                Path(row["source_folder"]),
+                field_name="scan_sessions.source_folder",
+            )
+            if candidate_root == normalized_root:
+                return row["id"]
+        return None
+
+    def _replace_reconcile_temp_paths(
+        self,
+        table_name: str,
+        paths: set[str],
+    ) -> None:
+        if table_name not in {"reconcile_current_paths", "reconcile_previous_paths"}:
+            raise RepositoryDataError("非法的重新校准临时表")
+        self._connection.execute(
+            f"CREATE TEMP TABLE IF NOT EXISTS {table_name}(normalized_path TEXT PRIMARY KEY)"
+        )
+        self._connection.execute(f"DELETE FROM {table_name}")
+        if paths:
+            self._connection.executemany(
+                f"INSERT INTO {table_name}(normalized_path) VALUES (?)",
+                ((path,) for path in sorted(paths)),
+            )
 
     def _insert_prepared_scan_item(
         self,
@@ -595,12 +716,94 @@ class LibraryRepository:
 
         records: list[IndexBatchRecord] = []
         with self._transaction():
-            self._require_running_session(session_id)
+            session = self._require_running_session(session_id)
+            normalized_root = self._normalized_session_root(session)
+            for asset, _scan_item in prepared:
+                if asset.kind != session["mode"]:
+                    raise RepositoryDataError("索引资产类型必须与扫描会话模式一致")
+                _require_path_within_root(
+                    asset.normalized_path,
+                    normalized_root,
+                    field_name="索引文件路径",
+                )
             for asset, scan_item in prepared:
-                asset_record = self._upsert_prepared_asset(asset)
+                asset_record = self._upsert_indexed_asset(asset)
                 scan_item_record = self._insert_prepared_scan_item(session_id, scan_item)
                 records.append(IndexBatchRecord(asset_record, scan_item_record))
         return tuple(records)
+
+    def complete_scan_and_reconcile(self, session_id: str) -> ScanReconcileResult:
+        """Complete one audio scan and atomically reconcile its exact-root baseline."""
+
+        self._require_open_in_owner_thread()
+        result: ScanReconcileResult | None = None
+        with self._transaction():
+            session = self._require_running_session(session_id)
+            if session["mode"] != "audio":
+                raise RepositoryDataError("只有运行中的音频扫描会话可以重新校准音乐库")
+            normalized_root = self._normalized_session_root(session)
+            current_paths = self._validated_session_paths(session_id, normalized_root)
+            previous_session_id = self._previous_completed_session_id(
+                session_id,
+                normalized_root,
+            )
+            previous_paths = (
+                set()
+                if previous_session_id is None
+                else self._validated_session_paths(previous_session_id, normalized_root)
+            )
+            self._replace_reconcile_temp_paths("reconcile_current_paths", current_paths)
+            self._replace_reconcile_temp_paths("reconcile_previous_paths", previous_paths)
+
+            now = _utc_now()
+            missing_cursor = self._connection.execute(
+                """
+                UPDATE assets
+                SET file_state = 'missing', updated_at = ?
+                WHERE kind = 'audio'
+                  AND file_state = 'active'
+                  AND EXISTS (
+                      SELECT 1 FROM reconcile_previous_paths AS previous
+                      WHERE previous.normalized_path = assets.normalized_path
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM reconcile_current_paths AS current
+                      WHERE current.normalized_path = assets.normalized_path
+                  )
+                """,
+                (now,),
+            )
+            state_rows = self._connection.execute(
+                """
+                SELECT assets.file_state, COUNT(*) AS count
+                FROM assets
+                JOIN reconcile_current_paths AS current
+                  ON current.normalized_path = assets.normalized_path
+                WHERE assets.kind = 'audio'
+                GROUP BY assets.file_state
+                """
+            ).fetchall()
+            state_counts = {row["file_state"]: row["count"] for row in state_rows}
+            completed_cursor = self._connection.execute(
+                """
+                UPDATE scan_sessions
+                SET status = 'completed', completed_at = ?
+                WHERE id = ? AND status = 'running' AND mode = 'audio'
+                """,
+                (now, session_id),
+            )
+            if completed_cursor.rowcount != 1:
+                raise RepositoryDataError(f"扫描会话无法完成重新校准：{session_id}")
+            result = ScanReconcileResult(
+                session_id=session_id,
+                seen_count=len(current_paths),
+                active_count=int(state_counts.get("active", 0)),
+                external_changed_count=int(state_counts.get("external_changed", 0)),
+                missing_count=missing_cursor.rowcount,
+            )
+        if result is None:
+            raise RepositoryDataError("扫描重新校准未产生结果")
+        return result
 
     def list_scan_items(self, session_id: str) -> tuple[ScanItemRecord, ...]:
         self._require_open_in_owner_thread()

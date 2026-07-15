@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import sqlite3
 import threading
@@ -15,12 +16,22 @@ from services.scan_worker import ReadOnlyScanWorker
 
 
 class FakeRepository:
-    def __init__(self, *, batch_hook=None, close_error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        batch_hook=None,
+        reconcile_hook=None,
+        reconcile_error: Exception | None = None,
+        close_error: Exception | None = None,
+    ) -> None:
         self.batch_hook = batch_hook
+        self.reconcile_hook = reconcile_hook
+        self.reconcile_error = reconcile_error
         self.close_error = close_error
         self.thread_ids: list[tuple[str, int]] = []
         self.batches: list[tuple[object, ...]] = []
         self.finished_statuses: list[str] = []
+        self.reconcile_count = 0
         self.close_count = 0
 
     def _record_thread(self, operation: str) -> None:
@@ -42,6 +53,16 @@ class FakeRepository:
         self._record_thread(f"finish:{status}")
         self.finished_statuses.append(status)
         return SimpleNamespace(id=session_id, status=status)
+
+    def complete_scan_and_reconcile(self, session_id: str):
+        self._record_thread("reconcile")
+        self.reconcile_count += 1
+        if self.reconcile_hook is not None:
+            self.reconcile_hook()
+        if self.reconcile_error is not None:
+            raise self.reconcile_error
+        self.finished_statuses.append("completed")
+        return SimpleNamespace(session_id=session_id)
 
     def close(self) -> None:
         self._record_thread("close")
@@ -161,6 +182,22 @@ class ScanWorkerTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_success_uses_reconcile_once_instead_of_plain_finish(self) -> None:
+        self.touch("success.mp3")
+        repository = FakeRepository()
+        worker = ReadOnlyScanWorker(
+            root=self.scan_root,
+            allowed_root=self.root,
+            repository_factory=lambda: repository,  # type: ignore[arg-type,return-value]
+            batch_size=1,
+        )
+
+        observed = self.run_worker(worker)
+
+        self.assert_one_terminal(observed, "completed")
+        self.assertEqual(repository.reconcile_count, 1)
+        self.assertEqual(repository.finished_statuses, ["completed"])
+
     def test_cancel_before_start_skips_factory_and_all_writes(self) -> None:
         self.touch("never.mp3")
         factory_calls = []
@@ -212,6 +249,7 @@ class ScanWorkerTests(unittest.TestCase):
         self.assertEqual(observed["batches"], [])
         self.assertEqual(len(repository.batches), 1)
         self.assertEqual(repository.finished_statuses, ["cancelled"])
+        self.assertEqual(repository.reconcile_count, 0)
         self.assertEqual(repository.close_count, 1)
 
     def test_real_database_cancelled_count_matches_committed_rows_without_batch_signal(self) -> None:
@@ -281,15 +319,9 @@ class ScanWorkerTests(unittest.TestCase):
         self.assertEqual(len(factory_calls), 1)
         self.assertNotEqual(factory_calls[0], threading.get_ident())
 
-    def test_finish_session_error_emits_failed_and_closes_once(self) -> None:
+    def test_reconcile_error_emits_failed_marks_session_failed_and_closes_once(self) -> None:
         self.touch("finish.mp3")
-
-        class FinishFailRepository(FakeRepository):
-            def finish_scan_session(inner_self, session_id: str, *, status: str):
-                inner_self._record_thread(f"finish:{status}")
-                raise RuntimeError("finish session failed")
-
-        repository = FinishFailRepository()
+        repository = FakeRepository(reconcile_error=RuntimeError("reconcile failed"))
         worker = ReadOnlyScanWorker(
             root=self.scan_root,
             allowed_root=self.root,
@@ -300,8 +332,42 @@ class ScanWorkerTests(unittest.TestCase):
         observed = self.run_worker(worker)
 
         self.assert_one_terminal(observed, "failed")
-        self.assertIn("finish session failed", observed["failed"][0])
+        self.assertIn("reconcile failed", observed["failed"][0])
+        self.assertEqual(repository.reconcile_count, 1)
+        self.assertEqual(repository.finished_statuses, ["failed"])
         self.assertEqual(repository.close_count, 1)
+
+    def test_cancel_arriving_after_reconcile_commit_keeps_completed_terminal(self) -> None:
+        self.touch("late-cancel.mp3")
+        entered = threading.Event()
+        release = threading.Event()
+
+        def reconcile_hook() -> None:
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError("test release timeout")
+
+        repository = FakeRepository(reconcile_hook=reconcile_hook)
+        worker = ReadOnlyScanWorker(
+            root=self.scan_root,
+            allowed_root=self.root,
+            repository_factory=lambda: repository,  # type: ignore[arg-type,return-value]
+            batch_size=1,
+        )
+        cancellation_sent = []
+
+        def cancel_after_reconcile_entered() -> None:
+            if entered.is_set() and not cancellation_sent:
+                cancellation_sent.append(True)
+                worker.cancel()
+                release.set()
+
+        observed = self.run_worker(worker, poll=cancel_after_reconcile_entered)
+
+        self.assert_one_terminal(observed, "completed")
+        self.assertEqual(observed["completed"], [1])
+        self.assertEqual(repository.reconcile_count, 1)
+        self.assertEqual(repository.finished_statuses, ["completed"])
 
     def test_scanner_and_repository_errors_emit_only_failed_and_close(self) -> None:
         scenarios = (
@@ -325,6 +391,7 @@ class ScanWorkerTests(unittest.TestCase):
                 self.assert_one_terminal(observed, "failed")
                 self.assertIn(expected, observed["failed"][0])
                 self.assertEqual(repository.finished_statuses, ["failed"])
+                self.assertEqual(repository.reconcile_count, 0)
                 self.assertEqual(repository.close_count, 1)
 
     def test_factory_write_finish_close_share_worker_thread_and_close_precedes_finished(self) -> None:
@@ -428,6 +495,42 @@ class ScanWorkerTests(unittest.TestCase):
             )
         finally:
             connection.close()
+
+    def test_real_database_two_scans_reconcile_changed_and_missing_assets(self) -> None:
+        changed = self.touch("changed.mp3")
+        missing = self.touch("missing.mp3")
+
+        first = ReadOnlyScanWorker(
+            root=self.scan_root,
+            allowed_root=self.root,
+            repository_factory=lambda: LibraryRepository(self.config),
+            batch_size=2,
+        )
+        first_observed = self.run_worker(first)
+        self.assert_one_terminal(first_observed, "completed")
+
+        first_stat = changed.stat()
+        os.utime(
+            changed,
+            ns=(first_stat.st_atime_ns, first_stat.st_mtime_ns + 1_000_000),
+        )
+        missing.unlink()
+
+        second = ReadOnlyScanWorker(
+            root=self.scan_root,
+            allowed_root=self.root,
+            repository_factory=lambda: LibraryRepository(self.config),
+            batch_size=2,
+        )
+        second_observed = self.run_worker(second)
+        self.assert_one_terminal(second_observed, "completed")
+
+        with LibraryRepository(self.config) as repository:
+            changed_record = repository.get_asset_by_path(changed)
+            missing_record = repository.get_asset_by_path(missing)
+            self.assertEqual(changed_record.file_state, "external_changed")  # type: ignore[union-attr]
+            self.assertEqual(missing_record.file_state, "missing")  # type: ignore[union-attr]
+        self.assertEqual(changed.stat().st_size, 0)
 
     def test_close_error_is_reported_without_hiding_primary_failure(self) -> None:
         self.touch("close.mp3")

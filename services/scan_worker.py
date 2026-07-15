@@ -137,7 +137,7 @@ class ReadOnlyScanWorker(QThread):
                 self.batch_ready.emit(batch)
 
             self._check_cancelled()
-            repository.finish_scan_session(session_id, status="completed")
+            repository.complete_scan_and_reconcile(session_id)
             terminal = ("completed", indexed_count)
         except ScanCancelled:
             if repository is not None and session_id is not None:

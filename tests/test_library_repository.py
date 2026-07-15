@@ -52,6 +52,24 @@ class LibraryRepositoryTests(unittest.TestCase):
             file_state=overrides.get("file_state", "active"),
         )
 
+    def index_completed_session(
+        self,
+        repository: LibraryRepository,
+        scan_root: Path,
+        entries: tuple[tuple[str, int, int | None], ...],
+    ):
+        session = repository.create_scan_session(mode="audio", source_folder=scan_root)
+        if entries:
+            repository.index_scan_batch(
+                session.id,
+                tuple(
+                    IndexBatchItem(scan_root / name, size, mtime_ns)
+                    for name, size, mtime_ns in entries
+                ),
+            )
+        result = repository.complete_scan_and_reconcile(session.id)
+        return session, result
+
     def test_constructor_migrates_only_the_injected_temporary_database(self) -> None:
         project_root = Path(__file__).resolve().parents[1]
         patterns = ("*.db", "*.sqlite", "*.sqlite3", "*.backup.sqlite3")
@@ -275,6 +293,304 @@ class LibraryRepositoryTests(unittest.TestCase):
         self.assertEqual(records[0].asset.mtime_ns, 34)
         self.assertEqual(records[0].scan_item.status, "indexed")
         self.assertEqual(records[0].scan_item.source_path.as_posix(), records[0].asset.normalized_path)
+
+    def test_index_scan_batch_derives_file_state_from_previous_fingerprint(self) -> None:
+        repository = self.create_repository()
+        scan_root = self.root / "scan"
+        existing = {
+            "same.mp3": (10, 100, "active"),
+            "size.mp3": (10, 100, "active"),
+            "mtime.mp3": (10, 100, "active"),
+            "both.mp3": (10, 100, "active"),
+            "returns.mp3": (10, 100, "missing"),
+        }
+        repository.upsert_assets(
+            tuple(
+                AssetUpsert(scan_root / name, size, mtime, file_state=state)
+                for name, (size, mtime, state) in existing.items()
+            )
+        )
+        session = repository.create_scan_session(mode="audio", source_folder=scan_root)
+
+        records = repository.index_scan_batch(
+            session.id,
+            (
+                IndexBatchItem(scan_root / "new.mp3", 1, None),
+                IndexBatchItem(scan_root / "same.mp3", 10, 100),
+                IndexBatchItem(scan_root / "size.mp3", 11, 100),
+                IndexBatchItem(scan_root / "mtime.mp3", 10, 101),
+                IndexBatchItem(scan_root / "both.mp3", 11, 101),
+                IndexBatchItem(scan_root / "returns.mp3", 10, 100),
+            ),
+        )
+
+        states = {record.asset.file_name: record.asset.file_state for record in records}
+        self.assertEqual(states["new.mp3"], "active")
+        self.assertEqual(states["same.mp3"], "active")
+        self.assertEqual(states["returns.mp3"], "active")
+        self.assertEqual(states["size.mp3"], "external_changed")
+        self.assertEqual(states["mtime.mp3"], "external_changed")
+        self.assertEqual(states["both.mp3"], "external_changed")
+
+    def test_generic_asset_upsert_keeps_explicit_state_behavior(self) -> None:
+        repository = self.create_repository()
+        source = self.root / "music" / "explicit.mp3"
+
+        first = repository.upsert_asset(AssetUpsert(source, 1, 1, file_state="missing"))
+        second = repository.upsert_asset(
+            AssetUpsert(source, 2, 2, file_state="external_changed")
+        )
+
+        self.assertEqual(first.file_state, "missing")
+        self.assertEqual(second.file_state, "external_changed")
+
+    def test_index_scan_batch_rejects_root_escape_and_rolls_back_whole_batch(self) -> None:
+        repository = self.create_repository()
+        scan_root = self.root / "Root"
+        session = repository.create_scan_session(mode="audio", source_folder=scan_root)
+
+        with self.assertRaisesRegex(RepositoryPathError, "扫描根目录"):
+            repository.index_scan_batch(
+                session.id,
+                (
+                    IndexBatchItem(scan_root / "inside.mp3", 1, 1),
+                    IndexBatchItem(self.root / "Root2" / "outside.mp3", 1, 1),
+                ),
+            )
+
+        self.assertEqual(repository.list_assets(), ())
+        self.assertEqual(repository.list_scan_items(session.id), ())
+
+    def test_reconcile_marks_only_missing_active_asset_and_preserves_identity(self) -> None:
+        repository = self.create_repository()
+        scan_root = self.root / "scan"
+        self.index_completed_session(
+            repository,
+            scan_root,
+            (("kept.mp3", 1, 1), ("gone.mp3", 2, 2)),
+        )
+        gone_before = repository.get_asset_by_path(scan_root / "gone.mp3")
+        self.assertIsNotNone(gone_before)
+
+        _, result = self.index_completed_session(
+            repository,
+            scan_root,
+            (("kept.mp3", 1, 1),),
+        )
+
+        gone_after = repository.get_asset_by_path(scan_root / "gone.mp3")
+        self.assertIsNotNone(gone_after)
+        self.assertEqual(gone_after.id, gone_before.id)  # type: ignore[union-attr]
+        self.assertEqual(gone_after.file_state, "missing")  # type: ignore[union-attr]
+        self.assertEqual(result.seen_count, 1)
+        self.assertEqual(result.active_count, 1)
+        self.assertEqual(result.external_changed_count, 0)
+        self.assertEqual(result.missing_count, 1)
+        self.assertEqual(len(repository.list_assets()), 2)
+
+    def test_reconcile_does_not_replace_external_changed_with_missing(self) -> None:
+        repository = self.create_repository()
+        scan_root = self.root / "scan"
+        self.index_completed_session(repository, scan_root, (("changed.mp3", 1, 1),))
+        repository.upsert_asset(
+            AssetUpsert(
+                scan_root / "changed.mp3",
+                2,
+                2,
+                file_state="external_changed",
+            )
+        )
+
+        _, result = self.index_completed_session(repository, scan_root, ())
+
+        self.assertEqual(result.missing_count, 0)
+        self.assertEqual(
+            repository.get_asset_by_path(scan_root / "changed.mp3").file_state,  # type: ignore[union-attr]
+            "external_changed",
+        )
+
+    def test_reconcile_requires_running_audio_session(self) -> None:
+        repository = self.create_repository()
+        lyric = repository.create_scan_session(mode="lyric", source_folder=self.root / "lyrics")
+        with self.assertRaisesRegex(RepositoryDataError, "音频扫描"):
+            repository.complete_scan_and_reconcile(lyric.id)
+        self.assertEqual(repository.get_scan_session(lyric.id).status, "running")  # type: ignore[union-attr]
+
+        audio = repository.create_scan_session(mode="audio", source_folder=self.root / "audio")
+        repository.finish_scan_session(audio.id, status="cancelled")
+        with self.assertRaisesRegex(RepositoryDataError, "已经结束"):
+            repository.complete_scan_and_reconcile(audio.id)
+
+    def test_reconcile_uses_latest_successful_exact_root_only(self) -> None:
+        repository = self.create_repository()
+        root = self.root / "Root"
+        root2 = self.root / "Root2"
+        nested = root / "Nested"
+        self.index_completed_session(repository, root, (("old.mp3", 1, 1),))
+        self.index_completed_session(repository, root, (("latest.mp3", 1, 1),))
+        self.index_completed_session(repository, root2, (("other.mp3", 1, 1),))
+        self.index_completed_session(repository, nested, (("nested.mp3", 1, 1),))
+        repository.upsert_asset(AssetUpsert(root / "old.mp3", 1, 1, file_state="active"))
+
+        self.index_completed_session(repository, root, ())
+
+        self.assertEqual(
+            repository.get_asset_by_path(root / "latest.mp3").file_state,  # type: ignore[union-attr]
+            "missing",
+        )
+        self.assertEqual(
+            repository.get_asset_by_path(root / "old.mp3").file_state,  # type: ignore[union-attr]
+            "active",
+        )
+        self.assertEqual(
+            repository.get_asset_by_path(root2 / "other.mp3").file_state,  # type: ignore[union-attr]
+            "active",
+        )
+        self.assertEqual(
+            repository.get_asset_by_path(nested / "nested.mp3").file_state,  # type: ignore[union-attr]
+            "active",
+        )
+
+    @unittest.skipUnless(os.name == "nt", "Windows 根目录规范化规则")
+    def test_reconcile_matches_equivalent_windows_root_and_rejects_other_drive(self) -> None:
+        repository = self.create_repository()
+        scan_root = self.root / "CaseRoot"
+        equivalent_root = Path(os.fspath(scan_root).swapcase().replace("\\", "/"))
+        self.index_completed_session(repository, scan_root, (("song.mp3", 1, 1),))
+
+        current = repository.create_scan_session(mode="audio", source_folder=equivalent_root)
+        result = repository.complete_scan_and_reconcile(current.id)
+
+        self.assertEqual(result.missing_count, 1)
+        self.assertEqual(
+            repository.get_asset_by_path(scan_root / "song.mp3").file_state,  # type: ignore[union-attr]
+            "missing",
+        )
+
+        current_drive = scan_root.drive.casefold()
+        other_drive = next(
+            drive for drive in ("Z:", "Y:", "X:") if drive.casefold() != current_drive
+        )
+        escaped = Path(other_drive + "\\escape.mp3")
+        cross_drive = repository.create_scan_session(mode="audio", source_folder=scan_root)
+        with self.assertRaisesRegex(RepositoryPathError, "扫描根目录"):
+            repository.index_scan_batch(
+                cross_drive.id,
+                (IndexBatchItem(escaped, 1, 1),),
+            )
+        self.assertEqual(repository.list_scan_items(cross_drive.id), ())
+
+    def test_cancelled_and_failed_sessions_are_not_reconcile_baselines(self) -> None:
+        repository = self.create_repository()
+        scan_root = self.root / "scan"
+        self.index_completed_session(repository, scan_root, (("successful.mp3", 1, 1),))
+        for status, name in (("cancelled", "cancelled.mp3"), ("failed", "failed.mp3")):
+            session = repository.create_scan_session(mode="audio", source_folder=scan_root)
+            repository.index_scan_batch(
+                session.id,
+                (IndexBatchItem(scan_root / name, 1, 1),),
+            )
+            repository.finish_scan_session(session.id, status=status)
+
+        self.index_completed_session(repository, scan_root, ())
+
+        self.assertEqual(
+            repository.get_asset_by_path(scan_root / "successful.mp3").file_state,  # type: ignore[union-attr]
+            "missing",
+        )
+        for name in ("cancelled.mp3", "failed.mp3"):
+            self.assertEqual(
+                repository.get_asset_by_path(scan_root / name).file_state,  # type: ignore[union-attr]
+                "active",
+            )
+
+    def test_reconcile_fails_closed_for_out_of_root_current_or_history_item(self) -> None:
+        for corrupt_current in (False, True):
+            with self.subTest(corrupt_current=corrupt_current):
+                repository = self.create_repository()
+                scan_root = self.root / ("current" if corrupt_current else "history")
+                baseline, _ = self.index_completed_session(
+                    repository,
+                    scan_root,
+                    (("song.mp3", 1, 1),),
+                )
+                current = repository.create_scan_session(mode="audio", source_folder=scan_root)
+                if corrupt_current:
+                    repository.index_scan_batch(
+                        current.id,
+                        (IndexBatchItem(scan_root / "current.mp3", 1, 1),),
+                    )
+                    target_session = current.id
+                else:
+                    target_session = baseline.id
+                repository._connection.execute(
+                    "UPDATE scan_items SET source_path = ? WHERE session_id = ?",
+                    (str(self.root / "outside" / "escape.mp3"), target_session),
+                )
+
+                with self.assertRaisesRegex(RepositoryPathError, "扫描根目录"):
+                    repository.complete_scan_and_reconcile(current.id)
+
+                self.assertEqual(repository.get_scan_session(current.id).status, "running")  # type: ignore[union-attr]
+                repository.close()
+
+    def test_reconcile_sql_failure_rolls_back_missing_and_completed_state(self) -> None:
+        repository = self.create_repository()
+        scan_root = self.root / "scan"
+        self.index_completed_session(repository, scan_root, (("song.mp3", 1, 1),))
+        current = repository.create_scan_session(mode="audio", source_folder=scan_root)
+        repository._connection.execute(
+            """
+            CREATE TRIGGER fail_reconcile_update
+            BEFORE UPDATE OF file_state ON assets
+            WHEN NEW.file_state = 'missing'
+            BEGIN
+                SELECT RAISE(ABORT, 'reconcile update failure');
+            END
+            """
+        )
+
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "reconcile update failure"):
+            repository.complete_scan_and_reconcile(current.id)
+
+        self.assertEqual(repository.get_scan_session(current.id).status, "running")  # type: ignore[union-attr]
+        self.assertEqual(
+            repository.get_asset_by_path(scan_root / "song.mp3").file_state,  # type: ignore[union-attr]
+            "active",
+        )
+
+    def test_reconcile_commit_failure_rolls_back_missing_and_completed_state(self) -> None:
+        repository = self.create_repository()
+        scan_root = self.root / "scan"
+        self.index_completed_session(repository, scan_root, (("song.mp3", 1, 1),))
+        current = repository.create_scan_session(mode="audio", source_folder=scan_root)
+        connection = repository._connection
+
+        class FailCommitProxy:
+            @property
+            def in_transaction(self):
+                return connection.in_transaction
+
+            def execute(self, sql, *args):
+                if sql == "COMMIT":
+                    raise sqlite3.OperationalError("reconcile commit failure")
+                return connection.execute(sql, *args)
+
+            def executemany(self, sql, *args):
+                return connection.executemany(sql, *args)
+
+            def close(self):
+                return connection.close()
+
+        repository._connection = FailCommitProxy()  # type: ignore[assignment]
+        with self.assertRaisesRegex(sqlite3.OperationalError, "reconcile commit failure"):
+            repository.complete_scan_and_reconcile(current.id)
+
+        self.assertEqual(repository.get_scan_session(current.id).status, "running")  # type: ignore[union-attr]
+        self.assertEqual(
+            repository.get_asset_by_path(scan_root / "song.mp3").file_state,  # type: ignore[union-attr]
+            "active",
+        )
 
     def test_index_scan_batch_scan_item_failure_rolls_back_assets_and_items(self) -> None:
         repository = self.create_repository()

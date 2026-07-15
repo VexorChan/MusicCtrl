@@ -14,6 +14,7 @@ from .library_repository import (
     RepositoryThreadError,
     ScanItemInput,
     ScanItemRecord,
+    ScanReconcileResult,
     ScanSessionRecord,
     SettingRecord,
 )
@@ -32,6 +33,7 @@ __all__ = [
     "RepositoryThreadError",
     "ScanItemInput",
     "ScanItemRecord",
+    "ScanReconcileResult",
     "ScanSessionRecord",
     "SettingRecord",
 ]
