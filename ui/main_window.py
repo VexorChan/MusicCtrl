@@ -221,6 +221,7 @@ class MainWindow(QMainWindow):
             self._import_dialog = dialog
             dialog.destroyed.connect(lambda: setattr(self, "_import_dialog", None))
             dialog.start_requested.connect(self._start_safe_import)
+            dialog.scan_existing_requested.connect(self.open_read_only_scan)
             dialog.cancel_requested.connect(self._safe_import_controller.request_cancel)
             dialog.set_running(self._safe_import_controller.running)
             self._show_window(dialog)
@@ -228,6 +229,19 @@ class MainWindow(QMainWindow):
         if self._scan_controller is None:
             self._show_window(ImportDialog(self))
             return
+        self.open_read_only_scan()
+
+    def open_read_only_scan(self) -> None:
+        if self._scan_controller is None:
+            if self._import_dialog is not None:
+                self._import_dialog.show_failed("当前未启用只读音乐扫描")
+            return
+        if self._safe_import_controller is not None and self._safe_import_controller.running:
+            if self._import_dialog is not None:
+                self._import_dialog.show_failed("安全移动导入正在运行，请完成或取消后再扫描")
+            return
+        if self._import_dialog is not None:
+            self._import_dialog.hide()
         if self._scan_dialog is not None:
             self._scan_dialog.show()
             self._scan_dialog.raise_()

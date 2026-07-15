@@ -25,6 +25,7 @@ from ui.tables import DataTable
 
 class ImportDialog(PrototypeDialog):
     start_requested = Signal(object, object, str)
+    scan_existing_requested = Signal()
     cancel_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None, *, live_mode: bool = False) -> None:
@@ -40,11 +41,21 @@ class ImportDialog(PrototypeDialog):
             if live_mode
             else "扫描 Downloads 中的文件并预览整理结果；本原型不会移动任何真实文件。"
         )
-        root.addWidget(dialog_header("导入本地文件", subtitle))
+        root.addWidget(dialog_header("安全移动导入" if live_mode else "导入本地文件", subtitle))
+
+        self.read_only_scan_button = QPushButton("只读扫描已有音乐")
+        self.read_only_scan_button.setToolTip("只建立索引并刷新音乐列表，不移动或修改任何音乐文件")
+        self.read_only_scan_button.clicked.connect(self.scan_existing_requested.emit)
+        self.read_only_scan_button.setVisible(live_mode)
+        if live_mode:
+            root.addWidget(self.read_only_scan_button, 0, Qt.AlignmentFlag.AlignLeft)
 
         actions = QHBoxLayout()
         self.audio_button = QPushButton("扫描音频")
         self.lyrics_button = QPushButton("扫描歌词")
+        if live_mode:
+            self.audio_button.setText("导入音频")
+            self.lyrics_button.setText("导入歌词")
         for button in (self.audio_button, self.lyrics_button):
             button.setCheckable(True)
         group = QButtonGroup(self)
@@ -54,7 +65,7 @@ class ImportDialog(PrototypeDialog):
         self.audio_button.setChecked(True)
         self.audio_button.clicked.connect(lambda: self.set_mode("audio"))
         self.lyrics_button.clicked.connect(lambda: self.set_mode("lyrics"))
-        self.move_button = QPushButton("移动")
+        self.move_button = QPushButton("开始安全移动导入" if live_mode else "移动")
         self.move_button.setObjectName("PrimaryButton")
         self.move_button.setEnabled(True)
         if live_mode:
@@ -159,8 +170,9 @@ class ImportDialog(PrototypeDialog):
 
     def set_running(self, running: bool) -> None:
         self._running = bool(running)
-        self.move_button.setText("导入中" if running else "移动")
+        self.move_button.setText("导入中" if running else "开始安全移动导入")
         self.move_button.setEnabled(not running)
+        self.read_only_scan_button.setEnabled(not running)
         self.audio_button.setEnabled(not running)
         self.lyrics_button.setEnabled(not running)
         self.scan_path.setEnabled(not running)

@@ -17,6 +17,7 @@ from mock.data import SONGS
 from repositories import IndexBatchItem, LibraryRepository
 from services.library_scan_controller import LAST_SUCCESSFUL_ROOT_KEY, LibraryScanController
 from services.scan_worker import ReadOnlyScanWorker
+from services.safe_import import SafeImportController
 from ui.main_window import MainWindow
 from ui.music_page import LibraryPage
 
@@ -161,6 +162,52 @@ class P1IntegrationTests(unittest.TestCase):
         self.assertTrue(all(str(scan_root) not in name for name in table_names))
         for path, snapshot in snapshots.items():
             self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), snapshot)
+
+    def test_combined_production_import_entry_reaches_read_only_scan_and_refreshes_library(self) -> None:
+        scan_root = self.root / "existing-music"
+        target_root = self.root / "unused-import-target"
+        scan_root.mkdir()
+        target_root.mkdir()
+        names = ("a.mp3", "b.FLAC", "c.wav", "d.M4A", "e.ogg", "nested/f.AAC")
+        snapshots: dict[Path, tuple[bytes, int]] = {}
+        for index, name in enumerate(names):
+            path = scan_root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(f"existing-{index}".encode("utf-8"))
+            snapshots[path] = (path.read_bytes(), path.stat().st_mtime_ns)
+
+        scan_controller = LibraryScanController(self.config)
+        safe_import_controller = SafeImportController(lambda: LibraryRepository(self.config))
+        window = MainWindow(scan_controller, safe_import_controller=safe_import_controller)
+        window.show()
+        self.addCleanup(window.close)
+
+        window.open_import()
+        QApplication.processEvents()
+        import_dialog = window._import_dialog
+        self.assertIsInstance(import_dialog, ImportDialog)
+        assert import_dialog is not None
+        self.assertEqual(import_dialog.windowTitle(), "导入")
+        self.assertEqual(import_dialog.read_only_scan_button.text(), "只读扫描已有音乐")
+        self.assertEqual(import_dialog.move_button.text(), "开始安全移动导入")
+        self.assertFalse(safe_import_controller.running)
+
+        import_dialog.read_only_scan_button.click()
+        QApplication.processEvents()
+        scan_dialog = window._scan_dialog
+        self.assertIsInstance(scan_dialog, ReadOnlyScanDialog)
+        assert scan_dialog is not None
+        scan_dialog.path_input.setText(str(scan_root))
+        scan_dialog.start_button.click()
+        self.wait_until(lambda: not scan_controller.running)
+
+        self.assertEqual(len(window.pages["所有音乐"].all_data), 6)
+        self.assertEqual(scan_dialog.table.rowCount(), 6)
+        self.assertFalse(safe_import_controller.running)
+        self.assertFalse(import_dialog.isVisible())
+        for path, snapshot in snapshots.items():
+            self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), snapshot)
+        self.assertEqual(tuple(target_root.iterdir()), ())
 
     def test_cancel_and_failure_keep_old_root_and_reload_committed_library_after_finished(self) -> None:
         old_root = self.root / "old-root"
