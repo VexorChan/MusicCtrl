@@ -1,0 +1,30 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Local environment and secret configuration
+.env
+.env.*
+!.env.example
+
+# Local runtime data and logs
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.log
+logs/
+*.tmp
+*.temp
+
+# Local editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local scratch artifacts
+work/

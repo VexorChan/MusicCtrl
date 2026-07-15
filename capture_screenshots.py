@@ -1,0 +1,89 @@
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+from PySide6.QtCore import QEventLoop, QTimer
+from PySide6.QtWidgets import QApplication, QWidget
+
+from dialogs.delete_confirm_dialog import DeleteConfirmDialog
+from dialogs.history_dialog import HistoryDialog
+from dialogs.import_dialog import ImportDialog
+from dialogs.lyrics_match_dialog import LyricsMatchDialog
+from dialogs.rename_preview_dialog import RenamePreviewDialog
+from dialogs.settings_dialog import SettingsDialog
+from main import build_app
+from ui.main_window import MainWindow
+
+
+ROOT = Path(__file__).resolve().parent
+SHOT_DIR = ROOT / "screenshots"
+
+
+def settle(app: QApplication, milliseconds: int = 180) -> None:
+    loop = QEventLoop()
+    QTimer.singleShot(milliseconds, loop.quit)
+    loop.exec()
+    app.processEvents()
+
+
+def save_widget(app: QApplication, widget: QWidget, filename: str) -> None:
+    widget.show()
+    widget.raise_()
+    widget.activateWindow()
+    settle(app)
+    pixmap = widget.grab()
+    target = SHOT_DIR / filename
+    if not pixmap.save(str(target), "PNG"):
+        raise RuntimeError(f"无法保存截图：{target}")
+    print(target)
+
+
+def run() -> None:
+    SHOT_DIR.mkdir(parents=True, exist_ok=True)
+    app = build_app()
+    app.setQuitOnLastWindowClosed(False)
+    main = MainWindow()
+    main.resize(1200, 760)
+    main.move(80, 50)
+    save_widget(app, main, "01_all_music.png")
+
+    main.navigate("所有歌词")
+    settle(app)
+    save_widget(app, main, "02_all_lyrics.png")
+
+    main.navigate("playlist:粤语")
+    settle(app)
+    save_widget(app, main, "03_playlist_cantonese.png")
+
+    dialogs: list[QWidget] = [
+        ImportDialog(main),
+        RenamePreviewDialog(main),
+        LyricsMatchDialog(main),
+        HistoryDialog(main),
+        SettingsDialog(main),
+        DeleteConfirmDialog(parent=main),
+    ]
+    names = [
+        "04_import.png",
+        "05_rename_preview.png",
+        "06_lyrics_match.png",
+        "07_history.png",
+        "08_settings.png",
+        "09_delete_confirm.png",
+    ]
+    for dialog, name in zip(dialogs, names):
+        save_widget(app, dialog, name)
+        dialog.hide()
+        settle(app, 80)
+
+    main.navigate("所有音乐")
+    main.pages["所有音乐"].apply_search_immediately("没有这首歌")
+    settle(app)
+    save_widget(app, main, "10_search_empty.png")
+    main.close()
+
+
+if __name__ == "__main__":
+    run()
+
