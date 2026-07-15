@@ -6,6 +6,7 @@ from collections import defaultdict
 from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+import json
 import os
 from pathlib import Path
 import stat
@@ -18,6 +19,14 @@ from repositories import (
     RenameOperationRecord,
     RenamePlanItem,
     RepositoryCommitOutcomeUnknown,
+)
+from services.safe_metadata import (
+    AppliedMetadataWrite,
+    MetadataWriteInput,
+    apply_prepared_metadata,
+    finalize_metadata_write,
+    prepare_metadata_write,
+    rollback_metadata_write,
 )
 
 
@@ -48,6 +57,9 @@ class SafeRenameInput:
     allowed_root: Path
     expected_size_bytes: int
     expected_mtime_ns: int | None
+    sync_metadata: bool = False
+    metadata_title: str | None = None
+    metadata_artist: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,6 +231,13 @@ def _validate_input(item: SafeRenameInput) -> None:
         raise SafeRenameError("重命名不能改变文件扩展名")
     if not _within_root(item.source_path, item.allowed_root) or not _within_root(item.target_path, item.allowed_root):
         raise SafeRenameError("重命名路径超出已授权扫描根")
+    if item.sync_metadata:
+        if item.target_path.suffix.casefold() not in {".mp3", ".flac", ".m4a"}:
+            raise SafeRenameError("元数据同步只支持 MP3、FLAC 和 M4A")
+        if not isinstance(item.metadata_title, str) or not item.metadata_title.strip():
+            raise SafeRenameError("元数据同步需要非空 Title")
+        if not isinstance(item.metadata_artist, str) or not item.metadata_artist.strip():
+            raise SafeRenameError("元数据同步需要非空 Artist")
 
 
 def _target_is_free(source: Path, target: Path) -> bool:
@@ -352,6 +371,8 @@ class SafeRenameWorker(QThread):
     ) -> tuple[SafeRenameItemResult, LibraryRepository]:
         repository.start_rename_item(operation_id, record.id)
         identity: tuple[int, int, int, int] | None = None
+        metadata_applied: AppliedMetadataWrite | None = None
+        metadata_audit: object | None = None
         try:
             # Keep an executor-owned pre-move identity as well as the helper's
             # checks.  This lets us compensate even when a lower-level post-
@@ -398,10 +419,63 @@ class SafeRenameWorker(QThread):
                 repository,
             )
 
+        if item.sync_metadata:
+            try:
+                prepared = prepare_metadata_write(
+                    MetadataWriteInput(
+                        asset_id=item.asset_id,
+                        source_path=item.target_path,
+                        allowed_root=item.allowed_root,
+                        expected_size_bytes=identity[2],
+                        expected_mtime_ns=identity[3],
+                        title=item.metadata_title or "",
+                        artist=item.metadata_artist or "",
+                    )
+                )
+                metadata_applied = apply_prepared_metadata(prepared)
+                metadata_audit = {
+                    "original": json.loads(prepared.original_metadata_json),
+                    "written": {
+                        "title": (item.metadata_title or "").strip(),
+                        "artist": (item.metadata_artist or "").strip(),
+                    },
+                }
+            except Exception as error:
+                return (
+                    self._rollback_after_database_failure(
+                        repository,
+                        operation_id,
+                        record.id,
+                        item,
+                        identity,
+                        str(error),
+                        error_code="metadata_sync_failed",
+                    ),
+                    repository,
+                )
+
         try:
-            repository.commit_rename_item(operation_id, record.id)
+            if metadata_applied is None:
+                repository.commit_rename_item(operation_id, record.id)
+            else:
+                repository.commit_rename_item(
+                    operation_id,
+                    record.id,
+                    actual_size_bytes=metadata_applied.applied_identity[2],
+                    actual_mtime_ns=metadata_applied.applied_identity[3],
+                    metadata_audit=metadata_audit,
+                )
+            cleanup_message = self._finalize_metadata_after_commit(metadata_applied)
             return (
-                SafeRenameItemResult(item.asset_id, operation_id, record.id, item.source_path, item.target_path, "success", "重命名成功"),
+                SafeRenameItemResult(
+                    item.asset_id,
+                    operation_id,
+                    record.id,
+                    item.source_path,
+                    item.target_path,
+                    "success",
+                    "重命名及标签同步成功" + cleanup_message if metadata_applied is not None else "重命名成功",
+                ),
                 repository,
             )
         except RepositoryCommitOutcomeUnknown:
@@ -416,14 +490,21 @@ class SafeRenameWorker(QThread):
             try:
                 asset = readback_repository.get_asset_by_id(item.asset_id)
                 db_item = readback_repository.get_rename_operation_item(record.id)
-                if asset is not None and db_item is not None and _path_key(asset.canonical_path) == _path_key(item.target_path) and db_item.result == "success":
+                committed_fingerprint_matches = metadata_applied is None or (
+                    asset is not None
+                    and asset.size_bytes == metadata_applied.applied_identity[2]
+                    and asset.mtime_ns == metadata_applied.applied_identity[3]
+                )
+                if asset is not None and db_item is not None and _path_key(asset.canonical_path) == _path_key(item.target_path) and db_item.result == "success" and committed_fingerprint_matches:
+                    cleanup_message = self._finalize_metadata_after_commit(metadata_applied)
                     return (
-                        SafeRenameItemResult(item.asset_id, operation_id, record.id, item.source_path, item.target_path, "success", "数据库提交已由回读确认"),
+                        SafeRenameItemResult(item.asset_id, operation_id, record.id, item.source_path, item.target_path, "success", "数据库提交已由回读确认" + cleanup_message),
                         readback_repository,
                     )
                 if asset is not None and db_item is not None and _path_key(asset.canonical_path) == _path_key(item.source_path) and db_item.result == "running":
+                    metadata_reason = self._rollback_metadata_before_rename(metadata_applied)
                     return (
-                        self._rollback_after_database_failure(readback_repository, operation_id, record.id, item, identity, "数据库提交结果不明确，回读确认未提交"),
+                        self._rollback_after_database_failure(readback_repository, operation_id, record.id, item, identity, "数据库提交结果不明确，回读确认未提交" + metadata_reason),
                         readback_repository,
                     )
                 if db_item is not None and db_item.result == "running":
@@ -446,10 +527,31 @@ class SafeRenameWorker(QThread):
                     pass
                 raise
         except Exception as error:
+            metadata_reason = self._rollback_metadata_before_rename(metadata_applied)
             return (
-                self._rollback_after_database_failure(repository, operation_id, record.id, item, identity, str(error)),
+                self._rollback_after_database_failure(repository, operation_id, record.id, item, identity, str(error) + metadata_reason),
                 repository,
             )
+
+    @staticmethod
+    def _finalize_metadata_after_commit(applied: AppliedMetadataWrite | None) -> str:
+        if applied is None:
+            return ""
+        try:
+            finalize_metadata_write(applied)
+        except Exception as error:
+            return f"；标签已提交，但旧副本清理失败：{error}"
+        return ""
+
+    @staticmethod
+    def _rollback_metadata_before_rename(applied: AppliedMetadataWrite | None) -> str:
+        if applied is None:
+            return ""
+        try:
+            rollback_metadata_write(applied)
+        except Exception as error:
+            return f"；标签文件恢复失败：{error}"
+        return "；标签文件已恢复"
 
     def _rollback_after_database_failure(
         self,

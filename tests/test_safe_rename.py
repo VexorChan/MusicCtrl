@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ast
+import base64
+from dataclasses import replace
 import os
 from pathlib import Path
 import sqlite3
@@ -25,6 +27,8 @@ from services.safe_rename import (
     SafeRenameRunResult,
     SafeRenameWorker,
 )
+from services.safe_metadata import _read_title_artist
+from tests.test_safe_metadata import _AUDIO_FIXTURES
 
 
 def _app() -> QApplication:
@@ -133,6 +137,71 @@ class SafeRenameTests(unittest.TestCase):
             self.assertEqual([record.result for record in records], ["success"])
         finally:
             repository.close()
+
+    def test_supported_metadata_sync_updates_tags_fingerprint_and_audit(self) -> None:
+        request = self._indexed_input(
+            self.root_a,
+            "metadata-old.mp3",
+            "新标题-新歌手.mp3",
+            content=base64.b64decode(_AUDIO_FIXTURES[".mp3"]),
+        )
+        request = replace(
+            request,
+            sync_metadata=True,
+            metadata_title="新标题",
+            metadata_artist="新歌手",
+        )
+
+        _worker, completed, cancelled, failed = self._run_worker(request)
+
+        self.assertEqual((len(completed), cancelled, failed), (1, [], []))
+        self.assertEqual(completed[0].items[0].result, "success")
+        self.assertEqual(_read_title_artist(request.target_path), ("新标题", "新歌手"))
+        self.assertEqual(list(self.root_a.glob(".musicctrl-*")), [])
+        metadata = request.target_path.stat()
+        repository = self._repository()
+        try:
+            asset = repository.get_asset_by_id(request.asset_id)
+            item = repository.get_rename_operation_item(completed[0].items[0].item_id)
+            self.assertEqual((asset.size_bytes, asset.mtime_ns), (metadata.st_size, metadata.st_mtime_ns))  # type: ignore[union-attr]
+            self.assertEqual(item.after["metadata_sync"]["original"]["title"], ["原歌名"])  # type: ignore[index,union-attr]
+            self.assertEqual(item.after["metadata_sync"]["written"]["artist"], "新歌手")  # type: ignore[index,union-attr]
+        finally:
+            repository.close()
+
+    def test_metadata_sync_database_failure_restores_exact_original_and_name(self) -> None:
+        request = self._indexed_input(
+            self.root_a,
+            "metadata-rollback.mp3",
+            "新标题-新歌手.mp3",
+            content=base64.b64decode(_AUDIO_FIXTURES[".mp3"]),
+        )
+        request = replace(
+            request,
+            sync_metadata=True,
+            metadata_title="新标题",
+            metadata_artist="新歌手",
+        )
+        original = request.source_path.read_bytes()
+
+        class FailCommitRepository(LibraryRepository):
+            def commit_rename_item(self, operation_id: str, item_id: str, **_kwargs):
+                raise sqlite3.OperationalError("deterministic metadata commit failure")
+
+        worker = SafeRenameWorker(
+            items=(request,),
+            repository_factory=lambda: FailCommitRepository(DatabaseConfig(self.db_path)),
+        )
+        completed: list[SafeRenameRunResult] = []
+        worker.completed.connect(completed.append)
+        worker.start()
+        self.assertTrue(_wait_until(lambda: worker.isFinished() and bool(completed)))
+
+        self.assertEqual(completed[0].items[0].result, "rolled_back")
+        self.assertEqual(request.source_path.read_bytes(), original)
+        self.assertEqual(_read_title_artist(request.source_path), ("原歌名", "原歌手"))
+        self.assertFalse(request.target_path.exists())
+        self.assertEqual(list(self.root_a.glob(".musicctrl-*")), [])
 
     def test_two_roots_create_two_operations_without_common_ancestor_authority(self) -> None:
         first = self._indexed_input(self.root_a, "a.mp3", "a-new.mp3", content=b"A")
@@ -427,6 +496,59 @@ class SafeRenameTests(unittest.TestCase):
         self.assertFalse(request.source_path.exists())
         self.assertTrue(request.target_path.exists())
         self.assertEqual(completed[0].items[0].result, "success")
+
+    def test_metadata_post_commit_unknown_readback_finalizes_only_after_proven_success(self) -> None:
+        request = self._indexed_input(
+            self.root_a,
+            "metadata-unknown.mp3",
+            "新标题-新歌手.mp3",
+            content=base64.b64decode(_AUDIO_FIXTURES[".mp3"]),
+        )
+        request = replace(
+            request,
+            sync_metadata=True,
+            metadata_title="新标题",
+            metadata_artist="新歌手",
+        )
+        factory_calls = 0
+
+        class CommitThenRaiseRepository(LibraryRepository):
+            def commit_rename_item(self, operation_id: str, item_id: str, **kwargs):
+                connection = self._connection
+
+                class Proxy:
+                    @property
+                    def in_transaction(self):
+                        return connection.in_transaction
+
+                    def execute(self, sql, *args):
+                        value = connection.execute(sql, *args)
+                        if sql == "COMMIT":
+                            raise sqlite3.OperationalError("after real metadata COMMIT")
+                        return value
+
+                    def close(self):
+                        return connection.close()
+
+                self._connection = Proxy()  # type: ignore[assignment]
+                return super().commit_rename_item(operation_id, item_id, **kwargs)
+
+        def factory():
+            nonlocal factory_calls
+            factory_calls += 1
+            repository_type = CommitThenRaiseRepository if factory_calls == 1 else LibraryRepository
+            return repository_type(DatabaseConfig(self.db_path))
+
+        worker = SafeRenameWorker(items=(request,), repository_factory=factory)
+        completed: list[SafeRenameRunResult] = []
+        worker.completed.connect(completed.append)
+        worker.start()
+        self.assertTrue(_wait_until(lambda: worker.isFinished() and bool(completed)))
+
+        self.assertEqual(factory_calls, 2)
+        self.assertEqual(completed[0].items[0].result, "success")
+        self.assertEqual(_read_title_artist(request.target_path), ("新标题", "新歌手"))
+        self.assertEqual(list(self.root_a.glob(".musicctrl-*")), [])
 
     def test_unknown_readback_source_running_restores_file_and_records_rolled_back(self) -> None:
         request = self._indexed_input(self.root_a, "unknown-old.mp3", "unknown-target.mp3")

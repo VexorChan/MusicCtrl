@@ -835,8 +835,31 @@ class LibraryRepository:
         self,
         operation_id: str,
         item_id: str,
+        *,
+        actual_size_bytes: int | None = None,
+        actual_mtime_ns: int | None = None,
+        metadata_audit: object | None = None,
     ) -> tuple[AssetRecord, RenameOperationItemRecord]:
         self._require_open_in_owner_thread()
+        if (actual_size_bytes is None) != (actual_mtime_ns is None):
+            raise RepositoryDataError("实际 size 与 mtime 必须同时提供或同时省略")
+        if actual_size_bytes is not None:
+            _require_non_negative_integer(
+                actual_size_bytes,
+                field_name="actual_size_bytes",
+                optional=False,
+            )
+            _require_non_negative_integer(
+                actual_mtime_ns,
+                field_name="actual_mtime_ns",
+                optional=False,
+            )
+        if metadata_audit is not None:
+            # Validate before opening a transaction and normalize to a detached
+            # standard-JSON value for the immutable operation snapshot.
+            metadata_audit = _strict_json_loads(
+                _strict_json_dumps(metadata_audit, field_name="metadata_audit")
+            )
         now = _utc_now()
         with self._transaction(operation_id=operation_id, item_id=item_id):
             operation = self._connection.execute(
@@ -882,23 +905,29 @@ class LibraryRepository:
             ).fetchone()
             if conflict is not None:
                 raise RepositoryDataError("提交重命名时目标索引已经被占用")
-            after_json = _strict_json_dumps(
-                {
+            committed_size = asset["size_bytes"] if actual_size_bytes is None else actual_size_bytes
+            committed_mtime = asset["mtime_ns"] if actual_size_bytes is None else actual_mtime_ns
+            after_value = {
                     "asset_id": asset["id"],
                     "canonical_path": os.fspath(target_path),
                     "file_name": target_path.name,
                     "file_state": "active",
-                    "mtime_ns": asset["mtime_ns"],
+                    "mtime_ns": committed_mtime,
                     "normalized_path": target_normalized,
-                    "size_bytes": asset["size_bytes"],
-                },
+                    "size_bytes": committed_size,
+                }
+            if metadata_audit is not None:
+                after_value["metadata_sync"] = metadata_audit
+            after_json = _strict_json_dumps(
+                after_value,
                 field_name="after_json",
             )
             asset_cursor = self._connection.execute(
                 """
                 UPDATE assets
                 SET canonical_path = ?, normalized_path = ?, file_name = ?,
-                    extension = ?, file_state = 'active', updated_at = ?
+                    extension = ?, size_bytes = ?, mtime_ns = ?,
+                    file_state = 'active', updated_at = ?
                 WHERE id = ? AND normalized_path = ?
                 """,
                 (
@@ -906,6 +935,8 @@ class LibraryRepository:
                     target_normalized,
                     target_path.name,
                     target_path.suffix.casefold(),
+                    committed_size,
+                    committed_mtime,
                     now,
                     asset["id"],
                     asset["normalized_path"],

@@ -39,7 +39,7 @@ class RenamePreviewDialog(PrototypeDialog):
         root.setContentsMargins(22, 18, 22, 18)
         root.setSpacing(12)
         subtitle = (
-            "只读分析完成后可编辑建议名称；只有再次确认才会执行同目录重命名，绝不覆盖目标，不写音频标签。"
+            "只读分析完成后可编辑建议名称；确认后只在原目录安全重命名，可为 MP3、FLAC、M4A 同步 Title/Artist。"
             if self.execution_enabled
             else "只读分析已选择的索引音乐；建议名称可以编辑，但本阶段不会修改文件名或音频标签。"
             if live_mode
@@ -51,9 +51,9 @@ class RenamePreviewDialog(PrototypeDialog):
         self.table.setEditTriggers(self.table.EditTrigger.DoubleClicked | self.table.EditTrigger.EditKeyPressed)
         root.addWidget(self.table, 1)
 
-        self.id3_checkbox = QCheckBox("同步修改音频 ID3 中的 Title 和 Artist")
+        self.id3_checkbox = QCheckBox("同步修改 Title 和 Artist（仅 MP3、FLAC、M4A）")
         self.id3_checkbox.setChecked(True)
-        self.id3_checkbox.setVisible(not live_mode)
+        self.id3_checkbox.setVisible(self.execution_enabled or not live_mode)
         root.addWidget(self.id3_checkbox)
 
         self.summary = QLabel()
@@ -158,7 +158,11 @@ class RenamePreviewDialog(PrototypeDialog):
             status_item.setToolTip(result.message)
             self.table.setItem(row, 5, status_item)
             self.table.setCellWidget(row, 5, make_status_badge(result.status))
-        self.summary.setText(f"只读分析完成：{len(self._results)} 项。仅预览，未修改任何文件或标签。")
+        self.summary.setText(
+            f"只读分析完成：{len(self._results)} 项。尚未修改文件；确认执行前可选择是否同步标签。"
+            if self.execution_enabled
+            else f"只读分析完成：{len(self._results)} 项。仅预览，未修改任何文件或标签。"
+        )
         if self.execution_enabled:
             self.primary_button.setEnabled(any(
                 self.table.item(row, 0) is not None

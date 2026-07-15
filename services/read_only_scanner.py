@@ -149,6 +149,10 @@ def _iter_scan_directory(
         if not is_file:
             continue
 
+        # Internal recovery artifacts retain an audio extension but are not
+        # user library assets and must never be indexed as duplicate songs.
+        if entry.name.casefold().startswith(".musicctrl-"):
+            continue
         extension = Path(entry.name).suffix.casefold()
         if extension not in SUPPORTED_AUDIO_EXTENSIONS:
             continue

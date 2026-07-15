@@ -482,6 +482,48 @@ class RenameRepositoryTests(unittest.TestCase):
         self.assertTrue(source.is_file(), "repository 不得实际重命名媒体文件")
         self.assertFalse(target.exists())
 
+    def test_metadata_sync_commit_records_new_fingerprint_and_strict_audit_atomically(self) -> None:
+        repository = self.create_repository()
+        source, asset = self.add_audio(repository, "metadata-old.mp3")
+        target = self.music_root / "metadata-new.mp3"
+        operation, items = self.create_operation(repository, self.plan(asset, source, target))
+        repository.start_rename_operation(operation.id)
+        repository.start_rename_item(operation.id, items[0].id)
+
+        updated_asset, updated_item = repository.commit_rename_item(
+            operation.id,
+            items[0].id,
+            actual_size_bytes=987,
+            actual_mtime_ns=654321,
+            metadata_audit={
+                "original": {"title": ["旧标题"], "artist": ["旧歌手"]},
+                "written": {"title": "新标题", "artist": "新歌手"},
+            },
+        )
+
+        self.assertEqual((updated_asset.size_bytes, updated_asset.mtime_ns), (987, 654321))
+        self.assertEqual(updated_item.after["size_bytes"], 987)
+        self.assertEqual(updated_item.after["mtime_ns"], 654321)
+        self.assertEqual(updated_item.after["metadata_sync"]["written"]["title"], "新标题")
+
+        second_source, second_asset = self.add_audio(repository, "invalid-audit.mp3")
+        second_operation, second_items = self.create_operation(
+            repository,
+            self.plan(second_asset, second_source, self.music_root / "invalid-audit-new.mp3"),
+        )
+        repository.start_rename_operation(second_operation.id)
+        repository.start_rename_item(second_operation.id, second_items[0].id)
+        with self.assertRaises(RepositoryDataError):
+            repository.commit_rename_item(
+                second_operation.id,
+                second_items[0].id,
+                actual_size_bytes=1,
+                actual_mtime_ns=2,
+                metadata_audit={"invalid": float("nan")},
+            )
+        self.assertEqual(repository.get_asset_by_id(second_asset.id).canonical_path, second_source)  # type: ignore[union-attr]
+        self.assertEqual(repository.get_rename_operation_item(second_items[0].id).result, "running")  # type: ignore[union-attr]
+
     def test_pre_commit_failure_rolls_back_asset_item_and_counter(self) -> None:
         repository = self.create_repository()
         source, asset = self.add_audio(repository, "rollback.mp3")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -17,6 +18,8 @@ from repositories import AssetUpsert, LibraryRepository
 import main as main_module
 from services.metadata_preview import MetadataPreviewResult
 from services.safe_rename import SafeRenameController, SafeRenameInput, SafeRenameRunResult
+from services.safe_metadata import _read_title_artist
+from tests.test_safe_metadata import _AUDIO_FIXTURES
 from ui.main_window import MainWindow
 
 
@@ -146,8 +149,15 @@ class P2RenameIntegrationTests(unittest.TestCase):
         self._temporary.cleanup()
         _flush_deferred_deletes()
 
-    def _record(self, path: Path, *, asset_id: str = "asset-1", allowed_root: Path | None = None):
-        path.write_bytes(b"fixture")
+    def _record(
+        self,
+        path: Path,
+        *,
+        asset_id: str = "asset-1",
+        allowed_root: Path | None = None,
+        content: bytes = b"fixture",
+    ):
+        path.write_bytes(content)
         metadata = path.stat()
         return {
             "title": path.stem,
@@ -209,6 +219,7 @@ class P2RenameIntegrationTests(unittest.TestCase):
         try:
             dialog = self._select_first_row_and_open(window, metadata)
             metadata.publish((self._preview(source),))
+            dialog.id3_checkbox.setChecked(False)
             dialog.table.item(0, 2).setText("edited")
             with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes):
                 dialog.primary_button.click()
@@ -220,6 +231,38 @@ class P2RenameIntegrationTests(unittest.TestCase):
             self.assertEqual(request.allowed_root, self.music)
             self.assertEqual(request.expected_size_bytes, record["_size_bytes"])
             self.assertEqual(request.expected_mtime_ns, record["_mtime_ns"])
+        finally:
+            self._dispose(window)
+
+    def test_default_sync_uses_last_hyphen_for_supported_formats_and_skips_wav(self) -> None:
+        flac = self.music / "old.flac"
+        wav = self.music / "old.wav"
+        records = (
+            self._record(flac, asset_id="flac"),
+            self._record(wav, asset_id="wav"),
+        )
+        window, _scan, metadata, safe = self._live_window(records)
+        try:
+            page = window.pages["所有音乐"]
+            page.table.selectRow(0)
+            page.table.item(1, 0).setCheckState(Qt.CheckState.Checked)
+            window.open_rename()
+            dialog = window._rename_dialog
+            self.assertIsNotNone(dialog)
+            metadata.publish(
+                (
+                    self._preview(flac, asset_id="flac", stem="歌-名-歌手"),
+                    self._preview(wav, asset_id="wav", stem="波形歌-歌手"),
+                )
+            )
+            with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes):
+                dialog.primary_button.click()  # type: ignore[union-attr]
+            self.assertEqual(len(safe.starts), 1)
+            by_id = {item.asset_id: item for item in safe.starts[0]}
+            self.assertTrue(by_id["flac"].sync_metadata)
+            self.assertEqual((by_id["flac"].metadata_title, by_id["flac"].metadata_artist), ("歌-名", "歌手"))
+            self.assertFalse(by_id["wav"].sync_metadata)
+            self.assertIsNone(by_id["wav"].metadata_title)
         finally:
             self._dispose(window)
 
@@ -251,6 +294,7 @@ class P2RenameIntegrationTests(unittest.TestCase):
         try:
             dialog = self._select_first_row_and_open(window, metadata)
             metadata.publish((self._preview(source, asset_id=asset.id, stem="real-new"),))
+            dialog.id3_checkbox.setChecked(False)
             with patch.object(
                 QMessageBox,
                 "question",
@@ -269,6 +313,58 @@ class P2RenameIntegrationTests(unittest.TestCase):
                 updated = readback.get_asset_by_id(asset.id)
                 self.assertIsNotNone(updated)
                 self.assertEqual(updated.canonical_path, target)  # type: ignore[union-attr]
+            finally:
+                readback.close()
+        finally:
+            self._dispose(window)
+
+    def test_default_confirmed_mp3_syncs_tags_and_persists_new_fingerprint(self) -> None:
+        source = self.music / "metadata-old.mp3"
+        record = self._record(
+            source,
+            asset_id="placeholder",
+            content=base64.b64decode(_AUDIO_FIXTURES[".mp3"]),
+        )
+        config = DatabaseConfig(self.root / "metadata-library.sqlite3")
+        repository = LibraryRepository(config)
+        try:
+            asset = repository.upsert_asset(
+                AssetUpsert(source, int(record["_size_bytes"]), int(record["_mtime_ns"]))
+            )
+        finally:
+            repository.close()
+        record["_asset_id"] = asset.id
+
+        scan = _FakeScanController((record,))
+        metadata = _FakeMetadataController()
+        safe = SafeRenameController(lambda: LibraryRepository(config))
+        completed: list[SafeRenameRunResult] = []
+        safe.completed.connect(completed.append)
+        window = MainWindow(scan, metadata, safe)
+        window.show()
+        target = self.music / "新标题-新歌手.mp3"
+        try:
+            dialog = self._select_first_row_and_open(window, metadata)
+            metadata.publish((self._preview(source, asset_id=asset.id, stem="新标题-新歌手"),))
+            self.assertTrue(dialog.id3_checkbox.isVisible())
+            self.assertTrue(dialog.id3_checkbox.isChecked())
+            with patch.object(
+                QMessageBox,
+                "question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ):
+                dialog.primary_button.click()
+            self.assertTrue(_wait_until(lambda: not safe.running and bool(completed)))
+            self.assertFalse(source.exists())
+            self.assertEqual(_read_title_artist(target), ("新标题", "新歌手"))
+            self.assertEqual(list(self.music.glob(".musicctrl-*")), [])
+            stat_result = target.stat()
+            readback = LibraryRepository(config)
+            try:
+                updated = readback.get_asset_by_id(asset.id)
+                self.assertEqual((updated.size_bytes, updated.mtime_ns), (stat_result.st_size, stat_result.st_mtime_ns))  # type: ignore[union-attr]
+                item = readback.list_rename_operation_items(completed[0].operations[0].id)[0]
+                self.assertEqual(item.after["metadata_sync"]["written"]["title"], "新标题")
             finally:
                 readback.close()
         finally:

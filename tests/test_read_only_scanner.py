@@ -165,6 +165,16 @@ class ReadOnlyScannerTests(unittest.TestCase):
 
         self.assertEqual([item.relative_path.as_posix() for item in self.scan()], ["keep.mp3"])
 
+    def test_ignores_internal_metadata_candidate_and_rollback_artifacts(self) -> None:
+        self.touch(".musicctrl-metadata-candidate-token.mp3")
+        self.touch(".musicctrl-metadata-rollback-token.flac")
+        self.touch("visible.mp3")
+
+        self.assertEqual(
+            [item.relative_path.as_posix() for item in self.scan()],
+            ["visible.mp3"],
+        )
+
     def test_recurses_and_returns_stable_case_insensitive_order(self) -> None:
         for name in ("zeta/Track.ogg", "Alpha/song.wav", "beta/A.MP3", "beta/b.flac"):
             self.touch(name)

@@ -20,7 +20,7 @@ from mutagen.flac import FLAC
 from mutagen.id3 import ID3, ID3NoHeaderError, TIT2, TPE1
 from mutagen.mp4 import MP4
 
-from services.safe_rename import (
+from services.file_safety import (
     _identity,
     _is_reparse,
     _locked_directory_chain,

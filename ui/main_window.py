@@ -309,6 +309,7 @@ class MainWindow(QMainWindow):
             return
         try:
             items: list[SafeRenameInput] = []
+            sync_requested = self._rename_dialog.id3_checkbox.isChecked()
             for request in requests:
                 if not isinstance(request, tuple) or len(request) != 2:
                     raise ValueError("重命名选择格式无效")
@@ -324,6 +325,21 @@ class MainWindow(QMainWindow):
                 extension = getattr(preview_result, "extension", None)
                 if not isinstance(extension, str) or not extension:
                     raise ValueError("预览扩展名无效")
+                sync_metadata = sync_requested and extension.casefold() in {".mp3", ".flac", ".m4a"}
+                metadata_title: str | None = None
+                metadata_artist: str | None = None
+                if sync_metadata:
+                    if "-" not in suggested_stem:
+                        raise ValueError(
+                            f"{suggested_stem}{extension}：同步标签时建议名称必须包含最后一个半角 '-'"
+                        )
+                    metadata_title, metadata_artist = (
+                        value.strip() for value in suggested_stem.rsplit("-", 1)
+                    )
+                    if not metadata_title or not metadata_artist:
+                        raise ValueError(
+                            f"{suggested_stem}{extension}：同步标签时歌名和歌手都不能为空"
+                        )
                 items.append(
                     SafeRenameInput(
                         asset_id=asset_id,
@@ -332,6 +348,9 @@ class MainWindow(QMainWindow):
                         allowed_root=preview_input.allowed_root,
                         expected_size_bytes=preview_input.size_bytes,
                         expected_mtime_ns=preview_input.mtime_ns,
+                        sync_metadata=sync_metadata,
+                        metadata_title=metadata_title,
+                        metadata_artist=metadata_artist,
                     )
                 )
             if not items:
@@ -340,12 +359,20 @@ class MainWindow(QMainWindow):
             self._rename_dialog.show_warning(str(error))
             return
 
+        confirmation_message = (
+            f"将实际修改 {len(items)} 个文件名。\n\n"
+            "所有文件只在原目录内重命名，目标存在时绝不覆盖。\n"
+        )
+        confirmation_message += (
+            "MP3、FLAC、M4A 会先在候选副本同步 Title/Artist，回读验证后才替换；失败会恢复原文件。\n"
+            if any(item.sync_metadata for item in items)
+            else "本次不会写入音频标签。\n"
+        )
+        confirmation_message += "是否继续？"
         answer = QMessageBox.question(
             self._rename_dialog,
             "确认安全重命名",
-            f"将实际修改 {len(items)} 个文件名。\n\n"
-            "所有文件只在原目录内重命名，目标存在时绝不覆盖；本步骤不会写入音频标签。\n"
-            "是否继续？",
+            confirmation_message,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
