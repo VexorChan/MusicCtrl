@@ -16,7 +16,7 @@ from repositories import LibraryRepository
 
 from services.safe_import import (
     SafeImportError,
-    SafeImportWorker,
+    SafeImportPreviewWorker,
     cleanup_stale_candidates,
     enumerate_import_files,
     iter_import_files,
@@ -116,7 +116,7 @@ class SafeImportTests(unittest.TestCase):
         failed = []
         controller.completed.connect(completed.append)
         controller.failed.connect(failed.append)
-        controller.start(self.source, self.target, "audio")
+        controller.start_preview(self.source, self.target, "audio")
         import time
 
         deadline = time.monotonic() + 5
@@ -124,9 +124,123 @@ class SafeImportTests(unittest.TestCase):
             self.app.processEvents()
         self.app.processEvents()
         self.assertFalse(controller.running)
+        self.assertIsNotNone(controller.current_plan)
+        controller.start_execute(controller.current_plan.id)
+        self._wait_for_controller(controller)
         self.assertEqual(len(completed), 1)
         self.assertEqual(failed, [])
         self.assertEqual(completed[0].success_count, 1)
+
+    def test_preview_is_read_only_and_same_batch_targets_both_conflict(self) -> None:
+        first = self.source / "one"
+        second = self.source / "two"
+        first.mkdir()
+        second.mkdir()
+        (first / "Same.MP3").write_bytes(b"one")
+        (second / "same.mp3").write_bytes(b"two")
+        before = {
+            path.relative_to(self.root): (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in self.root.rglob("*") if path.is_file()
+        }
+        controller = SafeImportController()
+        controller.start_preview(self.source, self.target, "audio")
+        self._wait_for_controller(controller)
+        plan = controller.current_plan
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.ready_count, 0)
+        self.assertEqual(plan.conflict_count, 2)
+        self.assertEqual(tuple(self.target.iterdir()), ())
+        after = {
+            path.relative_to(self.root): (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in self.root.rglob("*") if path.is_file()
+        }
+        self.assertEqual(after, before)
+
+    def test_plan_is_one_shot_and_does_not_enumerate_new_file(self) -> None:
+        planned = self.source / "planned.mp3"
+        planned.write_bytes(b"planned")
+        controller = SafeImportController()
+        controller.start_preview(self.source, self.target, "audio")
+        self._wait_for_controller(controller)
+        plan = controller.current_plan
+        self.assertIsNotNone(plan)
+        late = self.source / "late.mp3"
+        late.write_bytes(b"late")
+        controller.start_execute(plan.id)
+        self._wait_for_controller(controller)
+        self.assertFalse(planned.exists())
+        self.assertTrue((self.target / planned.name).exists())
+        self.assertTrue(late.exists())
+        self.assertFalse((self.target / late.name).exists())
+        with self.assertRaisesRegex(SafeImportError, "失效"):
+            controller.start_execute(plan.id)
+
+    def test_target_created_after_preview_fails_closed(self) -> None:
+        source = self.source / "race.mp3"
+        source.write_bytes(b"source")
+        controller = SafeImportController()
+        completed: list[object] = []
+        controller.completed.connect(completed.append)
+        controller.start_preview(self.source, self.target, "audio")
+        self._wait_for_controller(controller)
+        plan = controller.current_plan
+        self.assertIsNotNone(plan)
+        target = self.target / source.name
+        target.write_bytes(b"late target")
+        controller.start_execute(plan.id)
+        self._wait_for_controller(controller)
+        self.assertEqual(completed[-1].failure_count, 1)
+        self.assertTrue(source.exists())
+        self.assertEqual(target.read_bytes(), b"late target")
+
+    def test_cancelled_execution_persists_every_ready_item(self) -> None:
+        for name in ("a.mp3", "b.mp3"):
+            (self.source / name).write_bytes(name.encode("utf-8"))
+        config = DatabaseConfig(self.root / "cancelled-history.sqlite3")
+        controller = SafeImportController(lambda: LibraryRepository(config))
+        controller.start_preview(self.source, self.target, "audio")
+        self._wait_for_controller(controller)
+        plan = controller.current_plan
+        self.assertIsNotNone(plan)
+        entered = threading.Event()
+
+        def cancelled_import(*_args, cancel_event, **_kwargs):
+            entered.set()
+            while not cancel_event.is_set():
+                time.sleep(0.001)
+            raise InterruptedError("用户取消")
+
+        with mock.patch("services.safe_import.import_one", side_effect=cancelled_import):
+            controller.start_execute(plan.id)
+            deadline = time.monotonic() + 5
+            while not entered.is_set() and time.monotonic() < deadline:
+                self.app.processEvents()
+            controller.request_cancel()
+            self._wait_for_controller(controller)
+        history = controller.list_history()
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["terminal_status"], "cancelled")
+        self.assertFalse(history[0]["complete"])
+        self.assertEqual([item["status"] for item in history[0]["items"]], ["cancelled", "cancelled"])
+        self.assertTrue(all((self.source / name).exists() for name in ("a.mp3", "b.mp3")))
+
+    def test_completed_batch_with_duplicate_is_undoable_for_success_only(self) -> None:
+        movable = self.source / "move.mp3"
+        duplicate = self.source / "same.mp3"
+        movable.write_bytes(b"move")
+        duplicate.write_bytes(b"same")
+        (self.target / duplicate.name).write_bytes(b"same")
+        config = DatabaseConfig(self.root / "mixed-history.sqlite3")
+        controller = SafeImportController(lambda: LibraryRepository(config))
+        self._preview_and_execute(controller, mode="audio")
+        history = controller.list_history()
+        self.assertTrue(history[0]["complete"])
+        self.assertEqual({item["status"] for item in history[0]["items"]}, {"success", "duplicate"})
+        controller.undo_last_complete()
+        self._wait_for_controller(controller)
+        self.assertEqual(movable.read_bytes(), b"move")
+        self.assertTrue(duplicate.exists())
+        self.assertEqual((self.target / duplicate.name).read_bytes(), b"same")
 
     def test_complete_import_is_persisted_and_can_be_undone(self) -> None:
         source = self.source / "undo.mp3"
@@ -144,8 +258,7 @@ class SafeImportTests(unittest.TestCase):
             self.app.processEvents()
             self.assertFalse(controller.running)
 
-        controller.start(self.source, self.target, "audio")
-        wait()
+        self._preview_and_execute(controller, mode="audio")
         self.assertFalse(source.exists())
         self.assertTrue((self.target / source.name).exists())
         self.assertEqual(len(controller.list_history()), 1)
@@ -181,6 +294,99 @@ class SafeImportTests(unittest.TestCase):
         with self.assertRaisesRegex(SafeImportError, "模式"):
             controller.list_history()
 
+    def test_history_rejects_bad_times_and_duplicate_ids(self) -> None:
+        source = self.source / "history.mp3"
+        source.write_bytes(b"history")
+        config = DatabaseConfig(self.root / "strict-history.sqlite3")
+        controller = SafeImportController(lambda: LibraryRepository(config))
+        self._preview_and_execute(controller, mode="audio")
+        original = list(controller.list_history())
+        for key, value in (
+            ("created_at", "2026-01-01T00:00:00"),
+            ("undone_at", 123),
+        ):
+            damaged = [dict(original[0])]
+            damaged[0][key] = value
+            with LibraryRepository(config) as repository:
+                repository.set_setting("p6.import_history", damaged)
+            with self.assertRaisesRegex(SafeImportError, "时间"):
+                controller.list_history()
+        duplicate = [dict(original[0]), dict(original[0])]
+        with LibraryRepository(config) as repository:
+            repository.set_setting("p6.import_history", duplicate)
+        with self.assertRaisesRegex(SafeImportError, "重复"):
+            controller.list_history()
+
+    def test_legacy_history_overflow_is_read_only_compacted_on_next_append(self) -> None:
+        config = DatabaseConfig(self.root / "legacy-overflow.sqlite3")
+
+        def legacy(index: int) -> dict[str, object]:
+            return {
+                "id": f"legacy-{index:03d}",
+                "created_at": f"2026-01-01T00:{index // 60:02d}:{index % 60:02d}+00:00",
+                "mode": "audio",
+                "source_root": str(self.source),
+                "target_root": str(self.target),
+                "undone_at": None,
+                "complete": True,
+                "items": [{
+                    "source_path": str(self.source / f"old-{index}.mp3"),
+                    "target_path": str(self.target / f"old-{index}.mp3"),
+                    "status": "success",
+                    "sha256": "0" * 64,
+                    "message": "legacy",
+                }],
+            }
+
+        raw = [legacy(index) for index in range(201)]
+        with LibraryRepository(config) as repository:
+            repository.set_setting("p6.import_history", raw)
+        controller = SafeImportController(lambda: LibraryRepository(config))
+        visible = controller.list_history()
+        self.assertEqual(len(visible), 200)
+        self.assertEqual(visible[0]["id"], "legacy-001")
+        with LibraryRepository(config) as repository:
+            self.assertEqual(len(repository.get_setting("p6.import_history").value), 201)
+
+        (self.source / "new.mp3").write_bytes(b"new")
+        self._preview_and_execute(controller, mode="audio")
+        stored = controller.list_history()
+        self.assertEqual(len(stored), 200)
+        self.assertNotEqual(stored[-1]["id"], "legacy-200")
+        with LibraryRepository(config) as repository:
+            self.assertEqual(len(repository.get_setting("p6.import_history").value), 200)
+
+        new_overflow = [legacy(index) for index in range(201)]
+        for item in new_overflow:
+            item["terminal_status"] = "completed"
+            item["terminal_message"] = ""
+            item["plan_id"] = None
+        with LibraryRepository(config) as repository:
+            repository.set_setting("p6.import_history", new_overflow)
+        with self.assertRaisesRegex(SafeImportError, "新版"):
+            controller.list_history()
+
+    def test_sha256_cancel_is_checked_after_each_blocking_read(self) -> None:
+        source = self.source / "large.mp3"
+        source.write_bytes(os.urandom(2 * 1024 * 1024))
+
+        class CancelAfterRead:
+            calls = 0
+
+            def is_set(inner_self) -> bool:
+                inner_self.calls += 1
+                return inner_self.calls >= 2
+
+        with self.assertRaises(InterruptedError):
+            import_one(
+                source,
+                source_root=self.source,
+                target_root=self.target,
+                cancel_event=CancelAfterRead(),  # type: ignore[arg-type]
+            )
+        self.assertTrue(source.exists())
+        self.assertFalse((self.target / source.name).exists())
+
     def test_lyrics_import_persists_mode_and_remains_undoable(self) -> None:
         lyric = self.source / "晴天-周杰伦.lrc"
         lyric.write_text("[00:00.00]晴天", encoding="utf-8")
@@ -189,8 +395,7 @@ class SafeImportTests(unittest.TestCase):
         completed: list[object] = []
         controller.completed.connect(completed.append)
 
-        controller.start(self.source, self.target, "lyrics")
-        self._wait_for_controller(controller)
+        self._preview_and_execute(controller, mode="lyrics")
         self.assertEqual(completed[-1].mode, "lyrics")
         self.assertEqual(controller.list_history()[0]["mode"], "lyrics")
         self.assertFalse(lyric.exists())
@@ -210,8 +415,7 @@ class SafeImportTests(unittest.TestCase):
         controller.completed.connect(completed.append)
         controller.failed.connect(failed.append)
 
-        controller.start(self.source, self.target, "audio")
-        self._wait_for_controller(controller)
+        self._preview_and_execute(controller, mode="audio")
         outside = self.root / "outside.mp3"
         imported = self.target / source.name
         outside.write_bytes(imported.read_bytes())
@@ -233,8 +437,7 @@ class SafeImportTests(unittest.TestCase):
         source.write_bytes(b"payload")
         config = DatabaseConfig(self.root / "cancel-history.sqlite3")
         controller = SafeImportController(lambda: LibraryRepository(config))
-        controller.start(self.source, self.target, "audio")
-        self._wait_for_controller(controller)
+        self._preview_and_execute(controller, mode="audio")
 
         entered = threading.Event()
         real_import_one = import_one
@@ -271,8 +474,7 @@ class SafeImportTests(unittest.TestCase):
         source.write_bytes(b"original import")
         config = DatabaseConfig(self.root / "tamper-after-preflight.sqlite3")
         controller = SafeImportController(lambda: LibraryRepository(config))
-        controller.start(self.source, self.target, "audio")
-        self._wait_for_controller(controller)
+        self._preview_and_execute(controller, mode="audio")
         imported = self.target / source.name
         real_import_one = import_one
         tampered = False
@@ -302,8 +504,7 @@ class SafeImportTests(unittest.TestCase):
         source.write_bytes(payload)
         config = DatabaseConfig(self.root / "post-move-mismatch.sqlite3")
         controller = SafeImportController(lambda: LibraryRepository(config))
-        controller.start(self.source, self.target, "audio")
-        self._wait_for_controller(controller)
+        self._preview_and_execute(controller, mode="audio")
         imported = self.target / source.name
         real_import_one = import_one
 
@@ -325,7 +526,7 @@ class SafeImportTests(unittest.TestCase):
         self.assertIsNone(controller.list_history()[0]["undone_at"])
 
     def test_worker_emits_cancelled_when_iterator_stops_on_cancel(self) -> None:
-        worker = SafeImportWorker(
+        worker = SafeImportPreviewWorker(
             source_root=self.source,
             target_root=self.target,
             mode="audio",
@@ -334,7 +535,7 @@ class SafeImportTests(unittest.TestCase):
         cancelled: list[object] = []
         failed: list[str] = []
         worker.completed.connect(completed.append)
-        worker.cancelled.connect(cancelled.append)
+        worker.cancelled.connect(lambda: cancelled.append(True))
         worker.failed.connect(failed.append)
 
         def stop_for_cancel(*_args, cancel_event, **_kwargs):
@@ -408,6 +609,14 @@ class SafeImportTests(unittest.TestCase):
             self.app.processEvents()
         self.app.processEvents()
         self.assertFalse(controller.running)
+
+    def _preview_and_execute(self, controller: SafeImportController, *, mode: str) -> None:
+        controller.start_preview(self.source, self.target, mode)
+        self._wait_for_controller(controller)
+        plan = controller.current_plan
+        self.assertIsNotNone(plan)
+        controller.start_execute(plan.id)
+        self._wait_for_controller(controller)
 
 
 if __name__ == "__main__":

@@ -25,6 +25,9 @@ from ui.tables import DataTable
 
 class ImportDialog(PrototypeDialog):
     start_requested = Signal(object, object, str)
+    preview_requested = Signal(object, object, str)
+    execute_requested = Signal(str)
+    discard_preview_requested = Signal()
     scan_existing_requested = Signal()
     cancel_requested = Signal()
 
@@ -33,6 +36,7 @@ class ImportDialog(PrototypeDialog):
         self.mode = "audio"
         self.live_mode = bool(live_mode)
         self._running = False
+        self._plan_id: str | None = None
         root = QVBoxLayout(self)
         root.setContentsMargins(22, 18, 22, 18)
         root.setSpacing(12)
@@ -67,12 +71,16 @@ class ImportDialog(PrototypeDialog):
         self.lyrics_button.clicked.connect(lambda: self.set_mode("lyrics"))
         self.move_button = QPushButton("开始安全移动导入" if live_mode else "移动")
         self.move_button.setObjectName("PrimaryButton")
-        self.move_button.setEnabled(True)
+        self.move_button.setEnabled(not live_mode)
         if live_mode:
-            self.move_button.clicked.connect(self._request_start)
+            self.move_button.clicked.connect(self._request_execute)
+        self.preview_button = QPushButton("生成只读预览")
+        self.preview_button.setVisible(live_mode)
+        self.preview_button.clicked.connect(self._request_preview)
         actions.addWidget(self.audio_button)
         actions.addWidget(self.lyrics_button)
         actions.addStretch(1)
+        actions.addWidget(self.preview_button)
         actions.addWidget(self.move_button)
         root.addLayout(actions)
 
@@ -81,12 +89,18 @@ class ImportDialog(PrototypeDialog):
         root.addWidget(self.mode_hint)
 
         self.table = DataTable()
-        self.table.setColumnCount(3)
-        self.table.setHorizontalHeaderLabels(["No.", "名称", "状态"])
+        self.table.setColumnCount(4 if live_mode else 3)
+        self.table.setHorizontalHeaderLabels(
+            ["No.", "源文件", "目标文件", "状态"] if live_mode else ["No.", "名称", "状态"]
+        )
         self.table.horizontalHeader().setStretchLastSection(False)
         self.table.setColumnWidth(0, 68)
         self.table.horizontalHeader().setSectionResizeMode(1, self.table.horizontalHeader().ResizeMode.Stretch)
-        self.table.setColumnWidth(2, 180)
+        if live_mode:
+            self.table.horizontalHeader().setSectionResizeMode(2, self.table.horizontalHeader().ResizeMode.Stretch)
+            self.table.setColumnWidth(3, 140)
+        else:
+            self.table.setColumnWidth(2, 180)
         root.addWidget(self.table, 1)
 
         paths = QGridLayout()
@@ -124,6 +138,8 @@ class ImportDialog(PrototypeDialog):
             self.target_path.clear()
             self.table.setRowCount(0)
             self.summary.setText("请选择源目录和目标目录，然后开始安全导入。")
+            self.scan_path.textChanged.connect(self._invalidate_preview)
+            self.target_path.textChanged.connect(self._invalidate_preview)
 
     def _choose(self, line: QLineEdit) -> None:
         path = QFileDialog.getExistingDirectory(self, "选择文件夹", line.text())
@@ -131,6 +147,7 @@ class ImportDialog(PrototypeDialog):
             line.setText(path.replace("/", "\\"))
 
     def set_mode(self, mode: str) -> None:
+        changed = mode != self.mode
         self.mode = mode
         self.audio_button.setChecked(mode == "audio")
         self.lyrics_button.setChecked(mode == "lyrics")
@@ -141,6 +158,8 @@ class ImportDialog(PrototypeDialog):
             )
         self.mode_hint.setText("音频模式 · 仅显示 MP3 / FLAC / WAV / M4A / OGG / AAC" if mode == "audio" else "歌词模式 · 仅显示 LRC")
         if self.live_mode:
+            if changed:
+                self._invalidate_preview()
             self.table.setRowCount(0)
             self.summary.setText("请选择源目录和目标目录，然后开始安全导入。")
             return
@@ -160,27 +179,79 @@ class ImportDialog(PrototypeDialog):
         else:
             self.summary.setText("已选择 6 项    ·    可移动 3 项    ·    冲突 2 项    ·    重复 1 项")
 
-    def _request_start(self) -> None:
+    def _request_preview(self) -> None:
         source = Path(self.scan_path.text().strip())
         target = Path(self.target_path.text().strip())
         if not source.is_absolute() or not target.is_absolute():
             self.summary.setText("源目录和目标目录都必须选择绝对路径。")
             return
-        self.start_requested.emit(source, target, self.mode)
+        self._invalidate_preview()
+        self.preview_requested.emit(source, target, self.mode)
 
-    def set_running(self, running: bool) -> None:
+    def _request_start(self) -> None:
+        self._request_preview()
+
+    def _request_execute(self) -> None:
+        if self._plan_id is None:
+            self.summary.setText("预览已失效，请重新生成。")
+            return
+        self.execute_requested.emit(self._plan_id)
+
+    def _invalidate_preview(self) -> None:
+        if not self.live_mode or self._plan_id is None:
+            return
+        self.clear_preview()
+        self.discard_preview_requested.emit()
+        self.summary.setText("输入已变化，请重新生成只读预览。")
+
+    def clear_preview(self) -> None:
+        self._plan_id = None
+        self.move_button.setEnabled(False)
+        self.table.setRowCount(0)
+        self.summary.setText("预览已失效，请重新生成只读预览。")
+
+    def discard_preview(self) -> None:
+        self.clear_preview()
+
+    def show_preview(self, plan: object) -> None:
+        self._plan_id = str(getattr(plan, "id"))
+        items = tuple(getattr(plan, "items", ()))
+        self.table.setRowCount(len(items))
+        labels = {"ready": "可执行", "duplicate": "重复", "conflict": "冲突", "failed": "失败"}
+        for row, item in enumerate(items):
+            number = QTableWidgetItem(str(row + 1))
+            number.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(row, 0, number)
+            self.table.setItem(row, 1, QTableWidgetItem(str(item.source_path)))
+            self.table.setItem(row, 2, QTableWidgetItem(str(item.target_path)))
+            status = QTableWidgetItem(labels.get(item.status, item.status))
+            status.setToolTip(item.message)
+            self.table.setItem(row, 3, status)
+        self.move_button.setEnabled(getattr(plan, "ready_count", 0) > 0 and not self._running)
+        self.summary.setText(
+            f"预览完成 · 可执行 {getattr(plan, 'ready_count', 0)} · "
+            f"重复 {getattr(plan, 'duplicate_count', 0)} · "
+            f"冲突 {getattr(plan, 'conflict_count', 0)} · 失败 {getattr(plan, 'failure_count', 0)}"
+        )
+
+    def set_running(self, running: bool, phase: str = "execute") -> None:
         self._running = bool(running)
-        self.move_button.setText("导入中" if running else "开始安全移动导入")
-        self.move_button.setEnabled(not running)
+        self.move_button.setText("导入中" if running and phase == "execute" else "开始安全移动导入")
+        self.move_button.setEnabled(not running and self._plan_id is not None)
+        self.preview_button.setEnabled(not running)
         self.read_only_scan_button.setEnabled(not running)
         self.audio_button.setEnabled(not running)
         self.lyrics_button.setEnabled(not running)
         self.scan_path.setEnabled(not running)
         self.target_path.setEnabled(not running)
         if running:
-            self.summary.setText("正在校验并安全导入；关闭窗口会先协作取消。")
+            self.summary.setText(
+                "正在生成只读预览；关闭窗口会先协作取消。"
+                if phase == "preview" else "正在校验并安全导入；关闭窗口会先协作取消。"
+            )
 
     def show_result(self, result: object, *, cancelled: bool = False) -> None:
+        self._plan_id = None
         items = tuple(getattr(result, "items", ()))
         self.table.setRowCount(len(items))
         labels = {"success": "已导入", "duplicate": "重复", "conflict": "冲突", "failed": "失败"}
@@ -188,11 +259,15 @@ class ImportDialog(PrototypeDialog):
             number = QTableWidgetItem(str(row + 1))
             number.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.table.setItem(row, 0, number)
-            self.table.setItem(row, 1, QTableWidgetItem(item.source_path.name))
+            self.table.setItem(row, 1, QTableWidgetItem(str(item.source_path)))
+            status_column = 2
+            if self.live_mode:
+                self.table.setItem(row, 2, QTableWidgetItem(str(item.target_path)))
+                status_column = 3
             status = labels.get(item.status, item.status)
             status_item = QTableWidgetItem(status)
             status_item.setToolTip(item.message)
-            self.table.setItem(row, 2, status_item)
+            self.table.setItem(row, status_column, status_item)
         prefix = "已取消" if cancelled else "已完成"
         self.summary.setText(
             f"{prefix} · 成功 {getattr(result, 'success_count', 0)} · "
@@ -209,4 +284,7 @@ class ImportDialog(PrototypeDialog):
             self.cancel_requested.emit()
             event.ignore()
             return
+        if self._plan_id is not None:
+            self.clear_preview()
+            self.discard_preview_requested.emit()
         super().closeEvent(event)

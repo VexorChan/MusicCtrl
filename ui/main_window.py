@@ -174,10 +174,14 @@ class MainWindow(QMainWindow):
             except Exception as error:
                 playlist_controller.failed.emit(f"无法加载歌单：{error}")
         if safe_import_controller is not None:
+            if hasattr(safe_import_controller, "preview_ready"):
+                safe_import_controller.preview_ready.connect(self._safe_import_preview_ready)
+                safe_import_controller.preview_cancelled.connect(self._safe_import_preview_cancelled)
+                safe_import_controller.preview_failed.connect(self._safe_import_failed)
             safe_import_controller.completed.connect(self._safe_import_completed)
             safe_import_controller.cancelled.connect(self._safe_import_cancelled)
             safe_import_controller.failed.connect(self._safe_import_failed)
-            safe_import_controller.warning.connect(self._safe_import_failed)
+            safe_import_controller.warning.connect(self._safe_import_warning)
             safe_import_controller.running_changed.connect(self._safe_import_running_changed)
         if backup_controller is not None:
             backup_controller.completed.connect(self._backup_completed)
@@ -223,9 +227,15 @@ class MainWindow(QMainWindow):
             self._import_dialog = dialog
             dialog.destroyed.connect(lambda: setattr(self, "_import_dialog", None))
             dialog.start_requested.connect(self._start_safe_import)
+            dialog.preview_requested.connect(self._start_safe_import_preview)
+            dialog.execute_requested.connect(self._execute_safe_import)
+            dialog.discard_preview_requested.connect(self._discard_safe_import_preview)
             dialog.scan_existing_requested.connect(self.open_read_only_scan)
             dialog.cancel_requested.connect(self._safe_import_controller.request_cancel)
-            dialog.set_running(self._safe_import_controller.running)
+            dialog.set_running(
+                self._safe_import_controller.running,
+                getattr(self._safe_import_controller, "phase", "execute"),
+            )
             self._show_window(dialog)
             return
         if self._scan_controller is None:
@@ -242,7 +252,12 @@ class MainWindow(QMainWindow):
             if self._import_dialog is not None:
                 self._import_dialog.show_failed("安全移动导入正在运行，请完成或取消后再扫描")
             return
+        if self._safe_import_controller is not None and hasattr(
+            self._safe_import_controller, "discard_preview"
+        ):
+            self._safe_import_controller.discard_preview()
         if self._import_dialog is not None:
+            self._import_dialog.clear_preview()
             self._import_dialog.hide()
         if self._scan_dialog is not None:
             self._scan_dialog.show()
@@ -272,23 +287,69 @@ class MainWindow(QMainWindow):
         self._show_window(dialog)
 
     def _start_safe_import(self, source_root: Path, target_root: Path, mode: str) -> None:
+        self._start_safe_import_preview(source_root, target_root, mode)
+
+    def _start_safe_import_preview(self, source_root: Path, target_root: Path, mode: str) -> None:
         if self._safe_import_controller is None or self._import_dialog is None:
             return
         if self._has_running_background_task():
             self._import_dialog.show_failed("已有后台任务运行，请完成后再导入")
             return
+        try:
+            starter = getattr(
+                self._safe_import_controller,
+                "start_preview",
+                self._safe_import_controller.start,
+            )
+            starter(source_root, target_root, mode)
+        except Exception as error:
+            self._import_dialog.show_failed(str(error))
+
+    def _safe_import_preview_ready(self, plan: object) -> None:
+        if self._import_dialog is not None:
+            self._import_dialog.show_preview(plan)
+
+    def _safe_import_preview_cancelled(self) -> None:
+        if self._import_dialog is not None:
+            self._import_dialog.show_failed("已取消生成预览")
+
+    def _discard_safe_import_preview(self) -> None:
+        if (
+            self._safe_import_controller is None
+            or self._safe_import_controller.running
+            or not hasattr(self._safe_import_controller, "discard_preview")
+        ):
+            return
+        self._safe_import_controller.discard_preview()
+
+    def _execute_safe_import(self, plan_id: str) -> None:
+        if self._safe_import_controller is None or self._import_dialog is None:
+            return
+        if self._has_running_background_task():
+            self._import_dialog.show_failed("已有后台任务运行，请完成后再导入")
+            return
+        plan = self._safe_import_controller.current_plan
+        if plan is None or plan.id != plan_id:
+            self._import_dialog.show_failed("预览已失效，请重新生成")
+            return
         answer = QMessageBox.question(
             self._import_dialog,
             "确认安全移动导入",
-            "源文件只有在目标副本完成大小和 SHA-256 校验后才会删除。\n"
-            "同名不同内容不会覆盖。是否继续？",
+            f"模式：{'音频' if plan.mode == 'audio' else '歌词'}\n"
+            f"可执行 {plan.ready_count} · 重复 {plan.duplicate_count} · "
+            f"冲突 {plan.conflict_count} · 失败 {plan.failure_count}\n"
+            f"源目录：{plan.source_root}\n目标目录：{plan.target_root}\n"
+            "确认后才会移动文件，是否继续？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
+        if self._has_running_background_task():
+            self._import_dialog.show_failed("确认期间已有后台任务启动，请完成后重新执行预览")
+            return
         try:
-            self._safe_import_controller.start(source_root, target_root, mode)
+            self._safe_import_controller.start_execute(plan_id)
         except Exception as error:
             self._import_dialog.show_failed(str(error))
 
@@ -318,9 +379,14 @@ class MainWindow(QMainWindow):
         if self._import_dialog is not None:
             self._import_dialog.show_failed(message)
 
+    def _safe_import_warning(self, message: str) -> None:
+        if self._import_dialog is not None:
+            self._import_dialog.summary.setText(f"警告：{message}")
+
     def _safe_import_running_changed(self, running: bool) -> None:
         if self._import_dialog is not None:
-            self._import_dialog.set_running(running)
+            phase = getattr(self._safe_import_controller, "phase", "execute")
+            self._import_dialog.set_running(running, phase)
         self._background_running_changed(running)
 
     def _start_read_only_scan(self, root) -> None:
