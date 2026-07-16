@@ -592,6 +592,19 @@ class LibraryRepository:
         ).fetchone()
         return None if row is None else self._rename_operation_from_row(row)
 
+    def list_rename_operations(self) -> tuple[RenameOperationRecord, ...]:
+        """Return every persisted rename operation, newest first, without writing."""
+
+        self._require_open_in_owner_thread()
+        rows = self._connection.execute(
+            """
+            SELECT * FROM operations
+            WHERE operation_type = 'rename'
+            ORDER BY created_at DESC, id DESC
+            """
+        ).fetchall()
+        return tuple(self._rename_operation_from_row(row) for row in rows)
+
     def get_rename_operation_item(self, item_id: str) -> RenameOperationItemRecord | None:
         self._require_open_in_owner_thread()
         if not isinstance(item_id, str) or not item_id.strip():

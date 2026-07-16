@@ -377,6 +377,43 @@ class LyricsMatchController(QObject):
         path = Path(setting.value)
         return path if path.is_absolute() else None
 
+    def list_history(self) -> tuple[dict[str, object], ...]:
+        """Return newest-first lyrics relation history with real indexed paths."""
+
+        repository = self._open_repository()
+        try:
+            records = repository.list_lyrics_matches()
+            history: list[dict[str, object]] = []
+            for record in reversed(records):
+                audio = repository.get_asset_by_id(record.audio_asset_id)
+                if audio is None:
+                    raise ValueError("歌词历史引用的音频索引不存在")
+                lyric_path: Path | None = None
+                if record.lyric_asset_id is not None:
+                    lyric = repository.get_asset_by_id(record.lyric_asset_id)
+                    if lyric is None:
+                        raise ValueError("歌词历史引用的歌词索引不存在")
+                    lyric_path = lyric.canonical_path
+                history.append(
+                    {
+                        "id": record.id,
+                        "created_at": record.created_at,
+                        "updated_at": record.updated_at,
+                        "audio_asset_id": record.audio_asset_id,
+                        "audio_path": audio.canonical_path,
+                        "lyric_asset_id": record.lyric_asset_id,
+                        "lyric_path": lyric_path,
+                        "source_kind": record.source_kind,
+                        "confidence": record.confidence,
+                        "method": record.method,
+                        "state": record.state,
+                        "is_current": record.is_current,
+                    }
+                )
+            return tuple(history)
+        finally:
+            repository.close()
+
     def start_scan(self, root: Path) -> None:
         if not isinstance(root, Path) or not root.is_absolute():
             raise ValueError("歌词目录必须是绝对 Path")

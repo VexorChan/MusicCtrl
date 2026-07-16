@@ -16,6 +16,7 @@ from PySide6.QtCore import QObject, QThread, Signal, Slot
 
 from repositories import (
     LibraryRepository,
+    RenameOperationItemRecord,
     RenameOperationRecord,
     RenamePlanItem,
     RepositoryCommitOutcomeUnknown,
@@ -685,6 +686,20 @@ class SafeRenameController(QObject):
     def request_cancel(self) -> None:
         if self._worker is not None:
             self._worker.request_cancel()
+
+    def list_history(
+        self,
+    ) -> tuple[tuple[RenameOperationRecord, tuple[RenameOperationItemRecord, ...]], ...]:
+        """Return persisted rename operations with their file-level items."""
+
+        repository = self._repository_factory()
+        try:
+            return tuple(
+                (operation, repository.list_rename_operation_items(operation.id))
+                for operation in repository.list_rename_operations()
+            )
+        finally:
+            repository.close()
 
     def _cache(self, kind: str, payload: object) -> None:
         if self._terminal is None:

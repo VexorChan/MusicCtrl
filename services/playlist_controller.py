@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 import stat
@@ -23,6 +24,11 @@ from services.windows_shortcuts import (
 
 
 PLAYLIST_ROOT_KEY = "p5.playlist_root"
+PLAYLIST_HISTORY_KEY = "p5.operation_history"
+_PLAYLIST_HISTORY_LIMIT = 200
+_PLAYLIST_ACTIONS = {"create", "add", "remove", "retarget"}
+_PLAYLIST_TERMINALS = {"completed", "cancelled", "failed"}
+_PLAYLIST_ITEM_RESULTS = {"success", "skipped", "failed", "cancelled"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +53,14 @@ class PlaylistRetargetInput:
 
 
 @dataclass(frozen=True, slots=True)
+class PlaylistItemResult:
+    source_path: Path | None
+    target_path: Path | None
+    result: str
+    message: str
+
+
+@dataclass(frozen=True, slots=True)
 class PlaylistOperationResult:
     playlist_name: str
     success_count: int
@@ -54,6 +68,137 @@ class PlaylistOperationResult:
     failure_count: int
     messages: tuple[str, ...]
     affected_playlists: tuple[str, ...] = ()
+    action: str = "add"
+    status: str = "completed"
+    created_at: str = ""
+    items: tuple[PlaylistItemResult, ...] = ()
+
+
+def _item_paths(item: object, *, playlist_root: Path, playlist_name: str) -> tuple[Path | None, Path | None]:
+    if isinstance(item, PlaylistAudioInput):
+        return item.target_path, playlist_root / playlist_name / f"{item.target_path.name}.lnk"
+    if isinstance(item, PlaylistRemovalInput):
+        return item.shortcut_path, item.expected_target
+    if isinstance(item, PlaylistRetargetInput):
+        return item.source_path, item.target_path
+    return None, None
+
+
+def _history_to_json(result: PlaylistOperationResult) -> dict[str, object]:
+    return {
+        "playlist_name": result.playlist_name,
+        "success_count": result.success_count,
+        "skipped_count": result.skipped_count,
+        "failure_count": result.failure_count,
+        "messages": list(result.messages),
+        "affected_playlists": list(result.affected_playlists),
+        "action": result.action,
+        "status": result.status,
+        "created_at": result.created_at,
+        "items": [
+            {
+                "source_path": None if item.source_path is None else str(item.source_path),
+                "target_path": None if item.target_path is None else str(item.target_path),
+                "result": item.result,
+                "message": item.message,
+            }
+            for item in result.items
+        ],
+    }
+
+
+def _history_from_json(value: object) -> PlaylistOperationResult:
+    if not isinstance(value, dict):
+        raise ValueError("歌单操作历史格式损坏")
+    try:
+        playlist_name = value["playlist_name"]
+        action = value["action"]
+        status = value["status"]
+        created_at = value["created_at"]
+        success_count = value["success_count"]
+        skipped_count = value["skipped_count"]
+        failure_count = value["failure_count"]
+        messages = value["messages"]
+        affected = value["affected_playlists"]
+        raw_items = value["items"]
+    except KeyError as error:
+        raise ValueError("歌单操作历史字段缺失") from error
+    if (
+        not isinstance(playlist_name, str)
+        or not playlist_name
+        or action not in _PLAYLIST_ACTIONS
+        or status not in _PLAYLIST_TERMINALS
+        or not isinstance(created_at, str)
+        or not created_at
+        or any(isinstance(count, bool) or not isinstance(count, int) or count < 0 for count in (success_count, skipped_count, failure_count))
+        or not isinstance(messages, list)
+        or not all(isinstance(message, str) for message in messages)
+        or not isinstance(affected, list)
+        or not all(isinstance(name, str) and name for name in affected)
+        or not isinstance(raw_items, list)
+    ):
+        raise ValueError("歌单操作历史字段损坏")
+    try:
+        parsed_time = datetime.fromisoformat(created_at)
+    except ValueError as error:
+        raise ValueError("歌单操作历史时间损坏") from error
+    if parsed_time.tzinfo is None or parsed_time.utcoffset() is None:
+        raise ValueError("歌单操作历史时间缺少时区")
+    items: list[PlaylistItemResult] = []
+    for raw_item in raw_items:
+        if not isinstance(raw_item, dict):
+            raise ValueError("歌单操作历史明细损坏")
+        source_value = raw_item.get("source_path")
+        target_value = raw_item.get("target_path")
+        result = raw_item.get("result")
+        message = raw_item.get("message")
+        source = None if source_value is None else Path(source_value) if isinstance(source_value, str) else None
+        target = None if target_value is None else Path(target_value) if isinstance(target_value, str) else None
+        if (
+            (source_value is not None and (source is None or not source.is_absolute()))
+            or (target_value is not None and (target is None or not target.is_absolute()))
+            or result not in _PLAYLIST_ITEM_RESULTS
+            or not isinstance(message, str)
+        ):
+            raise ValueError("歌单操作历史明细损坏")
+        items.append(PlaylistItemResult(source, target, str(result), message))
+    actual_counts = (
+        sum(item.result == "success" for item in items),
+        sum(item.result == "skipped" for item in items),
+        sum(item.result == "failed" for item in items),
+    )
+    if actual_counts != (success_count, skipped_count, failure_count):
+        raise ValueError("歌单操作历史计数与明细不一致")
+    item_results = {item.result for item in items}
+    if status == "completed" and "cancelled" in item_results:
+        raise ValueError("歌单完成历史混入取消明细")
+    if status == "cancelled" and "cancelled" not in item_results:
+        raise ValueError("歌单取消历史缺少取消明细")
+    if status == "failed" and "failed" not in item_results:
+        raise ValueError("歌单失败历史缺少失败明细")
+    return PlaylistOperationResult(
+        playlist_name,
+        success_count,
+        skipped_count,
+        failure_count,
+        tuple(messages),
+        tuple(affected),
+        str(action),
+        str(status),
+        created_at,
+        tuple(items),
+    )
+
+
+def _load_history(repository: LibraryRepository) -> list[PlaylistOperationResult]:
+    setting = repository.get_setting(PLAYLIST_HISTORY_KEY)
+    if setting is None:
+        return []
+    if not isinstance(setting.value, list):
+        raise ValueError("歌单操作历史不是列表")
+    if len(setting.value) > _PLAYLIST_HISTORY_LIMIT:
+        raise ValueError("歌单操作历史超过 200 条，拒绝隐藏或截断异常数据")
+    return [_history_from_json(value) for value in setting.value]
 
 
 def _name_key(value: str) -> str:
@@ -106,6 +251,8 @@ class PlaylistShortcutWorker(QThread):
         self._remove_items = remove_items
         self._retarget_items = retarget_items
         self._cancel = threading.Event()
+        self._action = "retarget" if retarget_items else "add" if add_items else "remove"
+        self._created_at = datetime.now(timezone.utc).isoformat()
 
     def request_cancel(self) -> None:
         self._cancel.set()
@@ -115,6 +262,22 @@ class PlaylistShortcutWorker(QThread):
         success = skipped = failures = 0
         messages: list[str] = []
         affected: set[str] = set()
+        details: list[PlaylistItemResult] = []
+
+        def build_result(status: str) -> PlaylistOperationResult:
+            return PlaylistOperationResult(
+                self._playlist_name,
+                success,
+                skipped,
+                failures,
+                tuple(messages),
+                tuple(sorted(affected)),
+                self._action,
+                status,
+                self._created_at,
+                tuple(details),
+            )
+
         try:
             if self._retarget_items:
                 folder = None
@@ -136,18 +299,29 @@ class PlaylistShortcutWorker(QThread):
                     raise ValueError("要移除快捷方式的歌单不存在或不安全")
                 folder = self._playlist_root / matches[0].name
             items = self._add_items or self._remove_items or self._retarget_items
-            for item in items:
+            for index, item in enumerate(items):
                 if self._cancel.is_set():
-                    result = PlaylistOperationResult(
-                        self._playlist_name,
-                        success,
-                        skipped,
-                        failures,
-                        tuple(messages),
-                        tuple(sorted(affected)),
-                    )
-                    self.cancelled.emit(result)
+                    for remaining in items[index:]:
+                        source_path, target_path = _item_paths(
+                            remaining,
+                            playlist_root=self._playlist_root,
+                            playlist_name=self._playlist_name,
+                        )
+                        details.append(
+                            PlaylistItemResult(
+                                source_path,
+                                target_path,
+                                "cancelled",
+                                "未执行：操作已取消",
+                            )
+                        )
+                    self.cancelled.emit(build_result("cancelled"))
                     return
+                source_path, target_path = _item_paths(
+                    item,
+                    playlist_root=self._playlist_root,
+                    playlist_name=self._playlist_name,
+                )
                 try:
                     if isinstance(item, PlaylistRetargetInput):
                         updated = 0
@@ -183,7 +357,11 @@ class PlaylistShortcutWorker(QThread):
                                 updated += 1
                         if updated == 0:
                             skipped += 1
-                            messages.append(f"未发现引用：{item.source_path.name}")
+                            message = f"未发现引用：{item.source_path.name}"
+                            messages.append(message)
+                            details.append(
+                                PlaylistItemResult(source_path, target_path, "skipped", message)
+                            )
                             continue
                     elif isinstance(item, PlaylistAudioInput):
                         if item.file_state != "active":
@@ -207,22 +385,18 @@ class PlaylistShortcutWorker(QThread):
                         if isinstance(item, (PlaylistAudioInput, PlaylistRetargetInput))
                         else item.shortcut_path
                     )
-                    messages.append(f"已跳过重复项：{item_path.name}")
+                    message = f"已跳过重复项：{item_path.name}"
+                    messages.append(message)
+                    details.append(PlaylistItemResult(source_path, target_path, "skipped", message))
                 except Exception as error:
                     failures += 1
-                    messages.append(str(error).strip() or error.__class__.__name__)
+                    message = str(error).strip() or error.__class__.__name__
+                    messages.append(message)
+                    details.append(PlaylistItemResult(source_path, target_path, "failed", message))
                 else:
                     success += 1
-            self.completed.emit(
-                PlaylistOperationResult(
-                    self._playlist_name,
-                    success,
-                    skipped,
-                    failures,
-                    tuple(messages),
-                    tuple(sorted(affected)),
-                )
-            )
+                    details.append(PlaylistItemResult(source_path, target_path, "success", "已完成"))
+            self.completed.emit(build_result("completed"))
         except Exception as error:
             self.failed.emit(str(error).strip() or error.__class__.__name__)
 
@@ -233,6 +407,7 @@ class PlaylistController(QObject):
     completed = Signal(object)
     cancelled = Signal(object)
     failed = Signal(str)
+    warning = Signal(str)
     running_changed = Signal(bool)
 
     def __init__(self, database_config: DatabaseConfig, parent: QObject | None = None) -> None:
@@ -240,10 +415,34 @@ class PlaylistController(QObject):
         self._database_config = database_config
         self._worker: PlaylistShortcutWorker | None = None
         self._terminal: tuple[str, object] | None = None
+        self._owner_thread_id = threading.get_ident()
+        self._active_action = ""
+        self._active_playlist_name = ""
+        self._active_created_at = ""
+        self._active_items: tuple[PlaylistItemResult, ...] = ()
 
     @property
     def running(self) -> bool:
         return self._worker is not None
+
+    def _require_owner_thread(self) -> None:
+        if threading.get_ident() != self._owner_thread_id:
+            raise RuntimeError("歌单历史只能在创建 controller 的线程读取")
+
+    def list_history(self) -> tuple[PlaylistOperationResult, ...]:
+        self._require_owner_thread()
+        with LibraryRepository(self._database_config) as repository:
+            history = _load_history(repository)
+        return tuple(reversed(history))
+
+    def _append_history(self, result: PlaylistOperationResult) -> None:
+        with LibraryRepository(self._database_config) as repository:
+            history = _load_history(repository)
+            history.append(result)
+            repository.set_setting(
+                PLAYLIST_HISTORY_KEY,
+                [_history_to_json(item) for item in history[-_PLAYLIST_HISTORY_LIMIT:]],
+            )
 
     def remembered_root(self) -> Path | None:
         try:
@@ -286,6 +485,22 @@ class PlaylistController(QObject):
 
     def create_playlist(self, name: str) -> str:
         folder = create_playlist_directory(playlist_root=self._require_root(), name=name)
+        result = PlaylistOperationResult(
+            folder.name,
+            1,
+            0,
+            0,
+            (),
+            (folder.name,),
+            "create",
+            "completed",
+            datetime.now(timezone.utc).isoformat(),
+            (PlaylistItemResult(None, folder, "success", "已创建歌单"),),
+        )
+        try:
+            self._append_history(result)
+        except Exception as error:
+            self.warning.emit(f"歌单已创建，但操作历史保存失败：{error}")
         self.playlists_changed.emit(self.list_playlists())
         return folder.name
 
@@ -376,6 +591,21 @@ class PlaylistController(QObject):
         worker.finished.connect(self._finished)
         self._worker = worker
         self._terminal = None
+        self._active_action = worker._action
+        self._active_playlist_name = playlist_name
+        self._active_created_at = worker._created_at
+        self._active_items = tuple(
+            PlaylistItemResult(
+                *_item_paths(
+                    item,
+                    playlist_root=worker._playlist_root,
+                    playlist_name=playlist_name,
+                ),
+                "failed",
+                "",
+            )
+            for item in payload
+        )
         self.running_changed.emit(True)
         worker.start()
 
@@ -392,6 +622,35 @@ class PlaylistController(QObject):
         if worker is None:
             return
         kind, payload = self._terminal or ("failed", "歌单线程结束但没有终态")
+        if isinstance(payload, PlaylistOperationResult):
+            history_result = payload
+        else:
+            message = str(payload)
+            failed_items = tuple(
+                PlaylistItemResult(
+                    item.source_path,
+                    item.target_path,
+                    "failed",
+                    message,
+                )
+                for item in self._active_items
+            )
+            history_result = PlaylistOperationResult(
+                self._active_playlist_name or "未知歌单",
+                0,
+                0,
+                len(failed_items) or 1,
+                (message,),
+                (),
+                self._active_action or "add",
+                "failed",
+                self._active_created_at or datetime.now(timezone.utc).isoformat(),
+                failed_items,
+            )
+        try:
+            self._append_history(history_result)
+        except Exception as error:
+            self.warning.emit(f"歌单操作已结束，但历史保存失败：{error}")
         if isinstance(payload, PlaylistOperationResult):
             try:
                 names = payload.affected_playlists
@@ -411,5 +670,9 @@ class PlaylistController(QObject):
             self.failed.emit(str(payload))
         self._worker = None
         self._terminal = None
+        self._active_action = ""
+        self._active_playlist_name = ""
+        self._active_created_at = ""
+        self._active_items = ()
         worker.deleteLater()
         self.running_changed.emit(False)

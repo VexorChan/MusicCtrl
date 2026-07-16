@@ -657,6 +657,43 @@ class RenameRepositoryTests(unittest.TestCase):
         repository.finish_rename_operation(operation.id)
         self.assertEqual(self.media_snapshot(self.music_root), before)
 
+    def test_list_rename_operations_is_stable_read_only_and_thread_owned(self) -> None:
+        repository = self.create_repository()
+        first_path, first_asset = self.add_audio(repository, "history-first.mp3")
+        second_path, second_asset = self.add_audio(repository, "history-second.mp3")
+        first, _ = self.create_operation(
+            repository,
+            self.plan(first_asset, first_path, self.music_root / "history-first-new.mp3"),
+        )
+        second, _ = self.create_operation(
+            repository,
+            self.plan(second_asset, second_path, self.music_root / "history-second-new.mp3"),
+        )
+        expected = tuple(
+            sorted((first, second), key=lambda item: (item.created_at, item.id), reverse=True)
+        )
+        before_changes = repository._connection.total_changes
+
+        self.assertEqual(repository.list_rename_operations(), expected)
+        self.assertEqual(repository.list_rename_operations(), expected)
+        self.assertEqual(repository._connection.total_changes, before_changes)
+
+        errors: list[type[BaseException]] = []
+
+        def cross_thread() -> None:
+            try:
+                repository.list_rename_operations()
+            except BaseException as error:
+                errors.append(type(error))
+
+        thread = threading.Thread(target=cross_thread)
+        thread.start()
+        thread.join(timeout=5)
+        self.assertEqual(errors, [RepositoryThreadError])
+        repository.close()
+        with self.assertRaises(RepositoryClosedError):
+            repository.list_rename_operations()
+
 
 if __name__ == "__main__":
     unittest.main()
