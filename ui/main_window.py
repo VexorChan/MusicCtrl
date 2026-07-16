@@ -66,7 +66,7 @@ class MainWindow(QMainWindow):
         self._metadata_inputs_by_asset: dict[str, MetadataPreviewInput] = {}
         self._metadata_results_by_asset: dict[str, object] = {}
         self._playlist_add_queue: list[tuple[str, tuple[PlaylistAudioInput, ...]]] = []
-        self._pending_backup_roots: list[tuple[str, Path]] = []
+        self._pending_refresh_roots: list[tuple[str, Path]] = []
         self.setWindowTitle("乐库整理助手")
         app = QApplication.instance()
         if app is not None and not app.windowIcon().isNull():
@@ -293,12 +293,20 @@ class MainWindow(QMainWindow):
     def _safe_import_completed(self, result: object) -> None:
         if self._import_dialog is not None:
             self._import_dialog.show_result(result)
-        if self._scan_controller is not None and getattr(result, "success_count", 0) and not self._scan_controller.running:
-            try:
-                self._scan_controller.start_scan(getattr(result, "target_root"))
-            except Exception as error:
-                if self._import_dialog is not None:
-                    self._import_dialog.show_failed(f"文件已安全导入，但索引刷新失败：{error}")
+        if getattr(result, "success_count", 0):
+            action = getattr(result, "action", "import")
+            mode = getattr(result, "mode", "audio")
+            root = getattr(
+                result,
+                "source_root" if action == "undo" else "target_root",
+                None,
+            )
+            if isinstance(root, Path) and mode in {"audio", "lyrics"}:
+                self._queue_library_refresh(
+                    (("audio" if mode == "audio" else "lyric", root),)
+                )
+            elif self._import_dialog is not None:
+                self._import_dialog.show_failed("文件操作已完成，但刷新信息无效，请手动重新扫描。")
 
     def _safe_import_cancelled(self, result: object) -> None:
         if self._import_dialog is not None:
@@ -316,9 +324,9 @@ class MainWindow(QMainWindow):
     def _start_read_only_scan(self, root) -> None:
         if self._scan_controller is None:
             return
-        if self._has_running_rename_task():
+        if self._has_running_background_task():
             if self._scan_dialog is not None:
-                self._scan_dialog.show_failed("歌曲信息分析或重命名正在运行，不能同时开始扫描")
+                self._scan_dialog.show_failed("已有后台任务运行，不能同时开始扫描")
             return
         try:
             self._scan_controller.start_scan(root)
@@ -332,9 +340,54 @@ class MainWindow(QMainWindow):
     def _replace_lyrics_library(self, records) -> None:
         self.pages["所有歌词"].replace_data(records)
 
-    def _background_running_changed(self, _running: bool) -> None:
+    def _background_running_changed(self, running: bool) -> None:
         if self._close_pending and not self._has_running_background_task():
             QTimer.singleShot(0, self.close)
+            return
+        if not running:
+            QTimer.singleShot(0, self._drain_library_refresh)
+
+    def _queue_library_refresh(self, roots: object) -> None:
+        if self._close_pending:
+            return
+        if not isinstance(roots, (tuple, list)):
+            return
+        for value in roots:
+            if (
+                not isinstance(value, tuple)
+                or len(value) != 2
+                or value[0] not in {"audio", "lyric"}
+                or not isinstance(value[1], Path)
+                or not value[1].is_absolute()
+            ):
+                continue
+            item = (value[0], value[1])
+            if item not in self._pending_refresh_roots:
+                self._pending_refresh_roots.append(item)
+        self._drain_library_refresh()
+
+    def _drain_library_refresh(self) -> None:
+        if self._close_pending or self._has_running_background_task():
+            return
+        while self._pending_refresh_roots:
+            kind, root = self._pending_refresh_roots.pop(0)
+            controller = (
+                self._scan_controller if kind == "audio" else self._lyrics_match_controller
+            )
+            if controller is None:
+                current = self.stack.currentWidget()
+                if isinstance(current, LibraryPage):
+                    current.status.setText(
+                        f"文件操作已完成，但缺少{'音乐' if kind == 'audio' else '歌词'}刷新服务，请手动扫描。"
+                    )
+                continue
+            try:
+                controller.start_scan(root)
+                return
+            except Exception as error:
+                current = self.stack.currentWidget()
+                if isinstance(current, LibraryPage):
+                    current.status.setText(f"无法刷新 {root}：{error}")
 
     def open_rename(self) -> None:
         if self._metadata_preview_controller is None or self._scan_controller is None:
@@ -362,14 +415,11 @@ class MainWindow(QMainWindow):
         if self.stack.currentWidget() is not page:
             dialog.show_warning("请先切换到“所有音乐”并明确选择要分析的音乐。")
             return
-        if self._scan_controller.running:
-            dialog.show_warning("只读扫描正在运行，请完成或取消后再分析歌曲信息。")
+        if self._scan_controller is not None and self._scan_controller.running:
+            dialog.show_warning("扫描正在运行，请完成或取消后再分析歌曲信息。")
             return
-        if self._lyrics_match_controller is not None and self._lyrics_match_controller.running:
-            dialog.show_warning("歌词扫描与匹配正在运行，请完成或取消后再分析歌曲信息。")
-            return
-        if self._safe_rename_controller is not None and self._safe_rename_controller.running:
-            dialog.show_warning("安全重命名正在运行，请等待当前任务结束。")
+        if self._has_running_background_task():
+            dialog.show_warning("已有后台任务运行，请完成或取消后再分析歌曲信息。")
             return
         records = page.selected_records()
         if not records:
@@ -447,17 +497,8 @@ class MainWindow(QMainWindow):
     def _start_safe_rename(self, requests: object) -> None:
         if self._safe_rename_controller is None or self._rename_dialog is None:
             return
-        if self._scan_controller is not None and self._scan_controller.running:
-            self._rename_dialog.show_warning("只读扫描正在运行，不能同时重命名。")
-            return
-        if self._metadata_preview_controller is not None and self._metadata_preview_controller.running:
-            self._rename_dialog.show_warning("歌曲信息分析尚未结束，不能开始重命名。")
-            return
-        if self._lyrics_match_controller is not None and self._lyrics_match_controller.running:
-            self._rename_dialog.show_warning("歌词扫描与匹配正在运行，不能同时重命名。")
-            return
-        if self._safe_rename_controller.running:
-            self._rename_dialog.show_warning("已有安全重命名任务正在运行。")
+        if self._has_running_background_task():
+            self._rename_dialog.show_warning("已有后台任务运行，不能同时重命名。")
             return
         if not isinstance(requests, (tuple, list)):
             self._rename_dialog.show_warning("重命名选择格式无效。")
@@ -611,11 +652,8 @@ class MainWindow(QMainWindow):
         controller = self._lyrics_match_controller
         if controller is None or self._lyrics_dialog is None:
             return
-        if (
-            (self._scan_controller is not None and self._scan_controller.running)
-            or self._has_running_rename_task()
-        ):
-            self._lyrics_dialog.show_warning("音频扫描、信息分析或重命名正在运行，请完成后再匹配歌词。")
+        if self._has_running_background_task():
+            self._lyrics_dialog.show_warning("已有后台任务运行，请完成后再匹配歌词。")
             return
         try:
             controller.start_scan(root)
@@ -693,6 +731,11 @@ class MainWindow(QMainWindow):
     def _restore_backups(self, entry_ids: object) -> None:
         if self._backup_controller is None or not isinstance(entry_ids, tuple):
             return
+        if self._has_running_background_task():
+            current = self.stack.currentWidget()
+            if isinstance(current, LibraryPage):
+                current.status.setText("已有后台任务运行，请完成后再恢复备份。")
+            return
         try:
             self._backup_controller.start_restore(entry_ids)
         except Exception as error:
@@ -702,6 +745,11 @@ class MainWindow(QMainWindow):
 
     def _undo_last_import(self) -> None:
         if self._safe_import_controller is None:
+            return
+        if self._has_running_background_task():
+            current = self.stack.currentWidget()
+            if isinstance(current, LibraryPage):
+                current.status.setText("已有后台任务运行，请完成后再撤销导入。")
             return
         answer = QMessageBox.question(
             self._history_dialog,
@@ -721,6 +769,11 @@ class MainWindow(QMainWindow):
 
     def _cleanup_backups(self) -> None:
         if self._backup_controller is None:
+            return
+        if self._has_running_background_task():
+            current = self.stack.currentWidget()
+            if isinstance(current, LibraryPage):
+                current.status.setText("已有后台任务运行，请完成后再清理备份。")
             return
         answer = QMessageBox.warning(
             self._history_dialog,
@@ -838,6 +891,10 @@ class MainWindow(QMainWindow):
     def _start_next_playlist_add(self) -> None:
         if self._playlist_controller is None or not self._playlist_add_queue:
             return
+        if self._has_running_background_task():
+            self._playlist_add_queue.clear()
+            self.pages["所有音乐"].status.setText("已有后台任务运行，已停止后续歌单操作。")
+            return
         name, inputs = self._playlist_add_queue.pop(0)
         try:
             self._playlist_controller.start_add(name, inputs)
@@ -867,6 +924,9 @@ class MainWindow(QMainWindow):
             page.status.setText(f"歌单操作失败：{message}")
 
     def create_playlist(self) -> None:
+        if self._has_running_background_task():
+            self.pages["所有音乐"].status.setText("已有后台任务运行，请完成后再创建歌单。")
+            return
         dialog = CreatePlaylistDialog(self)
         if dialog.exec() != dialog.DialogCode.Accepted:
             return
@@ -895,6 +955,9 @@ class MainWindow(QMainWindow):
     def _confirm_delete(self, page: LibraryPage, records: list[dict]) -> None:
         if not records:
             return
+        if self._has_running_background_task():
+            page.status.setText("已有后台任务运行，请完成后再执行删除或移除。")
+            return
         dialog = self._create_delete_dialog(page, records)
         if dialog.exec() != dialog.DialogCode.Accepted:
             return
@@ -916,9 +979,6 @@ class MainWindow(QMainWindow):
         elif self._backup_controller is not None and page.kind in {"music", "lyrics"}:
             try:
                 items = tuple(self._backup_input(record, page.kind) for record in records)
-                self._pending_backup_roots = list(
-                    dict.fromkeys((item.kind, item.allowed_root) for item in items)
-                )
                 self._backup_controller.start_backup(items)
             except Exception as error:
                 page.status.setText(f"无法备份删除：{error}")
@@ -935,28 +995,22 @@ class MainWindow(QMainWindow):
         return BackupInput(asset_id, path, allowed_root, "audio" if kind == "music" else "lyric")
 
     def _backup_completed(self, result: object) -> None:
-        message = f"已安全移入备份 {getattr(result, 'success_count', 0)} 项，失败 {getattr(result, 'failure_count', 0)} 项"
+        action = getattr(result, "action", "backup")
+        action_label = {
+            "backup": "已安全移入备份",
+            "restore": "已恢复备份",
+            "cleanup": "已永久清理到期备份",
+        }.get(action, "备份操作已完成")
+        message = f"{action_label} {getattr(result, 'success_count', 0)} 项，失败 {getattr(result, 'failure_count', 0)} 项"
         current = self.stack.currentWidget()
         if isinstance(current, LibraryPage):
             current.status.setText(message)
         if self._history_dialog is not None:
             self._history_dialog.close()
-        roots = tuple(self._pending_backup_roots)
-        self._pending_backup_roots.clear()
-        for kind, root in roots:
-            try:
-                if kind == "audio" and self._scan_controller is not None and not self._scan_controller.running:
-                    self._scan_controller.start_scan(root)
-                    break
-                if kind == "lyric" and self._lyrics_match_controller is not None and not self._lyrics_match_controller.running:
-                    self._lyrics_match_controller.start_scan(root)
-                    break
-            except Exception as error:
-                if isinstance(current, LibraryPage):
-                    current.status.setText(f"{message}；索引刷新失败：{error}")
+        if action in {"backup", "restore"}:
+            self._queue_library_refresh(getattr(result, "affected_roots", ()))
 
     def _backup_failed(self, message: str) -> None:
-        self._pending_backup_roots.clear()
         current = self.stack.currentWidget()
         if isinstance(current, LibraryPage):
             current.status.setText(f"备份删除失败：{message}")
@@ -965,14 +1019,23 @@ class MainWindow(QMainWindow):
         if page.playlist_name:
             return RemovePlaylistItemsDialog(len(records), self)
         if page.kind == "music":
-            return DeleteConfirmDialog(records, self)
+            return DeleteConfirmDialog(
+                records,
+                self,
+                live_mode=self._backup_controller is not None,
+            )
         if page.kind == "lyrics":
-            return DeleteLyricsConfirmDialog(records, self)
+            return DeleteLyricsConfirmDialog(
+                records,
+                self,
+                live_mode=self._backup_controller is not None,
+            )
         raise ValueError(f"不支持的页面类型：{page.kind}")
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._has_running_background_task():
             self._close_pending = True
+            self._pending_refresh_roots.clear()
             if self._scan_controller is not None and self._scan_controller.running:
                 self._scan_controller.request_cancel()
             if self._metadata_preview_controller is not None and self._metadata_preview_controller.running:

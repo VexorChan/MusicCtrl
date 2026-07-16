@@ -81,6 +81,8 @@ class BackupManagerTests(unittest.TestCase):
         return None if setting is None else setting.value
 
     def test_backup_and_restore_roundtrip_never_overwrite(self) -> None:
+        results: list[object] = []
+        self.controller.completed.connect(results.append)
         self.controller.start_backup(
             (BackupInput(self.asset.id, self.file, self.media_root, "audio"),)
         )
@@ -89,12 +91,73 @@ class BackupManagerTests(unittest.TestCase):
         entries = self.controller.list_entries()
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0].backup_path.read_bytes(), self.payload)
+        self.assertEqual(entries[0].allowed_root, self.media_root)
+        self.assertEqual(results[-1].affected_roots, (("audio", self.media_root),))
 
         self.controller.start_restore((entries[0].id,))
         self._wait()
         self.assertEqual(self.file.read_bytes(), self.payload)
         self.assertFalse(entries[0].backup_path.exists())
         self.assertIsNotNone(self.controller.list_entries()[0].restored_at)
+        self.assertEqual(results[-1].action, "restore")
+        self.assertEqual(results[-1].affected_roots, (("audio", self.media_root),))
+
+    def test_successful_roots_are_stably_deduplicated(self) -> None:
+        second = self.media_root / "second.mp3"
+        second.write_bytes(b"second")
+        other_root = self.root / "other-media"
+        other_root.mkdir()
+        third = other_root / "third.flac"
+        third.write_bytes(b"third")
+        with LibraryRepository(self.config) as repository:
+            session = repository.create_scan_session(mode="audio", source_folder=self.media_root)
+            records = repository.index_scan_batch(
+                session.id,
+                tuple(
+                    IndexBatchItem(path, path.stat().st_size, path.stat().st_mtime_ns)
+                    for path in (self.file, second)
+                ),
+            )
+            repository.complete_scan_and_reconcile(session.id)
+            other_session = repository.create_scan_session(mode="audio", source_folder=other_root)
+            third_asset = repository.index_scan_batch(
+                other_session.id,
+                (IndexBatchItem(third, third.stat().st_size, third.stat().st_mtime_ns),),
+            )[0].asset
+            repository.complete_scan_and_reconcile(other_session.id)
+        by_path = {record.asset.canonical_path: record.asset for record in records}
+        results: list[object] = []
+        self.controller.completed.connect(results.append)
+
+        self.controller.start_backup(
+            (
+                BackupInput(by_path[self.file].id, self.file, self.media_root, "audio"),
+                BackupInput(by_path[second].id, second, self.media_root, "audio"),
+                BackupInput(third_asset.id, third, other_root, "audio"),
+            )
+        )
+        self._wait()
+
+        self.assertEqual(results[-1].success_count, 3)
+        self.assertEqual(
+            results[-1].affected_roots,
+            (("audio", self.media_root), ("audio", other_root)),
+        )
+
+    def test_legacy_manifest_without_allowed_root_still_loads(self) -> None:
+        self.controller.start_backup(
+            (BackupInput(self.asset.id, self.file, self.media_root, "audio"),)
+        )
+        self._wait()
+        manifest = self._raw_manifest()
+        self.assertIsInstance(manifest, list)
+        del manifest[0]["allowed_root"]  # type: ignore[index]
+        self._set_manifest(manifest)  # type: ignore[arg-type]
+
+        entries = self.controller.list_entries()
+
+        self.assertEqual(len(entries), 1)
+        self.assertIsNone(entries[0].allowed_root)
 
     def test_restore_conflict_keeps_backup_and_existing_file(self) -> None:
         self.controller.start_backup(
@@ -178,6 +241,8 @@ class BackupManagerTests(unittest.TestCase):
         self.assertEqual(len(self.controller.list_entries()), 1)
 
     def test_cleanup_removes_verified_expired_backup_and_manifest(self) -> None:
+        results: list[object] = []
+        self.controller.completed.connect(results.append)
         self.controller.start_backup(
             (BackupInput(self.asset.id, self.file, self.media_root, "audio"),)
         )
@@ -189,6 +254,8 @@ class BackupManagerTests(unittest.TestCase):
 
         self.assertFalse(entry.backup_path.exists())
         self.assertEqual(self.controller.list_entries(), ())
+        self.assertEqual(results[-1].action, "cleanup")
+        self.assertEqual(results[-1].affected_roots, ())
 
     def test_restore_manifest_save_failure_rolls_file_back_to_backup(self) -> None:
         self.controller.start_backup(

@@ -325,8 +325,7 @@ def run() -> None:
     lyrics_delete_text = " ".join(label.text() for label in lyrics_delete_dialog.findChildren(QLabel))
     playlist_remove_text = " ".join(label.text() for label in playlist_remove_dialog.findChildren(QLabel))
     assert "备份" in music_delete_text
-    assert music_delete_dialog.delete_lyrics.text() == "同时删除已匹配的歌词"
-    assert not music_delete_dialog.delete_lyrics.isChecked()
+    assert not hasattr(music_delete_dialog, "delete_lyrics")
     assert "引用" in lyrics_delete_text
     assert "备份" in lyrics_delete_text
     assert "本 M1 原型不会读取、移动或删除任何真实文件" in lyrics_delete_text

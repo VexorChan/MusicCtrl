@@ -1,12 +1,18 @@
 from __future__ import annotations
 
-from PySide6.QtWidgets import QCheckBox, QLabel, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
 
 from dialogs.common import PrototypeDialog, footer_buttons
 
 
 class DeleteConfirmDialog(PrototypeDialog):
-    def __init__(self, records: list[dict] | None = None, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        records: list[dict] | None = None,
+        parent: QWidget | None = None,
+        *,
+        live_mode: bool = False,
+    ) -> None:
         records = records or [
             {"title": "晴天", "artist": "周杰伦", "format": "FLAC"},
             {"title": "珊瑚海", "artist": "周杰伦、梁心颐", "format": "MP3"},
@@ -20,7 +26,12 @@ class DeleteConfirmDialog(PrototypeDialog):
         title = QLabel("删除音乐")
         title.setObjectName("PageTitle")
         root.addWidget(title)
-        body = QLabel(f"将删除选中的 {len(records)} 个音频文件。文件会被移动到备份目录，不会立即永久删除。")
+        body = QLabel(
+            f"将把选中的 {len(records)} 个音频文件移入应用备份目录，"
+            "不会立即永久删除，可在操作历史中恢复。"
+            if live_mode
+            else f"将删除选中的 {len(records)} 个音频文件。文件会被移动到备份目录，不会立即永久删除。"
+        )
         body.setWordWrap(True)
         root.addWidget(body)
         list_text = []
@@ -32,19 +43,28 @@ class DeleteConfirmDialog(PrototypeDialog):
         files = QLabel("\n".join(list_text))
         files.setStyleSheet("background:#f5f5f5;border:1px solid #dedede;border-radius:4px;padding:12px;color:#555")
         root.addWidget(files)
-        self.delete_lyrics = QCheckBox("同时删除已匹配的歌词")
-        self.delete_lyrics.setChecked(False)
-        root.addWidget(self.delete_lyrics)
-        warning = QLabel("此操作仅为界面演示，本原型不会删除或移动任何真实文件。")
+        warning = QLabel(
+            "确认后会实际移动以上音频文件；已匹配歌词不会随音乐自动删除。"
+            if live_mode
+            else "此操作仅为界面演示，本原型不会删除或移动任何真实文件。"
+        )
         warning.setObjectName("Hint")
         root.addWidget(warning)
         root.addStretch(1)
-        footer, _primary = footer_buttons(self, "删除", danger=True)
+        footer, _primary = footer_buttons(
+            self, "移入备份" if live_mode else "删除", danger=True
+        )
         root.addWidget(footer)
 
 
 class DeleteLyricsConfirmDialog(PrototypeDialog):
-    def __init__(self, records: list[dict] | None = None, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        records: list[dict] | None = None,
+        parent: QWidget | None = None,
+        *,
+        live_mode: bool = False,
+    ) -> None:
         records = records or [{"title": "晴天", "artist": "周杰伦", "format": "LRC"}]
         super().__init__("删除歌词", (520, 330), parent)
         self.setMinimumSize(480, 300)
@@ -57,8 +77,15 @@ class DeleteLyricsConfirmDialog(PrototypeDialog):
         root.addWidget(title)
 
         body = QLabel(
-            f"正式版本删除前会检查选中的 {len(records)} 个歌词文件的引用关系。"
-            "确认后文件会被移动到备份目录，不会立即永久删除。"
+            (
+                f"将检查选中的 {len(records)} 个歌词文件；仍被音乐引用的歌词会拒绝处理，"
+                "其余文件将移入应用备份目录并可恢复。"
+            )
+            if live_mode
+            else (
+                f"正式版本删除前会检查选中的 {len(records)} 个歌词文件的引用关系。"
+                "确认后文件会被移动到备份目录，不会立即永久删除。"
+            )
         )
         body.setWordWrap(True)
         root.addWidget(body)
@@ -72,13 +99,19 @@ class DeleteLyricsConfirmDialog(PrototypeDialog):
         files.setStyleSheet("background:#f5f5f5;border:1px solid #dedede;border-radius:4px;padding:12px;color:#555")
         root.addWidget(files)
 
-        warning = QLabel("此操作仅为界面演示，本 M1 原型不会读取、移动或删除任何真实文件。")
+        warning = QLabel(
+            "确认后会实际移动未被引用的歌词文件，不会立即永久删除。"
+            if live_mode
+            else "此操作仅为界面演示，本 M1 原型不会读取、移动或删除任何真实文件。"
+        )
         warning.setObjectName("Hint")
         warning.setWordWrap(True)
         root.addWidget(warning)
         root.addStretch(1)
 
-        footer, _primary = footer_buttons(self, "删除", danger=True)
+        footer, _primary = footer_buttons(
+            self, "移入备份" if live_mode else "删除", danger=True
+        )
         root.addWidget(footer)
 
 

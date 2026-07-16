@@ -50,6 +50,7 @@ class BackupEntry:
     sha256: str
     created_at: str
     restored_at: str | None = None
+    allowed_root: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,12 +59,14 @@ class BackupRunResult:
     success_count: int
     failure_count: int
     messages: tuple[str, ...]
+    affected_roots: tuple[tuple[str, Path], ...] = ()
 
 
 def _entry_to_json(entry: BackupEntry) -> dict[str, object]:
     value = asdict(entry)
     value["original_path"] = str(entry.original_path)
     value["backup_path"] = str(entry.backup_path)
+    value["allowed_root"] = None if entry.allowed_root is None else str(entry.allowed_root)
     return value
 
 
@@ -80,6 +83,9 @@ def _entry_from_json(value: object) -> BackupEntry:
             sha256=str(value["sha256"]),
             created_at=str(value["created_at"]),
             restored_at=None if value.get("restored_at") is None else str(value["restored_at"]),
+            allowed_root=None
+            if value.get("allowed_root") is None
+            else Path(str(value["allowed_root"])),
         )
     except Exception as error:
         raise BackupError("备份清单项字段损坏") from error
@@ -91,6 +97,7 @@ def _entry_from_json(value: object) -> BackupEntry:
         or entry.kind not in {"audio", "lyric"}
         or not entry.original_path.is_absolute()
         or not entry.backup_path.is_absolute()
+        or (entry.allowed_root is not None and not entry.allowed_root.is_absolute())
         or len(entry.sha256) != 64
         or any(character not in "0123456789abcdefABCDEF" for character in entry.sha256)
     ):
@@ -189,6 +196,10 @@ class BackupWorker(QThread):
             or entry.backup_path.name != entry.original_path.name
         ):
             raise BackupError("备份清单路径与条目标识不一致")
+        if entry.allowed_root is not None and not _within_root(
+            entry.original_path, entry.allowed_root
+        ):
+            raise BackupError("备份清单的扫描来源根与原路径不一致")
         asset = repository.get_asset_by_id(entry.asset_id)
         if (
             asset is None
@@ -232,6 +243,7 @@ class BackupWorker(QThread):
     def _backup(self, repository: LibraryRepository, entries: list[BackupEntry]) -> BackupRunResult:
         successes = failures = 0
         messages: list[str] = []
+        affected_roots: list[tuple[str, Path]] = []
         current_matches = repository.list_lyrics_matches(current_only=True)
         referenced_lyrics = {match.lyric_asset_id for match in current_matches if match.lyric_asset_id}
         for value in self._payload:
@@ -262,13 +274,14 @@ class BackupWorker(QThread):
                 if moved.status != "success" or moved.sha256 is None:
                     raise BackupError(moved.message)
                 entry = BackupEntry(
-                    entry_id,
-                    value.asset_id,
-                    value.kind,
-                    value.source_path,
-                    moved.target_path,
-                    moved.sha256,
-                    datetime.now(timezone.utc).isoformat(),
+                    id=entry_id,
+                    asset_id=value.asset_id,
+                    kind=value.kind,
+                    original_path=value.source_path,
+                    backup_path=moved.target_path,
+                    sha256=moved.sha256,
+                    created_at=datetime.now(timezone.utc).isoformat(),
+                    allowed_root=value.allowed_root,
                 )
                 self._validate_entry(repository, self._backup_root, entry)
                 candidate_entries = entries + [entry]
@@ -291,15 +304,25 @@ class BackupWorker(QThread):
                     raise
                 entries.append(entry)
                 successes += 1
+                root_key = (value.kind, value.allowed_root)
+                if root_key not in affected_roots:
+                    affected_roots.append(root_key)
             except Exception as error:
                 failures += 1
                 messages.append(f"{value.source_path.name}：{error}")
-        return BackupRunResult("backup", successes, failures, tuple(messages))
+        return BackupRunResult(
+            "backup",
+            successes,
+            failures,
+            tuple(messages),
+            tuple(affected_roots),
+        )
 
     def _restore(self, repository: LibraryRepository, entries: list[BackupEntry]) -> BackupRunResult:
         wanted = {str(value) for value in self._payload}
         successes = failures = 0
         messages: list[str] = []
+        affected_roots: list[tuple[str, Path]] = []
         updated = list(entries)
         for index, entry in enumerate(entries):
             if self._cancel.is_set():
@@ -351,10 +374,20 @@ class BackupWorker(QThread):
                         ) from restore_error
                     raise
                 successes += 1
+                if entry.allowed_root is not None:
+                    root_key = (entry.kind, entry.allowed_root)
+                    if root_key not in affected_roots:
+                        affected_roots.append(root_key)
             except Exception as error:
                 failures += 1
                 messages.append(f"{entry.original_path.name}：{error}")
-        return BackupRunResult("restore", successes, failures, tuple(messages))
+        return BackupRunResult(
+            "restore",
+            successes,
+            failures,
+            tuple(messages),
+            tuple(affected_roots),
+        )
 
     def _cleanup(self, repository: LibraryRepository, entries: list[BackupEntry]) -> BackupRunResult:
         threshold = datetime.now(timezone.utc) - timedelta(days=self._retention_days)
