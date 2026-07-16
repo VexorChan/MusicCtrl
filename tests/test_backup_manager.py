@@ -100,7 +100,7 @@ class BackupManagerTests(unittest.TestCase):
         self._wait()
         self.assertEqual(self.file.read_bytes(), self.payload)
         self.assertFalse(entries[0].backup_path.exists())
-        self.assertIsNotNone(self.controller.list_entries()[0].restored_at)
+        self.assertEqual(self.controller.list_entries(), ())
         self.assertEqual(results[-1].action, "restore")
         self.assertEqual(results[-1].affected_roots, (("audio", self.media_root),))
 
