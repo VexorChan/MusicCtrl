@@ -33,6 +33,7 @@ from services.metadata_preview import MetadataPreviewInput
 from services.safe_rename import SafeRenameInput
 from services.playlist_controller import PlaylistAudioInput, PlaylistRemovalInput, PlaylistRetargetInput
 from services.backup_manager import BackupInput
+from services.history_service import HistoryService
 
 
 class MainWindow(QMainWindow):
@@ -703,29 +704,39 @@ class MainWindow(QMainWindow):
             self._lyrics_dialog.show_warning(f"无法取消歌词匹配：{error}")
 
     def open_history(self) -> None:
-        if self._history_dialog is not None:
-            self._history_dialog.show()
-            self._history_dialog.raise_()
-            return
-        if self._backup_controller is None:
+        live_mode = any(
+            controller is not None
+            for controller in (
+                self._safe_import_controller,
+                self._safe_rename_controller,
+                self._backup_controller,
+                self._playlist_controller,
+                self._lyrics_match_controller,
+            )
+        )
+        if not live_mode:
+            if self._history_dialog is not None:
+                self._history_dialog.show()
+                self._history_dialog.raise_()
+                self._history_dialog.activateWindow()
+                return
             self._show_window(HistoryDialog(self))
             return
-        try:
-            import_batches = (
-                self._safe_import_controller.list_history()
-                if self._safe_import_controller is not None
-                else ()
-            )
-            dialog = HistoryDialog(
-                self,
-                backup_entries=self._backup_controller.list_entries(),
-                import_batches=import_batches,
-            )
-        except Exception as error:
-            current = self.stack.currentWidget()
-            if isinstance(current, LibraryPage):
-                current.status.setText(f"无法读取备份历史：{error}")
+
+        snapshot = HistoryService(
+            import_controller=self._safe_import_controller,
+            rename_controller=self._safe_rename_controller,
+            backup_controller=self._backup_controller,
+            playlist_controller=self._playlist_controller,
+            lyrics_controller=self._lyrics_match_controller,
+        ).load()
+        if self._history_dialog is not None:
+            self._history_dialog.set_snapshot(snapshot)
+            self._history_dialog.show()
+            self._history_dialog.raise_()
+            self._history_dialog.activateWindow()
             return
+        dialog = HistoryDialog(self, snapshot=snapshot)
         self._history_dialog = dialog
         dialog.destroyed.connect(lambda: setattr(self, "_history_dialog", None))
         dialog.restore_requested.connect(self._restore_backups)
