@@ -62,6 +62,13 @@ class BackupRunResult:
     affected_roots: tuple[tuple[str, Path], ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class BackupCleanupPreview:
+    backup_root: Path
+    retention_days: int | None
+    eligible_count: int
+
+
 def _entry_to_json(entry: BackupEntry) -> dict[str, object]:
     value = asdict(entry)
     value["original_path"] = str(entry.original_path)
@@ -452,6 +459,22 @@ class BackupController(QObject):
     def running(self) -> bool:
         return self._worker is not None
 
+    @property
+    def backup_root(self) -> Path:
+        return self._backup_root
+
+    def prepare_backup_root(self) -> Path:
+        if not isinstance(self._backup_root, Path) or not self._backup_root.is_absolute():
+            raise BackupError("备份目录必须是绝对 Path")
+        try:
+            self._backup_root.mkdir(parents=True, exist_ok=True)
+            BackupWorker._validate_backup_root_path(self._backup_root)
+        except BackupError:
+            raise
+        except Exception as error:
+            raise BackupError(f"无法准备备份目录：{error}") from error
+        return self._backup_root
+
     def list_entries(self) -> tuple[BackupEntry, ...]:
         with self._repository_factory() as repository:
             return tuple(BackupWorker._load(repository, self._backup_root))
@@ -469,6 +492,23 @@ class BackupController(QObject):
             raise BackupError("备份保留时间只支持 7、15、30 天或永久")
         with self._repository_factory() as repository:
             repository.set_setting(BACKUP_RETENTION_KEY, days)
+
+    def cleanup_preview(self) -> BackupCleanupPreview:
+        retention_days = self.retention_days()
+        if retention_days is None:
+            return BackupCleanupPreview(self._backup_root, None, 0)
+        threshold = datetime.now(timezone.utc) - timedelta(days=retention_days)
+        eligible_count = 0
+        for entry in self.list_entries():
+            try:
+                created_at = datetime.fromisoformat(entry.created_at)
+            except (TypeError, ValueError) as error:
+                raise BackupError("备份清单包含无效创建时间") from error
+            if created_at.tzinfo is None:
+                raise BackupError("备份清单创建时间缺少时区")
+            if entry.restored_at is None and created_at <= threshold:
+                eligible_count += 1
+        return BackupCleanupPreview(self._backup_root, retention_days, eligible_count)
 
     def start_backup(self, items: tuple[BackupInput, ...]) -> None:
         self._start("backup", items)

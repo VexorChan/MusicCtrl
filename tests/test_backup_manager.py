@@ -14,7 +14,9 @@ from repositories import IndexBatchItem, LibraryRepository
 from services.backup_manager import (
     BACKUP_MANIFEST_KEY,
     BackupController,
+    BackupError,
     BackupInput,
+    BackupWorker,
 )
 
 
@@ -306,6 +308,62 @@ class BackupManagerTests(unittest.TestCase):
         self.assertEqual(self.controller.retention_days(), 30)
         self.controller.set_retention_days(None)
         self.assertIsNone(self.controller.retention_days())
+
+    def test_backup_root_is_read_only_and_prepare_creates_valid_directory(self) -> None:
+        self.assertEqual(self.controller.backup_root, self.backup_root)
+        self.assertFalse(self.backup_root.exists())
+
+        prepared = self.controller.prepare_backup_root()
+
+        self.assertEqual(prepared, self.backup_root)
+        self.assertTrue(prepared.is_dir())
+
+    def test_prepare_backup_root_fails_closed_when_directory_validation_rejects(self) -> None:
+        with patch.object(
+            BackupWorker,
+            "_validate_backup_root_path",
+            side_effect=BackupError("deterministic reparse rejection"),
+        ):
+            with self.assertRaisesRegex(BackupError, "reparse rejection"):
+                self.controller.prepare_backup_root()
+
+    def test_cleanup_preview_reports_real_retention_root_and_eligible_count(self) -> None:
+        initial = self.controller.cleanup_preview()
+        self.assertEqual(
+            (initial.backup_root, initial.retention_days, initial.eligible_count),
+            (self.backup_root, 7, 0),
+        )
+        self.controller.start_backup(
+            (BackupInput(self.asset.id, self.file, self.media_root, "audio"),)
+        )
+        self._wait()
+        manifest = self._raw_manifest()
+        self.assertIsInstance(manifest, list)
+        manifest[0]["created_at"] = "2000-01-01T00:00:00+00:00"  # type: ignore[index]
+        self._set_manifest(manifest)  # type: ignore[arg-type]
+
+        preview = self.controller.cleanup_preview()
+
+        self.assertEqual(
+            (preview.backup_root, preview.retention_days, preview.eligible_count),
+            (self.backup_root, 7, 1),
+        )
+        self.controller.set_retention_days(None)
+        permanent = self.controller.cleanup_preview()
+        self.assertEqual((permanent.retention_days, permanent.eligible_count), (None, 0))
+
+    def test_cleanup_preview_rejects_invalid_manifest_timestamp(self) -> None:
+        self.controller.start_backup(
+            (BackupInput(self.asset.id, self.file, self.media_root, "audio"),)
+        )
+        self._wait()
+        manifest = self._raw_manifest()
+        self.assertIsInstance(manifest, list)
+        manifest[0]["created_at"] = "not-a-timestamp"  # type: ignore[index]
+        self._set_manifest(manifest)  # type: ignore[arg-type]
+
+        with self.assertRaisesRegex(BackupError, "创建时间"):
+            self.controller.cleanup_preview()
 
 
 if __name__ == "__main__":

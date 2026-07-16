@@ -3,8 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QTimer, Qt
-from PySide6.QtGui import QCloseEvent
+from PySide6.QtCore import QTimer, QUrl, Qt
+from PySide6.QtGui import QCloseEvent, QDesktopServices
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QHBoxLayout, QMainWindow, QMessageBox, QStackedWidget, QVBoxLayout, QWidget
 
 from dialogs.delete_confirm_dialog import DeleteConfirmDialog, DeleteLyricsConfirmDialog, RemovePlaylistItemsDialog
@@ -62,6 +62,7 @@ class MainWindow(QMainWindow):
         self._rename_dialog: RenamePreviewDialog | None = None
         self._lyrics_dialog: LyricsMatchDialog | None = None
         self._history_dialog: HistoryDialog | None = None
+        self._settings_dialog: SettingsDialog | None = None
         self._close_pending = False
         self._metadata_inputs_by_asset: dict[str, MetadataPreviewInput] = {}
         self._metadata_results_by_asset: dict[str, object] = {}
@@ -341,6 +342,10 @@ class MainWindow(QMainWindow):
         self.pages["所有歌词"].replace_data(records)
 
     def _background_running_changed(self, running: bool) -> None:
+        if self._settings_dialog is not None:
+            self._settings_dialog.set_maintenance_running(
+                self._has_running_background_task()
+            )
         if self._close_pending and not self._has_running_background_task():
             QTimer.singleShot(0, self.close)
             return
@@ -767,18 +772,39 @@ class MainWindow(QMainWindow):
             if isinstance(current, LibraryPage):
                 current.status.setText(f"无法撤销导入：{error}")
 
-    def _cleanup_backups(self) -> None:
+    def _settings_message(self, message: str, dialog: SettingsDialog | None = None) -> None:
+        target = dialog or self._settings_dialog
+        if target is not None:
+            target.show_message(message)
+            return
+        current = self.stack.currentWidget()
+        if isinstance(current, LibraryPage):
+            current.status.setText(message)
+
+    def _cleanup_backups(self, parent: QWidget | None = None) -> None:
         if self._backup_controller is None:
             return
+        settings_dialog = parent if isinstance(parent, SettingsDialog) else None
         if self._has_running_background_task():
-            current = self.stack.currentWidget()
-            if isinstance(current, LibraryPage):
-                current.status.setText("已有后台任务运行，请完成后再清理备份。")
+            self._settings_message("已有后台任务运行，请完成后再清理备份。", settings_dialog)
+            return
+        try:
+            preview = self._backup_controller.cleanup_preview()
+        except Exception as error:
+            self._settings_message(f"无法预览过期备份：{error}", settings_dialog)
+            return
+        if preview.retention_days is None:
+            self._settings_message("当前设置为永久保留，没有到期备份可清理。", settings_dialog)
+            return
+        if preview.eligible_count <= 0:
+            self._settings_message("当前没有超过保留期限的备份。", settings_dialog)
             return
         answer = QMessageBox.warning(
-            self._history_dialog,
+            parent or self._history_dialog,
             "确认永久清理",
-            "将永久删除超过当前保留期限且尚未恢复的备份文件。此操作不可撤销，是否继续？",
+            f"将永久删除 {preview.eligible_count} 个超过 {preview.retention_days} 天且尚未恢复的备份。\n"
+            f"范围：{preview.backup_root}\n"
+            "此操作不可撤销，是否继续？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -786,38 +812,114 @@ class MainWindow(QMainWindow):
             return
         try:
             self._backup_controller.start_cleanup()
+            if settings_dialog is not None:
+                settings_dialog.set_maintenance_running(True)
+                settings_dialog.show_message("正在后台清理已确认的过期备份…")
         except Exception as error:
-            current = self.stack.currentWidget()
-            if isinstance(current, LibraryPage):
-                current.status.setText(f"无法清理备份：{error}")
+            self._settings_message(f"无法清理备份：{error}", settings_dialog)
 
     def open_settings(self) -> None:
         if self._backup_controller is None:
             self._show_window(SettingsDialog(self))
+            return
+        if self._settings_dialog is not None:
+            self._settings_dialog.show()
+            self._settings_dialog.raise_()
+            self._settings_dialog.activateWindow()
             return
         try:
             dialog = SettingsDialog(
                 self,
                 live_mode=True,
                 retention_days=self._backup_controller.retention_days(),
+                remembered_paths=self._remembered_settings_paths(),
+                backup_root=self._backup_controller.backup_root,
             )
-            dialog.save_requested.connect(self._save_settings)
-            dialog.cleanup_requested.connect(self._cleanup_backups)
+            self._settings_dialog = dialog
+            dialog.destroyed.connect(lambda: setattr(self, "_settings_dialog", None))
+            dialog.save_requested.connect(
+                lambda values, current=dialog: self._save_settings(values, current)
+            )
+            dialog.cleanup_requested.connect(
+                lambda current=dialog: self._cleanup_backups(current)
+            )
+            dialog.open_backup_requested.connect(
+                lambda current=dialog: self._open_backup_directory(current)
+            )
+            dialog.rescan_requested.connect(
+                lambda current=dialog: self._rescan_remembered_libraries(current)
+            )
+            dialog.set_maintenance_running(self._has_running_background_task())
             self._show_window(dialog)
         except Exception as error:
             current = self.stack.currentWidget()
             if isinstance(current, LibraryPage):
                 current.status.setText(f"无法打开设置：{error}")
 
-    def _save_settings(self, values: object) -> None:
+    def _remembered_settings_paths(self) -> dict[str, Path | None]:
+        paths: dict[str, Path | None] = {"audio": None, "lyrics": None, "playlist": None}
+        for key, controller in (
+            ("audio", self._scan_controller),
+            ("lyrics", self._lyrics_match_controller),
+            ("playlist", self._playlist_controller),
+        ):
+            if controller is None:
+                continue
+            try:
+                value = controller.remembered_root()
+            except Exception:
+                continue
+            if isinstance(value, Path) and value.is_absolute():
+                paths[key] = value
+        return paths
+
+    def _save_settings(
+        self,
+        values: object,
+        dialog: SettingsDialog | None = None,
+    ) -> None:
         if self._backup_controller is None or not isinstance(values, dict):
             return
         try:
             self._backup_controller.set_retention_days(values.get("backup_retention_days"))
         except Exception as error:
-            current = self.stack.currentWidget()
-            if isinstance(current, LibraryPage):
-                current.status.setText(f"设置保存失败：{error}")
+            self._settings_message(f"设置保存失败：{error}", dialog)
+            return
+        target = dialog or self._settings_dialog
+        if target is not None:
+            target.complete_save()
+
+    def _open_backup_directory(self, dialog: SettingsDialog) -> None:
+        if self._backup_controller is None:
+            return
+        try:
+            root = self._backup_controller.prepare_backup_root()
+            opened = QDesktopServices.openUrl(QUrl.fromLocalFile(str(root)))
+            if not opened:
+                raise RuntimeError("系统未能打开该目录")
+        except Exception as error:
+            dialog.show_message(f"无法打开备份目录：{error}")
+            return
+        dialog.show_message(f"已打开备份目录：{root}")
+
+    def _rescan_remembered_libraries(self, dialog: SettingsDialog) -> None:
+        if self._has_running_background_task():
+            dialog.show_message("已有后台任务运行，请完成后再重新检查。")
+            return
+        paths = self._remembered_settings_paths()
+        roots = tuple(
+            (kind, path)
+            for kind, path in (
+                ("audio", paths["audio"]),
+                ("lyric", paths["lyrics"]),
+            )
+            if path is not None
+        )
+        if not roots:
+            dialog.show_message("尚未记住音乐或歌词目录，请先在对应功能中选择并完成扫描。")
+            return
+        dialog.show_message(f"正在重新检查 {len(roots)} 个已记住目录…")
+        self._queue_library_refresh(roots)
 
     def _replace_playlists(self, names: object) -> None:
         if self._playlist_controller is None or not isinstance(names, (tuple, list)):
@@ -1005,12 +1107,18 @@ class MainWindow(QMainWindow):
         current = self.stack.currentWidget()
         if isinstance(current, LibraryPage):
             current.status.setText(message)
+        if self._settings_dialog is not None:
+            self._settings_dialog.set_maintenance_running(False)
+            self._settings_dialog.show_message(message)
         if self._history_dialog is not None:
             self._history_dialog.close()
         if action in {"backup", "restore"}:
             self._queue_library_refresh(getattr(result, "affected_roots", ()))
 
     def _backup_failed(self, message: str) -> None:
+        if self._settings_dialog is not None:
+            self._settings_dialog.set_maintenance_running(False)
+            self._settings_dialog.show_message(f"备份操作失败：{message}")
         current = self.stack.currentWidget()
         if isinstance(current, LibraryPage):
             current.status.setText(f"备份删除失败：{message}")
