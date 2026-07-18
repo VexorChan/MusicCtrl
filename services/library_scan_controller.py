@@ -2,16 +2,155 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from dataclasses import dataclass
+import os
 from pathlib import Path
+import stat
 
 from PySide6.QtCore import QObject, Signal, Slot
 
 from database import DatabaseConfig
 from repositories import AssetRecord, LibraryRepository
+from services.file_safety import _is_reparse, _locked_directory_chain, _within_root
 from services.scan_worker import ReadOnlyScanWorker
 
 
 LAST_SUCCESSFUL_ROOT_KEY = "p1.last_successful_audio_root"
+
+
+@dataclass(frozen=True, slots=True)
+class AudioAssetSnapshot:
+    """Untrusted UI snapshot used only to identify the selected indexed asset."""
+
+    asset_id: str
+    canonical_path: Path
+    size_bytes: int
+    mtime_ns: int | None
+    allowed_root: Path | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RevalidatedAudioRecord:
+    """Repository and filesystem facts revalidated at one point in time."""
+
+    asset_id: str
+    canonical_path: Path
+    allowed_root: Path
+    size_bytes: int
+    mtime_ns: int | None
+    file_name: str
+    extension: str
+
+    @property
+    def id(self) -> str:
+        """Match the read-only AssetRecord identifier interface used by workers."""
+
+        return self.asset_id
+
+
+def _path_key(path: Path) -> str:
+    return os.path.normcase(os.path.normpath(os.path.abspath(os.fspath(path))))
+
+
+def revalidate_audio_snapshots(
+    repository: LibraryRepository,
+    snapshots: Iterable[AudioAssetSnapshot],
+) -> tuple[RevalidatedAudioRecord, ...]:
+    """Fail closed unless every snapshot still matches active indexed disk facts."""
+
+    requested = tuple(snapshots)
+    if not requested:
+        raise ValueError("请至少选择一首音乐")
+    asset_ids: set[str] = set()
+    path_keys: set[str] = set()
+    for snapshot in requested:
+        if not isinstance(snapshot, AudioAssetSnapshot):
+            raise TypeError("音乐重验输入必须使用 AudioAssetSnapshot")
+        if not snapshot.asset_id.strip():
+            raise ValueError("音乐索引编号不能为空")
+        if snapshot.asset_id in asset_ids:
+            raise ValueError("所选音乐包含重复索引编号")
+        asset_ids.add(snapshot.asset_id)
+        if not isinstance(snapshot.canonical_path, Path) or not snapshot.canonical_path.is_absolute():
+            raise ValueError("音乐路径必须是绝对 Path")
+        path_key = _path_key(snapshot.canonical_path)
+        if path_key in path_keys:
+            raise ValueError("所选音乐包含重复路径")
+        path_keys.add(path_key)
+        if (
+            isinstance(snapshot.size_bytes, bool)
+            or not isinstance(snapshot.size_bytes, int)
+            or snapshot.size_bytes < 0
+        ):
+            raise ValueError("音乐大小快照无效")
+        if snapshot.mtime_ns is not None and (
+            isinstance(snapshot.mtime_ns, bool)
+            or not isinstance(snapshot.mtime_ns, int)
+            or snapshot.mtime_ns < 0
+        ):
+            raise ValueError("音乐修改时间快照无效")
+        if snapshot.allowed_root is not None and (
+            not isinstance(snapshot.allowed_root, Path)
+            or not snapshot.allowed_root.is_absolute()
+        ):
+            raise ValueError("音乐扫描来源快照无效")
+
+    assets = []
+    for snapshot in requested:
+        asset = repository.get_asset_by_id(snapshot.asset_id)
+        if asset is None or asset.kind != "audio":
+            raise ValueError("所选音乐索引不存在或不是音频")
+        if asset.file_state != "active":
+            raise ValueError(f"只允许操作 active 音频：{asset.file_name}")
+        if (
+            _path_key(asset.canonical_path) != _path_key(snapshot.canonical_path)
+            or asset.size_bytes != snapshot.size_bytes
+            or asset.mtime_ns != snapshot.mtime_ns
+        ):
+            raise ValueError(f"音乐索引已变化，请刷新列表后重试：{asset.file_name}")
+        assets.append(asset)
+
+    roots = repository.latest_completed_audio_roots(asset.id for asset in assets)
+    results: list[RevalidatedAudioRecord] = []
+    for snapshot, asset in zip(requested, assets, strict=True):
+        allowed_root = roots.get(asset.id)
+        if (
+            not isinstance(allowed_root, Path)
+            or not allowed_root.is_absolute()
+            or not _within_root(asset.canonical_path, allowed_root)
+        ):
+            raise ValueError(f"音乐缺少可信的已完成扫描来源：{asset.file_name}")
+        if (
+            snapshot.allowed_root is not None
+            and _path_key(snapshot.allowed_root) != _path_key(allowed_root)
+        ):
+            raise ValueError(f"音乐扫描来源已变化，请刷新列表后重试：{asset.file_name}")
+        try:
+            with _locked_directory_chain(allowed_root, asset.canonical_path.parent):
+                metadata = os.lstat(asset.canonical_path)
+        except OSError as error:
+            raise ValueError(f"音乐文件不存在或无法访问：{asset.file_name}") from error
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or _is_reparse(metadata)
+        ):
+            raise ValueError(f"音乐路径不是安全普通文件：{asset.file_name}")
+        if metadata.st_size != asset.size_bytes or metadata.st_mtime_ns != asset.mtime_ns:
+            raise ValueError(f"音乐文件已在外部变化，请重新扫描：{asset.file_name}")
+        results.append(
+            RevalidatedAudioRecord(
+                asset.id,
+                asset.canonical_path,
+                allowed_root,
+                asset.size_bytes,
+                asset.mtime_ns,
+                asset.file_name,
+                asset.extension,
+            )
+        )
+    return tuple(results)
 
 
 def _human_size(size_bytes: int) -> str:
@@ -92,6 +231,18 @@ class LibraryScanController(QObject):
                 asset_to_music_record(asset, allowed_root=roots.get(asset.id))
                 for asset in assets
             )
+        finally:
+            repository.close()
+
+    def revalidate_audio_records(
+        self,
+        snapshots: Iterable[AudioAssetSnapshot],
+    ) -> tuple[RevalidatedAudioRecord, ...]:
+        """Revalidate a copied UI selection using one short-lived repository connection."""
+
+        repository = self._open_repository()
+        try:
+            return revalidate_audio_snapshots(repository, snapshots)
         finally:
             repository.close()
 

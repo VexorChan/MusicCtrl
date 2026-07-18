@@ -244,6 +244,9 @@ class LibraryPage(QWidget):
     delete_requested = Signal(list)
     new_playlist_requested = Signal()
     add_to_playlists_requested = Signal(object, object)
+    open_location_requested = Signal(object)
+    rename_context_requested = Signal(object)
+    rematch_lyrics_requested = Signal(object)
 
     def __init__(
         self,
@@ -630,12 +633,24 @@ class LibraryPage(QWidget):
             return
         if row not in self._checked_rows():
             self.table.selectRow(row)
-        menu = self.create_context_menu()
+        menu = self.create_context_menu(self.selected_records())
         menu.exec(self.table.viewport().mapToGlobal(pos))
 
-    def create_context_menu(self) -> QMenu:
+    def create_context_menu(self, records: object | None = None) -> QMenu:
+        frozen = tuple(
+            dict(record)
+            for record in (self.selected_records() if records is None else records)
+            if isinstance(record, dict)
+        )
+
+        def emit(signal: Signal) -> None:
+            signal.emit(tuple(dict(record) for record in frozen))
+
         menu = QMenu(self)
-        menu.addAction("打开所在文件夹")
-        menu.addAction("重命名")
-        menu.addAction("重新匹配歌词")
+        open_action = menu.addAction("打开所在文件夹")
+        rename_action = menu.addAction("重命名")
+        lyrics_action = menu.addAction("重新匹配歌词")
+        open_action.triggered.connect(lambda _checked=False: emit(self.open_location_requested))
+        rename_action.triggered.connect(lambda _checked=False: emit(self.rename_context_requested))
+        lyrics_action.triggered.connect(lambda _checked=False: emit(self.rematch_lyrics_requested))
         return menu

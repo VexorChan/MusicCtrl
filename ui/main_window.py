@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QTimer, QUrl, Qt
+from PySide6.QtCore import QDir, QProcess, QTimer, QUrl, Qt
 from PySide6.QtGui import QCloseEvent, QDesktopServices
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QHBoxLayout, QMainWindow, QMessageBox, QStackedWidget, QVBoxLayout, QWidget
 
@@ -34,6 +34,10 @@ from services.safe_rename import SafeRenameInput
 from services.playlist_controller import PlaylistAudioInput, PlaylistRemovalInput, PlaylistRetargetInput
 from services.backup_manager import BackupInput
 from services.history_service import HistoryService
+from services.library_scan_controller import (
+    AudioAssetSnapshot,
+    RevalidatedAudioRecord,
+)
 
 
 class MainWindow(QMainWindow):
@@ -65,6 +69,7 @@ class MainWindow(QMainWindow):
         self._history_dialog: HistoryDialog | None = None
         self._settings_dialog: SettingsDialog | None = None
         self._close_pending = False
+        self._lyrics_context_scope_active = False
         self._metadata_inputs_by_asset: dict[str, MetadataPreviewInput] = {}
         self._metadata_results_by_asset: dict[str, object] = {}
         self._playlist_add_queue: list[tuple[str, tuple[PlaylistAudioInput, ...]]] = []
@@ -194,6 +199,118 @@ class MainWindow(QMainWindow):
         page.delete_requested.connect(lambda records, p=page: self._confirm_delete(p, records))
         page.new_playlist_requested.connect(self.create_playlist)
         page.add_to_playlists_requested.connect(self._add_to_playlists)
+        page.open_location_requested.connect(self._open_selected_location)
+        page.rename_context_requested.connect(self._rename_selected_context)
+        page.rematch_lyrics_requested.connect(self._rematch_selected_lyrics)
+
+    @staticmethod
+    def _audio_snapshot_from_record(record: object) -> AudioAssetSnapshot:
+        if not isinstance(record, dict):
+            raise ValueError("右键选择快照格式无效")
+        asset_id = record.get("_asset_id")
+        path = record.get("_canonical_path")
+        size_bytes = record.get("_size_bytes")
+        mtime_ns = record.get("_mtime_ns")
+        allowed_root = record.get("_allowed_root")
+        file_state = record.get("_file_state")
+        if (
+            not isinstance(asset_id, str)
+            or not asset_id.strip()
+            or not isinstance(path, Path)
+            or not path.is_absolute()
+            or isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+            or size_bytes < 0
+            or (
+                mtime_ns is not None
+                and (isinstance(mtime_ns, bool) or not isinstance(mtime_ns, int) or mtime_ns < 0)
+            )
+            or not isinstance(allowed_root, Path)
+            or not allowed_root.is_absolute()
+        ):
+            raise ValueError("所选音乐缺少有效的 P1 索引快照，请刷新列表后重试")
+        if file_state != "active":
+            raise ValueError("所选音乐不是可操作状态，请重新扫描并刷新列表后重试")
+        return AudioAssetSnapshot(asset_id, path, size_bytes, mtime_ns, allowed_root)
+
+    def _revalidate_context_records(
+        self,
+        records: object,
+    ) -> tuple[RevalidatedAudioRecord, ...]:
+        if self._scan_controller is None:
+            raise ValueError("当前没有可用的音乐索引重验服务")
+        if not isinstance(records, tuple) or not records:
+            raise ValueError("请先选中或勾选音乐")
+        snapshots = tuple(self._audio_snapshot_from_record(record) for record in records)
+        return self._scan_controller.revalidate_audio_records(snapshots)
+
+    def _context_status(self, message: str) -> None:
+        page = self.pages.get("所有音乐")
+        if page is not None:
+            page.status.setText(message)
+
+    def _open_selected_location(self, records: object) -> None:
+        if self._has_running_background_task():
+            self._context_status("已有后台任务运行，请完成后再打开文件位置。")
+            return
+        try:
+            if not isinstance(records, tuple) or len(records) != 1:
+                raise ValueError("打开所在文件夹时必须且只能选择一首音乐")
+            validated = self._revalidate_context_records(records)
+            path = validated[0].canonical_path
+            native_path = QDir.toNativeSeparators(str(path))
+            launched = QProcess.startDetached("explorer.exe", ["/select,", native_path])
+            if isinstance(launched, tuple):
+                launched = launched[0]
+            if not launched and not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent))):
+                raise RuntimeError("系统无法打开资源管理器或文件所在目录")
+        except Exception as error:
+            self._context_status(f"无法打开所在文件夹：{error}")
+
+    @staticmethod
+    def _record_from_revalidated(record: RevalidatedAudioRecord) -> dict[str, object]:
+        return {
+            "_asset_id": record.asset_id,
+            "_canonical_path": record.canonical_path,
+            "_allowed_root": record.allowed_root,
+            "_file_state": "active",
+            "_size_bytes": record.size_bytes,
+            "_mtime_ns": record.mtime_ns,
+        }
+
+    def _rename_selected_context(self, records: object) -> None:
+        if self._has_running_background_task():
+            self._context_status("已有后台任务运行，请完成后再重命名。")
+            return
+        if (
+            self._scan_controller is None
+            or self._metadata_preview_controller is None
+            or self._safe_rename_controller is None
+        ):
+            self._context_status("当前未启用真实安全重命名，无法执行此操作。")
+            return
+        try:
+            validated = self._revalidate_context_records(records)
+        except Exception as error:
+            self._context_status(f"无法开始重命名：{error}")
+            return
+        self.open_rename(tuple(self._record_from_revalidated(record) for record in validated))
+
+    def _rematch_selected_lyrics(self, records: object) -> None:
+        if self._lyrics_match_controller is None:
+            self._context_status("当前没有可用的歌词匹配服务")
+            return
+        if self._has_running_background_task():
+            self._context_status("已有后台任务运行，请完成后再重新匹配歌词。")
+            return
+        try:
+            validated = self._revalidate_context_records(records)
+            self._lyrics_match_controller.set_scope(validated)
+        except Exception as error:
+            self._context_status(f"无法限定歌词匹配范围：{error}")
+            return
+        self._lyrics_context_scope_active = True
+        self.open_lyrics_match(validated)
 
     def navigate(self, key: str) -> None:
         page = self.pages.get(key)
@@ -461,27 +578,33 @@ class MainWindow(QMainWindow):
                 if isinstance(current, LibraryPage):
                     current.status.setText(f"无法刷新 {root}：{error}")
 
-    def open_rename(self) -> None:
+    def open_rename(self, records: object | None = None) -> None:
         if self._metadata_preview_controller is None or self._scan_controller is None:
             self._show_window(RenamePreviewDialog(self))
             return
-        if self._rename_dialog is not None:
+        if self._rename_dialog is not None and records is None:
             self._rename_dialog.show()
             self._rename_dialog.raise_()
             self._rename_dialog.activateWindow()
             return
 
-        dialog = RenamePreviewDialog(
-            self,
-            live_mode=True,
-            execution_enabled=self._safe_rename_controller is not None,
-        )
-        self._rename_dialog = dialog
-        dialog.destroyed.connect(lambda: setattr(self, "_rename_dialog", None))
-        dialog.cancel_requested.connect(self._cancel_active_rename_task)
-        if self._safe_rename_controller is not None:
-            dialog.execution_requested.connect(self._start_safe_rename)
-        self._show_window(dialog)
+        if self._rename_dialog is None:
+            dialog = RenamePreviewDialog(
+                self,
+                live_mode=True,
+                execution_enabled=self._safe_rename_controller is not None,
+            )
+            self._rename_dialog = dialog
+            dialog.destroyed.connect(lambda: setattr(self, "_rename_dialog", None))
+            dialog.cancel_requested.connect(self._cancel_active_rename_task)
+            if self._safe_rename_controller is not None:
+                dialog.execution_requested.connect(self._start_safe_rename)
+            self._show_window(dialog)
+        else:
+            dialog = self._rename_dialog
+            dialog.show()
+            dialog.raise_()
+            dialog.activateWindow()
 
         page = self.pages["所有音乐"]
         if self.stack.currentWidget() is not page:
@@ -493,12 +616,12 @@ class MainWindow(QMainWindow):
         if self._has_running_background_task():
             dialog.show_warning("已有后台任务运行，请完成或取消后再分析歌曲信息。")
             return
-        records = page.selected_records()
-        if not records:
+        selected_records = page.selected_records() if records is None else records
+        if not isinstance(selected_records, (tuple, list)) or not selected_records:
             dialog.show_warning("请先勾选或选中至少一首音乐，再开始只读分析。")
             return
         try:
-            items = tuple(self._metadata_input_from_record(record) for record in records)
+            items = tuple(self._metadata_input_from_record(record) for record in selected_records)
             self._metadata_inputs_by_asset = {item.asset_id: item for item in items}
             self._metadata_results_by_asset.clear()
             self._metadata_preview_controller.start(items)
@@ -698,11 +821,21 @@ class MainWindow(QMainWindow):
             if self._rename_dialog is not None:
                 self._rename_dialog.show_warning(f"重命名结果已记录，但列表刷新失败：{error}")
 
-    def open_lyrics_match(self) -> None:
+    def open_lyrics_match(self, scope: object | None = None) -> None:
         if self._lyrics_match_controller is None:
             self._show_window(LyricsMatchDialog(self))
             return
+        if scope is None:
+            self._clear_lyrics_context_scope()
+        else:
+            self._lyrics_context_scope_active = True
         if self._lyrics_dialog is not None:
+            if scope is not None:
+                self._lyrics_dialog.show_warning(
+                    f"已限定 {len(scope) if isinstance(scope, tuple) else 0} 首音乐；请选择歌词目录并点击开始。"
+                )
+            else:
+                self._lyrics_dialog.show_warning("已切换为全库歌词匹配；请选择歌词目录并点击开始。")
             self._lyrics_dialog.show()
             self._lyrics_dialog.raise_()
             self._lyrics_dialog.activateWindow()
@@ -710,6 +843,7 @@ class MainWindow(QMainWindow):
         dialog = LyricsMatchDialog(self, live_mode=True)
         self._lyrics_dialog = dialog
         dialog.destroyed.connect(lambda: setattr(self, "_lyrics_dialog", None))
+        dialog.destroyed.connect(self._clear_lyrics_context_scope)
         dialog.scan_requested.connect(self._start_lyrics_scan)
         dialog.candidate_requested.connect(self._commit_lyrics_candidate)
         dialog.cancel_match_requested.connect(self._cancel_lyrics_match)
@@ -718,11 +852,27 @@ class MainWindow(QMainWindow):
         if remembered is not None:
             dialog.path_input.setText(str(remembered))
         dialog.set_running(self._lyrics_match_controller.running)
+        if scope is not None:
+            dialog.show_warning(
+                f"已限定 {len(scope) if isinstance(scope, tuple) else 0} 首音乐；请选择歌词目录并点击开始。"
+            )
         self._show_window(dialog)
+
+    def _clear_lyrics_context_scope(self) -> None:
+        self._lyrics_context_scope_active = False
+        controller = self._lyrics_match_controller
+        clear_scope = getattr(controller, "clear_scope", None)
+        if controller is not None and not controller.running and callable(clear_scope):
+            clear_scope()
 
     def _start_lyrics_scan(self, root: Path) -> None:
         controller = self._lyrics_match_controller
         if controller is None or self._lyrics_dialog is None:
+            return
+        if self._lyrics_context_scope_active and controller.pending_scope is None:
+            self._lyrics_dialog.show_warning(
+                "本次限定范围已使用；请关闭后重新右键选择，或从顶部工具栏打开全库匹配。"
+            )
             return
         if self._has_running_background_task():
             self._lyrics_dialog.show_warning("已有后台任务运行，请完成后再匹配歌词。")
@@ -1219,25 +1369,39 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._has_running_background_task():
+            first_request = not self._close_pending
             self._close_pending = True
             self._pending_refresh_roots.clear()
-            if self._scan_controller is not None and self._scan_controller.running:
-                self._scan_controller.request_cancel()
-            if self._metadata_preview_controller is not None and self._metadata_preview_controller.running:
-                self._metadata_preview_controller.request_cancel()
-            if self._safe_rename_controller is not None and self._safe_rename_controller.running:
-                self._safe_rename_controller.request_cancel()
-            if self._lyrics_match_controller is not None and self._lyrics_match_controller.running:
-                self._lyrics_match_controller.request_cancel()
-            if self._playlist_controller is not None and self._playlist_controller.running:
-                self._playlist_controller.request_cancel()
-            if self._safe_import_controller is not None and self._safe_import_controller.running:
-                self._safe_import_controller.request_cancel()
-            if self._backup_controller is not None and self._backup_controller.running:
-                self._backup_controller.request_cancel()
+            self._playlist_add_queue.clear()
+            if first_request:
+                for controller in (
+                    self._scan_controller,
+                    self._metadata_preview_controller,
+                    self._safe_rename_controller,
+                    self._lyrics_match_controller,
+                    self._playlist_controller,
+                    self._safe_import_controller,
+                    self._backup_controller,
+                ):
+                    if controller is not None and controller.running:
+                        try:
+                            controller.request_cancel()
+                        except Exception:
+                            continue
             event.ignore()
             return
+        self._close_pending = True
+        self._pending_refresh_roots.clear()
+        self._playlist_add_queue.clear()
+        self._close_auxiliary_windows()
         super().closeEvent(event)
+
+    def _close_auxiliary_windows(self) -> None:
+        for window in tuple(self._open_windows):
+            try:
+                window.close()
+            except RuntimeError:
+                self._remove_open_window(id(window))
 
     def _has_running_background_task(self) -> bool:
         return bool(

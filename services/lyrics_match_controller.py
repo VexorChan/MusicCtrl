@@ -22,6 +22,11 @@ from services.lyrics_scanner import (
     detect_embedded_lyrics,
     iter_lrc_files,
 )
+from services.library_scan_controller import (
+    AudioAssetSnapshot,
+    RevalidatedAudioRecord,
+    revalidate_audio_snapshots,
+)
 
 
 LAST_SUCCESSFUL_LYRICS_ROOT_KEY = "p4.last_successful_lyrics_root"
@@ -75,7 +80,15 @@ class LyricsMatchWorker(QThread):
     cancelled = Signal(int)
     failed = Signal(str)
 
-    def __init__(self, *, root: Path, repository_factory, batch_size: int = 100, parent=None) -> None:
+    def __init__(
+        self,
+        *,
+        root: Path,
+        repository_factory,
+        batch_size: int = 100,
+        audio_scope: tuple[AudioAssetSnapshot, ...] | None = None,
+        parent=None,
+    ) -> None:
         super().__init__(parent)
         if not isinstance(root, Path) or not root.is_absolute():
             raise ValueError("歌词目录必须是绝对 Path")
@@ -86,6 +99,13 @@ class LyricsMatchWorker(QThread):
         self._root = root
         self._repository_factory = repository_factory
         self._batch_size = batch_size
+        if audio_scope is not None and (
+            not isinstance(audio_scope, tuple)
+            or not audio_scope
+            or not all(isinstance(item, AudioAssetSnapshot) for item in audio_scope)
+        ):
+            raise ValueError("歌词限定范围必须是非空 AudioAssetSnapshot 元组")
+        self._audio_scope = audio_scope
         self._cancel_event = threading.Event()
         self._start_lock = threading.Lock()
         self._started_once = False
@@ -117,6 +137,12 @@ class LyricsMatchWorker(QThread):
         try:
             self._check_cancelled()
             repository = self._repository_factory()
+            self._check_cancelled()
+            scoped_records = (
+                revalidate_audio_snapshots(repository, self._audio_scope)
+                if self._audio_scope is not None
+                else None
+            )
             self._check_cancelled()
             session = repository.create_scan_session(mode="lyric", source_folder=self._root)
             session_id = session.id
@@ -156,11 +182,18 @@ class LyricsMatchWorker(QThread):
             self._check_cancelled()
             repository.finish_scan_session(session_id, status="completed")
 
-            audio_assets = repository.list_assets(kind="audio", file_state="active")
-            roots = repository.latest_completed_audio_roots(asset.id for asset in audio_assets)
+            if self._audio_scope is None:
+                audio_assets = repository.list_assets(kind="audio", file_state="active")
+                roots = repository.latest_completed_audio_roots(asset.id for asset in audio_assets)
+            else:
+                scoped_records = revalidate_audio_snapshots(repository, self._audio_scope)
+                audio_assets = scoped_records
+                roots = {record.asset_id: record.allowed_root for record in scoped_records}
             current = {
                 item.audio_asset_id: item
                 for item in repository.list_lyrics_matches(current_only=True)
+                if self._audio_scope is None
+                or any(scope.asset_id == item.audio_asset_id for scope in self._audio_scope)
             }
             audio_inputs: list[AudioLyricsInput] = []
             labels: dict[str, str] = {}
@@ -318,6 +351,7 @@ class LyricsMatchController(QObject):
         self._terminal: tuple[str, object] | None = None
         self._active_root: Path | None = None
         self._review_by_token: dict[str, LyricsReviewItem] = {}
+        self._pending_scope: tuple[AudioAssetSnapshot, ...] | None = None
 
     @property
     def running(self) -> bool:
@@ -325,6 +359,35 @@ class LyricsMatchController(QObject):
 
     def _open_repository(self) -> LibraryRepository:
         return LibraryRepository(self._database_config)
+
+    @property
+    def pending_scope(self) -> tuple[AudioAssetSnapshot, ...] | None:
+        return self._pending_scope
+
+    def set_scope(self, records: tuple[RevalidatedAudioRecord, ...]) -> None:
+        if self.running:
+            raise RuntimeError("歌词扫描运行期间不能修改限定范围")
+        if not isinstance(records, tuple) or not records:
+            raise ValueError("请至少选择一首音乐重新匹配歌词")
+        snapshots: list[AudioAssetSnapshot] = []
+        for record in records:
+            if not isinstance(record, RevalidatedAudioRecord):
+                raise TypeError("歌词限定范围必须来自音乐索引重验")
+            snapshots.append(
+                AudioAssetSnapshot(
+                    record.asset_id,
+                    record.canonical_path,
+                    record.size_bytes,
+                    record.mtime_ns,
+                    record.allowed_root,
+                )
+            )
+        self._pending_scope = tuple(snapshots)
+
+    def clear_scope(self) -> None:
+        if self.running:
+            return
+        self._pending_scope = None
 
     def load_lyrics_library(self) -> tuple[dict[str, object], ...]:
         repository = self._open_repository()
@@ -420,7 +483,13 @@ class LyricsMatchController(QObject):
         if self.running:
             raise RuntimeError("歌词扫描已经在运行")
         config = self._database_config
-        worker = LyricsMatchWorker(root=root, repository_factory=lambda: LibraryRepository(config))
+        scope = self._pending_scope
+        self._pending_scope = None
+        worker = LyricsMatchWorker(
+            root=root,
+            repository_factory=lambda: LibraryRepository(config),
+            audio_scope=scope,
+        )
         worker.completed.connect(lambda result: self._cache_terminal("completed", result))
         worker.cancelled.connect(lambda count: self._cache_terminal("cancelled", count))
         worker.failed.connect(lambda message: self._cache_terminal("failed", message))
