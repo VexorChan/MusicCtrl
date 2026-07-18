@@ -102,6 +102,8 @@ class RememberedPlaylistController(QObject):
         super().__init__()
         self.root = root
         self.running = False
+        self.started: list[Path] = []
+        self.remember_flags: list[bool] = []
 
     def remembered_root(self) -> Path | None:
         return self.root
@@ -109,9 +111,26 @@ class RememberedPlaylistController(QObject):
     def list_playlists(self) -> tuple[str, ...]:
         return ()
 
-    def request_cancel(self) -> None:
+    def start_refresh(
+        self,
+        root: Path | None = None,
+        *,
+        remember_on_success: bool = False,
+    ) -> None:
+        selected = self.root if root is None else root
+        if not isinstance(selected, Path):
+            raise ValueError("missing root")
+        self.started.append(selected)
+        self.remember_flags.append(remember_on_success)
+        self.running = True
+        self.running_changed.emit(True)
+
+    def finish(self) -> None:
         self.running = False
         self.running_changed.emit(False)
+
+    def request_cancel(self) -> None:
+        self.finish()
 
 
 class SettingsLiveTests(unittest.TestCase):
@@ -191,6 +210,8 @@ class SettingsLiveTests(unittest.TestCase):
             set(dialog.maintenance_buttons),
             {"重新检查已标记文件", "打开备份目录", "清理过期备份"},
         )
+        self.assertTrue(dialog.playlist_choose_button.isEnabled())
+        self.assertTrue(dialog.playlist_refresh_button.isEnabled())
 
         mock = SettingsDialog()
         self.addCleanup(mock.close)
@@ -241,6 +262,7 @@ class SettingsLiveTests(unittest.TestCase):
 
     def test_recheck_runs_remembered_audio_then_lyrics_and_rejects_busy_or_empty(self) -> None:
         window, audio, lyrics = self._window()
+        playlist = window._playlist_controller
         window.open_settings()
         dialog = window._settings_dialog
         dialog.maintenance_buttons["重新检查已标记文件"].click()  # type: ignore[union-attr]
@@ -251,6 +273,9 @@ class SettingsLiveTests(unittest.TestCase):
         self._events()
         self.assertEqual(lyrics.started, [self.lyrics_root])
         lyrics.finish()
+        self._events()
+        self.assertEqual(playlist.started, [self.playlist_root])
+        playlist.finish()
         self._events()
 
         audio.running = True
@@ -275,6 +300,29 @@ class SettingsLiveTests(unittest.TestCase):
         empty_dialog.maintenance_buttons["重新检查已标记文件"].click()  # type: ignore[union-attr]
         self.assertEqual((empty_audio.started, empty_lyrics.started), ([], []))
         self.assertIn("尚未记住", empty_dialog.status.text())  # type: ignore[union-attr]
+
+    def test_playlist_path_buttons_choose_candidate_and_refresh_remembered_root(self) -> None:
+        window, _audio, _lyrics = self._window()
+        playlist = window._playlist_controller
+        window.open_settings()
+        dialog = window._settings_dialog
+        candidate = self.root / "candidate-playlists"
+        candidate.mkdir()
+
+        with patch(
+            "ui.main_window.QFileDialog.getExistingDirectory",
+            return_value=str(candidate),
+        ):
+            dialog.playlist_choose_button.click()
+        self.assertEqual(playlist.started, [candidate])
+        self.assertEqual(playlist.remember_flags, [True])
+        self.assertIn("验证", dialog.status.text())
+        playlist.finish()
+        self._events()
+
+        dialog.playlist_refresh_button.click()
+        self.assertEqual(playlist.started, [candidate, self.playlist_root])
+        self.assertEqual(playlist.remember_flags, [True, False])
 
     def test_cleanup_requires_real_nonzero_preview_and_confirmation_with_count_and_root(self) -> None:
         window, _audio, _lyrics = self._window()

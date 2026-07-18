@@ -8,6 +8,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 
 from database import DatabaseConfig
@@ -19,7 +20,9 @@ from services.playlist_controller import (
     PlaylistController,
     PlaylistRemovalInput,
     PlaylistRetargetInput,
+    PlaylistSnapshot,
 )
+from services.windows_shortcuts import create_playlist_directory, create_shortcut
 from ui.main_window import MainWindow
 
 
@@ -116,9 +119,236 @@ class PlaylistControllerTests(unittest.TestCase):
         self.assertFalse(old_shortcut.exists())
         self.assertTrue(rows[0]["_shortcut_path"].is_file())
 
+    def test_retarget_converges_existing_new_link_and_rejects_wrong_target(self) -> None:
+        item = PlaylistAudioInput(self.asset.id, self.audio, self.audio_root, "active")
+        self.controller.start_add("通勤", (item,))
+        self._wait()
+        old_shortcut = self.controller.load_playlist("通勤")[0]["_shortcut_path"]
+        renamed = self.audio_root / "晴天新版-周杰伦.mp3"
+        os.rename(self.audio, renamed)
+        destination = self.playlist_root / "通勤" / f"{renamed.name}.lnk"
+        create_shortcut(
+            target_path=renamed,
+            audio_root=self.audio_root,
+            shortcut_path=destination,
+            playlist_root=self.playlist_root,
+        )
+
+        results = []
+        self.controller.completed.connect(results.append)
+        self.controller.start_retarget(
+            (PlaylistRetargetInput(self.audio, renamed, self.audio_root),)
+        )
+        self._wait()
+        self.assertEqual(results[-1].success_count, 1)
+        self.assertFalse(old_shortcut.exists())
+        self.assertTrue(destination.exists())
+
+        results.clear()
+        self.controller.start_retarget(
+            (PlaylistRetargetInput(self.audio, renamed, self.audio_root),)
+        )
+        self._wait()
+        self.assertEqual(results[-1].skipped_count, 1)
+        self.assertIn("已收敛", results[-1].items[0].message)
+
+        source_again = self.audio_root / "旧名-歌手.mp3"
+        source_again.write_bytes(b"old")
+        wrong = self.audio_root / "其他-歌手.mp3"
+        wrong.write_bytes(b"wrong")
+        old_again = self.playlist_root / "通勤" / f"{source_again.name}.lnk"
+        target_again = self.playlist_root / "通勤" / "目标-歌手.mp3.lnk"
+        create_shortcut(
+            target_path=source_again,
+            audio_root=self.audio_root,
+            shortcut_path=old_again,
+            playlist_root=self.playlist_root,
+        )
+        create_shortcut(
+            target_path=wrong,
+            audio_root=self.audio_root,
+            shortcut_path=target_again,
+            playlist_root=self.playlist_root,
+        )
+        requested_target = self.audio_root / "目标-歌手.mp3"
+        requested_target.write_bytes(b"target")
+        self.controller.start_retarget(
+            (PlaylistRetargetInput(source_again, requested_target, self.audio_root),)
+        )
+        self._wait()
+        self.assertEqual(results[-1].failure_count, 1)
+        self.assertTrue(old_again.exists())
+        self.assertTrue(target_again.exists())
+
+        target_again.unlink()
+        target_again.write_bytes(b"not-a-shortcut")
+        self.controller.start_retarget(
+            (PlaylistRetargetInput(source_again, requested_target, self.audio_root),)
+        )
+        self._wait()
+        self.assertEqual(results[-1].failure_count, 1)
+        self.assertTrue(old_again.exists())
+        self.assertEqual(target_again.read_bytes(), b"not-a-shortcut")
+
+    def test_refresh_worker_is_read_only_off_thread_and_publishes_complete_snapshot(self) -> None:
+        item = PlaylistAudioInput(self.asset.id, self.audio, self.audio_root, "active")
+        self.controller.start_add("通勤", (item,))
+        self._wait()
+        media_before = (self.audio.read_bytes(), self.audio.stat().st_mtime_ns)
+        history_before = self.controller.list_history()
+        snapshots: list[PlaylistSnapshot] = []
+        self.controller.snapshot_ready.connect(snapshots.append)
+        repository_threads: list[int] = []
+        heartbeat = [0]
+        timer = QTimer()
+        timer.setInterval(1)
+        timer.timeout.connect(lambda: heartbeat.__setitem__(0, heartbeat[0] + 1))
+        real_repository = LibraryRepository
+        real_read = playlist_module.read_shortcut
+
+        def repository_factory(config):
+            repository_threads.append(threading.get_ident())
+            return real_repository(config)
+
+        def slow_read(*args, **kwargs):
+            time.sleep(0.05)
+            return real_read(*args, **kwargs)
+
+        timer.start()
+        with patch.object(playlist_module, "LibraryRepository", side_effect=repository_factory), patch.object(
+            playlist_module,
+            "read_shortcut",
+            side_effect=slow_read,
+        ):
+            self.controller.start_refresh(self.playlist_root)
+            self._wait()
+        timer.stop()
+
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(snapshots[0].root, self.playlist_root)
+        self.assertEqual([item.name for item in snapshots[0].playlists], ["通勤"])
+        self.assertEqual(len(snapshots[0].playlists[0].records), 1)
+        self.assertTrue(repository_threads)
+        self.assertTrue(all(value != threading.get_ident() for value in repository_threads))
+        self.assertGreater(heartbeat[0], 0)
+        self.assertEqual(self.controller.list_history(), history_before)
+        self.assertEqual((self.audio.read_bytes(), self.audio.stat().st_mtime_ns), media_before)
+
+    def test_candidate_root_changes_only_after_success_and_failure_or_cancel_preserves_old(self) -> None:
+        item = PlaylistAudioInput(self.asset.id, self.audio, self.audio_root, "active")
+        self.controller.start_add("通勤", (item,))
+        self._wait()
+        other_root = self.root / "playlists-b"
+        other_root.mkdir()
+        folder = create_playlist_directory(playlist_root=other_root, name="粤语")
+        create_shortcut(
+            target_path=self.audio,
+            audio_root=self.audio_root,
+            shortcut_path=folder / f"{self.audio.name}.lnk",
+            playlist_root=other_root,
+        )
+        snapshots: list[PlaylistSnapshot] = []
+        failures: list[str] = []
+        cancellations: list[object] = []
+        self.controller.snapshot_ready.connect(snapshots.append)
+        self.controller.failed.connect(failures.append)
+        self.controller.cancelled.connect(cancellations.append)
+
+        self.controller.start_refresh(other_root, remember_on_success=True)
+        self._wait()
+        self.assertEqual(self.controller.remembered_root(), other_root)
+        self.assertEqual(snapshots[-1].root, other_root)
+
+        with patch.object(
+            LibraryRepository,
+            "set_setting",
+            side_effect=RuntimeError("deterministic setting failure"),
+        ):
+            self.controller.start_refresh(self.playlist_root, remember_on_success=True)
+            self._wait()
+        self.assertIn("保存设置失败", failures[-1])
+        self.assertEqual(self.controller.remembered_root(), other_root)
+        self.assertEqual(snapshots[-1].root, other_root)
+
+        self.controller.start_refresh(self.playlist_root, remember_on_success=True)
+        self.controller.request_cancel()
+        self._wait()
+        self.assertTrue(cancellations)
+        self.assertEqual(self.controller.remembered_root(), other_root)
+        self.assertEqual(snapshots[-1].root, other_root)
+
+    def test_external_playlist_changes_refresh_atomically_and_removed_navigation_falls_back(self) -> None:
+        window = MainWindow(playlist_controller=self.controller)
+        self.addCleanup(window.close)
+        self.app.processEvents()
+        self._wait()
+        self.app.processEvents()
+        self.assertIn("playlist:通勤", window.pages)
+        window.navigate("playlist:通勤")
+
+        external = create_playlist_directory(
+            playlist_root=self.playlist_root,
+            name="外部新增",
+        )
+        create_shortcut(
+            target_path=self.audio,
+            audio_root=self.audio_root,
+            shortcut_path=external / f"{self.audio.name}.lnk",
+            playlist_root=self.playlist_root,
+        )
+        self.controller.start_refresh()
+        self._wait()
+        self.app.processEvents()
+        self.assertIn("playlist:外部新增", window.pages)
+        self.assertEqual(len(window.pages["playlist:外部新增"].visible_data), 1)
+
+        os.rmdir(self.playlist_root / "通勤")
+        self.controller.start_refresh()
+        self._wait()
+        self.app.processEvents()
+        self.assertNotIn("playlist:通勤", window.pages)
+        self.assertIs(window.stack.currentWidget(), window.pages["所有音乐"])
+
+    def test_main_close_cancels_refresh_and_late_terminal_does_not_restart_queue(self) -> None:
+        item = PlaylistAudioInput(self.asset.id, self.audio, self.audio_root, "active")
+        self.controller.start_add("通勤", (item,))
+        self._wait()
+        window = MainWindow(playlist_controller=self.controller)
+        self.addCleanup(window.close)
+        window.show()
+        self.app.processEvents()
+        self._wait()
+        entered = threading.Event()
+        real_read = playlist_module.read_shortcut
+
+        def slow_read(*args, **kwargs):
+            entered.set()
+            time.sleep(0.1)
+            return real_read(*args, **kwargs)
+
+        with patch.object(playlist_module, "read_shortcut", side_effect=slow_read):
+            self.controller.start_refresh(self.playlist_root)
+            deadline = time.monotonic() + 2
+            while not entered.is_set() and time.monotonic() < deadline:
+                self.app.processEvents()
+            self.assertTrue(entered.is_set())
+            window._pending_refresh_roots.append(("playlist", self.playlist_root))
+            window.close()
+            self.assertTrue(window.isVisible())
+            self.assertEqual(window._pending_refresh_roots, [])
+            self._wait()
+            for _ in range(6):
+                self.app.processEvents()
+        self.assertFalse(window.isVisible())
+        self.assertEqual(window._pending_refresh_roots, [])
+        self.assertFalse(self.controller.running)
+
     def test_main_window_uses_dynamic_playlists_and_mock_fallback(self) -> None:
         window = MainWindow(playlist_controller=self.controller)
         try:
+            self.app.processEvents()
+            self._wait()
+            self.app.processEvents()
             self.assertIn("playlist:通勤", window.pages)
             self.assertNotIn("playlist:我喜欢的", window.pages)
         finally:

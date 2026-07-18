@@ -31,7 +31,12 @@ if TYPE_CHECKING:
 
 from services.metadata_preview import MetadataPreviewInput
 from services.safe_rename import SafeRenameInput
-from services.playlist_controller import PlaylistAudioInput, PlaylistRemovalInput, PlaylistRetargetInput
+from services.playlist_controller import (
+    PlaylistAudioInput,
+    PlaylistRemovalInput,
+    PlaylistRetargetInput,
+    PlaylistSnapshot,
+)
 from services.backup_manager import BackupInput
 from services.history_service import HistoryService
 from services.library_scan_controller import (
@@ -74,6 +79,8 @@ class MainWindow(QMainWindow):
         self._metadata_results_by_asset: dict[str, object] = {}
         self._playlist_add_queue: list[tuple[str, tuple[PlaylistAudioInput, ...]]] = []
         self._pending_refresh_roots: list[tuple[str, Path]] = []
+        self._playlist_snapshot_generation = 0
+        self._pending_playlist_navigation: str | None = None
         self.setWindowTitle("乐库整理助手")
         app = QApplication.instance()
         if app is not None and not app.windowIcon().isNull():
@@ -168,16 +175,28 @@ class MainWindow(QMainWindow):
             except Exception as error:
                 lyrics_match_controller.warning.emit(f"无法加载歌词索引：{error}")
         if playlist_controller is not None:
-            playlist_controller.playlists_changed.connect(self._replace_playlists)
-            playlist_controller.playlist_changed.connect(self._replace_playlist)
             playlist_controller.completed.connect(self._playlist_completed)
             playlist_controller.cancelled.connect(self._playlist_cancelled)
             playlist_controller.failed.connect(self._playlist_failed)
             playlist_controller.running_changed.connect(self._background_running_changed)
-            try:
-                self._replace_playlists(playlist_controller.list_playlists())
-            except Exception as error:
-                playlist_controller.failed.emit(f"无法加载歌单：{error}")
+            if hasattr(playlist_controller, "snapshot_ready"):
+                playlist_controller.snapshot_ready.connect(self._apply_playlist_snapshot)
+                playlist_controller.root_changed.connect(self._playlist_root_changed)
+                root = playlist_controller.remembered_root()
+                if isinstance(root, Path) and root.is_absolute():
+                    QTimer.singleShot(
+                        0,
+                        lambda selected=root: self._queue_library_refresh(
+                            (("playlist", selected),)
+                        ),
+                    )
+            else:
+                playlist_controller.playlists_changed.connect(self._replace_playlists)
+                playlist_controller.playlist_changed.connect(self._replace_playlist)
+                try:
+                    self._replace_playlists(playlist_controller.list_playlists())
+                except Exception as error:
+                    playlist_controller.failed.emit(f"无法加载歌单：{error}")
         if safe_import_controller is not None:
             if hasattr(safe_import_controller, "preview_ready"):
                 safe_import_controller.preview_ready.connect(self._safe_import_preview_ready)
@@ -545,7 +564,7 @@ class MainWindow(QMainWindow):
             if (
                 not isinstance(value, tuple)
                 or len(value) != 2
-                or value[0] not in {"audio", "lyric"}
+                or value[0] not in {"audio", "lyric", "playlist"}
                 or not isinstance(value[1], Path)
                 or not value[1].is_absolute()
             ):
@@ -560,9 +579,11 @@ class MainWindow(QMainWindow):
             return
         while self._pending_refresh_roots:
             kind, root = self._pending_refresh_roots.pop(0)
-            controller = (
-                self._scan_controller if kind == "audio" else self._lyrics_match_controller
-            )
+            controller = {
+                "audio": self._scan_controller,
+                "lyric": self._lyrics_match_controller,
+                "playlist": self._playlist_controller,
+            }[kind]
             if controller is None:
                 current = self.stack.currentWidget()
                 if isinstance(current, LibraryPage):
@@ -571,7 +592,10 @@ class MainWindow(QMainWindow):
                     )
                 continue
             try:
-                controller.start_scan(root)
+                if kind == "playlist":
+                    controller.start_refresh(root)
+                else:
+                    controller.start_scan(root)
                 return
             except Exception as error:
                 current = self.stack.currentWidget()
@@ -1076,6 +1100,12 @@ class MainWindow(QMainWindow):
             dialog.rescan_requested.connect(
                 lambda current=dialog: self._rescan_remembered_libraries(current)
             )
+            dialog.playlist_root_requested.connect(
+                lambda current=dialog: self._choose_playlist_root(current)
+            )
+            dialog.playlist_refresh_requested.connect(
+                lambda current=dialog: self._refresh_playlist_from_settings(current)
+            )
             dialog.set_maintenance_running(self._has_running_background_task())
             self._show_window(dialog)
         except Exception as error:
@@ -1139,16 +1169,83 @@ class MainWindow(QMainWindow):
             for kind, path in (
                 ("audio", paths["audio"]),
                 ("lyric", paths["lyrics"]),
+                ("playlist", paths["playlist"]),
             )
             if path is not None
         )
         if not roots:
-            dialog.show_message("尚未记住音乐或歌词目录，请先在对应功能中选择并完成扫描。")
+            dialog.show_message("尚未记住音乐、歌词或歌单目录，请先明确选择并完成扫描。")
             return
         dialog.show_message(f"正在重新检查 {len(roots)} 个已记住目录…")
         self._queue_library_refresh(roots)
 
-    def _replace_playlists(self, names: object) -> None:
+    def _choose_playlist_root(self, dialog: SettingsDialog) -> None:
+        controller = self._playlist_controller
+        if controller is None:
+            dialog.show_message("当前没有可用的歌单刷新服务。")
+            return
+        if self._has_running_background_task():
+            dialog.show_message("已有后台任务运行，请完成后再切换歌单目录。")
+            return
+        selected = QFileDialog.getExistingDirectory(
+            dialog,
+            "选择歌单根目录",
+            dialog.path_fields["playlist"].text(),
+        )
+        if not selected:
+            return
+        try:
+            controller.start_refresh(Path(selected), remember_on_success=True)
+        except Exception as error:
+            dialog.show_message(f"无法切换歌单目录：{error}")
+            return
+        dialog.show_message("正在后台验证并刷新候选歌单目录…")
+
+    def _refresh_playlist_from_settings(self, dialog: SettingsDialog) -> None:
+        controller = self._playlist_controller
+        if controller is None:
+            dialog.show_message("当前没有可用的歌单刷新服务。")
+            return
+        if self._has_running_background_task():
+            dialog.show_message("已有后台任务运行，请完成后再刷新歌单。")
+            return
+        root = controller.remembered_root()
+        if not isinstance(root, Path) or not root.is_absolute():
+            dialog.show_message("尚未选择歌单目录。")
+            return
+        dialog.show_message("正在后台刷新歌单目录…")
+        self._queue_library_refresh((("playlist", root),))
+
+    def _playlist_root_changed(self, root: object) -> None:
+        if isinstance(root, Path) and self._settings_dialog is not None:
+            self._settings_dialog.set_playlist_root(root)
+
+    def _apply_playlist_snapshot(self, snapshot: object) -> None:
+        if self._close_pending or not isinstance(snapshot, PlaylistSnapshot):
+            return
+        if snapshot.generation <= self._playlist_snapshot_generation:
+            return
+        self._playlist_snapshot_generation = snapshot.generation
+        records = {
+            playlist.name: tuple(item.as_record() for item in playlist.records)
+            for playlist in snapshot.playlists
+        }
+        self._replace_playlists(tuple(records), records)
+        if self._pending_playlist_navigation is not None:
+            key = f"playlist:{self._pending_playlist_navigation}"
+            self._pending_playlist_navigation = None
+            if key in self.pages:
+                self.navigate(key)
+        if self._settings_dialog is not None:
+            self._settings_dialog.show_message(
+                f"歌单刷新完成：{len(records)} 个歌单。"
+            )
+
+    def _replace_playlists(
+        self,
+        names: object,
+        snapshot_records: dict[str, tuple[dict[str, object], ...]] | None = None,
+    ) -> None:
         if self._playlist_controller is None or not isinstance(names, (tuple, list)):
             return
         clean_names = tuple(str(name) for name in names)
@@ -1157,6 +1254,8 @@ class MainWindow(QMainWindow):
             if not key.startswith("playlist:") or key in wanted:
                 continue
             page = self.pages.pop(key)
+            if self.stack.currentWidget() is page:
+                self.navigate("所有音乐")
             self.stack.removeWidget(page)
             page.deleteLater()
         self.sidebar.set_playlists(clean_names)
@@ -1175,10 +1274,13 @@ class MainWindow(QMainWindow):
                         playlist_names=clean_names,
                     ),
                 )
-            try:
-                self._replace_playlist(name, self._playlist_controller.load_playlist(name))
-            except Exception as error:
-                self.pages[key].status.setText(f"无法读取歌单：{error}")
+            if snapshot_records is not None:
+                self._replace_playlist(name, snapshot_records.get(name, ()))
+            else:
+                try:
+                    self._replace_playlist(name, self._playlist_controller.load_playlist(name))
+                except Exception as error:
+                    self.pages[key].status.setText(f"无法读取歌单：{error}")
         for page in self.pages.values():
             page.set_playlist_names(clean_names)
 
@@ -1218,7 +1320,10 @@ class MainWindow(QMainWindow):
         )
 
     def _start_next_playlist_add(self) -> None:
-        if self._playlist_controller is None or not self._playlist_add_queue:
+        if self._playlist_controller is None:
+            return
+        if not self._playlist_add_queue:
+            self._queue_current_playlist_refresh()
             return
         if self._has_running_background_task():
             self._playlist_add_queue.clear()
@@ -1245,12 +1350,34 @@ class MainWindow(QMainWindow):
         page = self.pages.get("所有音乐")
         if page is not None:
             page.status.setText(f"歌单操作已取消；已完成 {getattr(result, 'success_count', 0)} 项")
+        if result is None and self._settings_dialog is not None:
+            self._settings_dialog.show_message("歌单刷新已取消；原目录和当前列表保持不变。")
+        if result is not None:
+            QTimer.singleShot(0, self._queue_current_playlist_refresh)
 
     def _playlist_failed(self, message: str) -> None:
         self._playlist_add_queue.clear()
         page = self.pages.get("所有音乐")
         if page is not None:
             page.status.setText(f"歌单操作失败：{message}")
+        if (
+            self._playlist_controller is not None
+            and getattr(self._playlist_controller, "last_terminal_kind", "") == "refresh"
+            and self._settings_dialog is not None
+        ):
+            self._settings_dialog.show_message(f"歌单刷新失败：{message}")
+        if (
+            self._playlist_controller is not None
+            and getattr(self._playlist_controller, "last_terminal_kind", "") == "operation"
+        ):
+            QTimer.singleShot(0, self._queue_current_playlist_refresh)
+
+    def _queue_current_playlist_refresh(self) -> None:
+        if self._close_pending or self._playlist_controller is None:
+            return
+        root = self._playlist_controller.remembered_root()
+        if isinstance(root, Path) and root.is_absolute():
+            self._queue_library_refresh((("playlist", root),))
 
     def create_playlist(self) -> None:
         if self._has_running_background_task():
@@ -1275,9 +1402,17 @@ class MainWindow(QMainWindow):
                 selected = QFileDialog.getExistingDirectory(self, "选择歌单根目录")
                 if not selected:
                     return
-                self._playlist_controller.set_root(Path(selected))
+                self._playlist_controller.start_refresh(
+                    Path(selected),
+                    remember_on_success=True,
+                )
+                self.pages["所有音乐"].status.setText(
+                    "正在验证歌单目录；完成后请再次点击“新建歌单”。"
+                )
+                return
             created = self._playlist_controller.create_playlist(name)
-            self.navigate(f"playlist:{created}")
+            self._pending_playlist_navigation = created
+            self._queue_current_playlist_refresh()
         except Exception as error:
             self.pages["所有音乐"].status.setText(f"无法创建歌单：{error}")
 
@@ -1373,6 +1508,7 @@ class MainWindow(QMainWindow):
             self._close_pending = True
             self._pending_refresh_roots.clear()
             self._playlist_add_queue.clear()
+            self._pending_playlist_navigation = None
             if first_request:
                 for controller in (
                     self._scan_controller,
@@ -1393,6 +1529,7 @@ class MainWindow(QMainWindow):
         self._close_pending = True
         self._pending_refresh_roots.clear()
         self._playlist_add_queue.clear()
+        self._pending_playlist_navigation = None
         self._close_auxiliary_windows()
         super().closeEvent(event)
 

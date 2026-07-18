@@ -13,7 +13,7 @@ from PySide6.QtCore import QObject, QThread, Signal
 
 from database import DatabaseConfig
 from repositories import LibraryRepository
-from services.file_safety import _is_reparse
+from services.file_safety import _is_reparse, _locked_directory_chain
 from services.windows_shortcuts import (
     ShortcutConflictError,
     create_playlist_directory,
@@ -72,6 +72,43 @@ class PlaylistOperationResult:
     status: str = "completed"
     created_at: str = ""
     items: tuple[PlaylistItemResult, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class PlaylistRowSnapshot:
+    shortcut_path: Path
+    target_path: Path | None
+    title: str
+    artist: str
+    duration: str
+    format: str
+    size: str
+    status: str
+
+    def as_record(self) -> dict[str, object]:
+        return {
+            "_shortcut_path": self.shortcut_path,
+            "_target_path": self.target_path,
+            "title": self.title,
+            "artist": self.artist,
+            "duration": self.duration,
+            "format": self.format,
+            "size": self.size,
+            "status": self.status,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class PlaylistViewSnapshot:
+    name: str
+    records: tuple[PlaylistRowSnapshot, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PlaylistSnapshot:
+    root: Path
+    generation: int
+    playlists: tuple[PlaylistViewSnapshot, ...]
 
 
 def _item_paths(item: object, *, playlist_root: Path, playlist_name: str) -> tuple[Path | None, Path | None]:
@@ -324,7 +361,16 @@ class PlaylistShortcutWorker(QThread):
                 )
                 try:
                     if isinstance(item, PlaylistRetargetInput):
+                        if _path_key(item.source_path) == _path_key(item.target_path):
+                            skipped += 1
+                            message = f"快捷方式已收敛：{item.target_path.name}"
+                            messages.append(message)
+                            details.append(
+                                PlaylistItemResult(source_path, target_path, "skipped", message)
+                            )
+                            continue
                         updated = 0
+                        converged = 0
                         for playlist in _safe_playlist_directories(self._playlist_root):
                             for shortcut_path in sorted(playlist.glob("*.lnk")):
                                 try:
@@ -334,6 +380,31 @@ class PlaylistShortcutWorker(QThread):
                                 if _path_key(info.target_path) != _path_key(item.source_path):
                                     continue
                                 destination = playlist / f"{item.target_path.name}.lnk"
+                                if destination.exists():
+                                    try:
+                                        destination_info = read_shortcut(
+                                            destination,
+                                            playlist_root=self._playlist_root,
+                                        )
+                                    except Exception as error:
+                                        raise ValueError(
+                                            f"目标快捷方式损坏，已保留原快捷方式：{destination.name}"
+                                        ) from error
+                                    if _path_key(destination_info.target_path) != _path_key(
+                                        item.target_path
+                                    ):
+                                        raise ValueError(
+                                            f"目标快捷方式指向其他文件，已保留双方：{destination.name}"
+                                        )
+                                    if _path_key(destination) != _path_key(shortcut_path):
+                                        remove_shortcut(
+                                            shortcut_path=shortcut_path,
+                                            playlist_root=self._playlist_root,
+                                            expected_target=item.source_path,
+                                        )
+                                    affected.add(playlist.name)
+                                    updated += 1
+                                    continue
                                 create_shortcut(
                                     target_path=item.target_path,
                                     audio_root=item.audio_root,
@@ -356,6 +427,32 @@ class PlaylistShortcutWorker(QThread):
                                 affected.add(playlist.name)
                                 updated += 1
                         if updated == 0:
+                            for playlist in _safe_playlist_directories(self._playlist_root):
+                                destination = playlist / f"{item.target_path.name}.lnk"
+                                if not destination.exists():
+                                    continue
+                                try:
+                                    info = read_shortcut(
+                                        destination,
+                                        playlist_root=self._playlist_root,
+                                    )
+                                except Exception:
+                                    continue
+                                if _path_key(info.target_path) == _path_key(item.target_path):
+                                    converged += 1
+                            if converged:
+                                skipped += 1
+                                message = f"快捷方式已收敛：{item.target_path.name}"
+                                messages.append(message)
+                                details.append(
+                                    PlaylistItemResult(
+                                        source_path,
+                                        target_path,
+                                        "skipped",
+                                        message,
+                                    )
+                                )
+                                continue
                             skipped += 1
                             message = f"未发现引用：{item.source_path.name}"
                             messages.append(message)
@@ -401,6 +498,157 @@ class PlaylistShortcutWorker(QThread):
             self.failed.emit(str(error).strip() or error.__class__.__name__)
 
 
+class PlaylistRefreshWorker(QThread):
+    completed = Signal(object)
+    cancelled = Signal()
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        *,
+        database_config: DatabaseConfig,
+        playlist_root: Path,
+        generation: int,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._database_config = database_config
+        self._playlist_root = playlist_root
+        self._generation = generation
+        self._cancel = threading.Event()
+
+    def request_cancel(self) -> None:
+        self._cancel.set()
+        self.requestInterruption()
+
+    def _check_cancel(self) -> None:
+        if self._cancel.is_set():
+            raise InterruptedError
+
+    def _scan_playlist(
+        self,
+        name: str,
+        by_path: dict[str, object],
+    ) -> PlaylistViewSnapshot:
+        folder = self._playlist_root / name
+        rows: list[PlaylistRowSnapshot] = []
+        with _locked_directory_chain(self._playlist_root, folder):
+            with os.scandir(folder) as shortcut_entries:
+                shortcuts = []
+                for entry in shortcut_entries:
+                    self._check_cancel()
+                    metadata = entry.stat(follow_symlinks=False)
+                    self._check_cancel()
+                    if entry.is_symlink() or _is_reparse(metadata):
+                        raise ValueError(
+                            f"歌单目录包含不安全的链接或重解析项：{entry.name}"
+                        )
+                    if (
+                        entry.name.casefold().endswith(".lnk")
+                        and entry.is_file(follow_symlinks=False)
+                    ):
+                        shortcuts.append(folder / entry.name)
+            for shortcut_path in sorted(
+                shortcuts,
+                key=lambda value: (value.name.casefold(), value.name),
+            ):
+                self._check_cancel()
+                try:
+                    info = read_shortcut(
+                        shortcut_path,
+                        playlist_root=self._playlist_root,
+                    )
+                    asset = by_path.get(_path_key(info.target_path))
+                except Exception as error:
+                    rows.append(
+                        PlaylistRowSnapshot(
+                            shortcut_path,
+                            None,
+                            shortcut_path.stem,
+                            "待修复",
+                            "—",
+                            "LNK",
+                            "—",
+                            f"损坏：{error}",
+                        )
+                    )
+                    continue
+                if asset is None:
+                    title, artist = info.target_path.stem, "待识别"
+                    size = "—"
+                    extension = info.target_path.suffix.lstrip(".").upper()
+                    state = "目标未索引"
+                else:
+                    stem = Path(asset.file_name).stem
+                    title, artist = (
+                        (stem.rsplit("-", 1) + ["待识别"])[:2]
+                        if "-" in stem
+                        else (stem, "待识别")
+                    )
+                    size = _human_size(asset.size_bytes)
+                    extension = asset.extension.lstrip(".").upper()
+                    state = "正常" if asset.file_state == "active" else asset.file_state
+                rows.append(
+                    PlaylistRowSnapshot(
+                        shortcut_path,
+                        info.target_path,
+                        title.strip(),
+                        artist.strip(),
+                        "—",
+                        extension,
+                        size,
+                        state,
+                    )
+                )
+        return PlaylistViewSnapshot(name, tuple(rows))
+
+    def run(self) -> None:
+        try:
+            self._check_cancel()
+            root_metadata = os.lstat(self._playlist_root)
+            if (
+                not self._playlist_root.is_absolute()
+                or not stat.S_ISDIR(root_metadata.st_mode)
+                or stat.S_ISLNK(root_metadata.st_mode)
+                or _is_reparse(root_metadata)
+            ):
+                raise ValueError("歌单根必须是普通绝对目录，不能是链接或重解析点")
+            with LibraryRepository(self._database_config) as repository:
+                assets = repository.list_assets(kind="audio")
+                by_path = {
+                    _path_key(asset.canonical_path): asset
+                    for asset in assets
+                }
+                playlists: list[PlaylistViewSnapshot] = []
+                with _locked_directory_chain(
+                    self._playlist_root,
+                    self._playlist_root,
+                ):
+                    with os.scandir(self._playlist_root) as root_entries:
+                        entries = []
+                        for entry in root_entries:
+                            self._check_cancel()
+                            metadata = entry.stat(follow_symlinks=False)
+                            self._check_cancel()
+                            if entry.is_symlink() or _is_reparse(metadata):
+                                raise ValueError(
+                                    f"歌单根包含不安全的链接或重解析项：{entry.name}"
+                                )
+                            if entry.is_dir(follow_symlinks=False):
+                                entries.append(entry.name)
+                for name in sorted(entries, key=lambda value: (value.casefold(), value)):
+                    self._check_cancel()
+                    playlists.append(self._scan_playlist(name, by_path))
+            self._check_cancel()
+            self.completed.emit(
+                PlaylistSnapshot(self._playlist_root, self._generation, tuple(playlists))
+            )
+        except InterruptedError:
+            self.cancelled.emit()
+        except Exception as error:
+            self.failed.emit(str(error).strip() or error.__class__.__name__)
+
+
 class PlaylistController(QObject):
     playlists_changed = Signal(object)
     playlist_changed = Signal(str, object)
@@ -409,21 +657,30 @@ class PlaylistController(QObject):
     failed = Signal(str)
     warning = Signal(str)
     running_changed = Signal(bool)
+    snapshot_ready = Signal(object)
+    root_changed = Signal(object)
 
     def __init__(self, database_config: DatabaseConfig, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._database_config = database_config
-        self._worker: PlaylistShortcutWorker | None = None
+        self._worker: PlaylistShortcutWorker | PlaylistRefreshWorker | None = None
         self._terminal: tuple[str, object] | None = None
         self._owner_thread_id = threading.get_ident()
         self._active_action = ""
         self._active_playlist_name = ""
         self._active_created_at = ""
         self._active_items: tuple[PlaylistItemResult, ...] = ()
+        self._refresh_remember_on_success = False
+        self._refresh_generation = 0
+        self._last_terminal_kind = ""
 
     @property
     def running(self) -> bool:
         return self._worker is not None
+
+    @property
+    def last_terminal_kind(self) -> str:
+        return self._last_terminal_kind
 
     def _require_owner_thread(self) -> None:
         if threading.get_ident() != self._owner_thread_id:
@@ -464,7 +721,33 @@ class PlaylistController(QObject):
             raise ValueError("歌单根不能是链接或重解析点")
         with LibraryRepository(self._database_config) as repository:
             repository.set_setting(PLAYLIST_ROOT_KEY, str(root))
-        self.playlists_changed.emit(self.list_playlists())
+
+    def start_refresh(
+        self,
+        root: Path | None = None,
+        *,
+        remember_on_success: bool = False,
+    ) -> None:
+        if self.running:
+            raise RuntimeError("歌单操作或刷新已经在运行")
+        selected_root = self.remembered_root() if root is None else root
+        if not isinstance(selected_root, Path) or not selected_root.is_absolute():
+            raise ValueError("请先选择有效的歌单根目录")
+        self._refresh_generation += 1
+        worker = PlaylistRefreshWorker(
+            database_config=self._database_config,
+            playlist_root=selected_root,
+            generation=self._refresh_generation,
+        )
+        worker.completed.connect(lambda snapshot: self._cache("refresh_completed", snapshot))
+        worker.cancelled.connect(lambda: self._cache("refresh_cancelled", None))
+        worker.failed.connect(lambda message: self._cache("refresh_failed", message))
+        worker.finished.connect(self._finished)
+        self._worker = worker
+        self._terminal = None
+        self._refresh_remember_on_success = bool(remember_on_success)
+        self.running_changed.emit(True)
+        worker.start()
 
     def _require_root(self) -> Path:
         root = self.remembered_root()
@@ -501,7 +784,6 @@ class PlaylistController(QObject):
             self._append_history(result)
         except Exception as error:
             self.warning.emit(f"歌单已创建，但操作历史保存失败：{error}")
-        self.playlists_changed.emit(self.list_playlists())
         return folder.name
 
     def load_playlist(self, name: str) -> tuple[dict[str, object], ...]:
@@ -621,6 +903,10 @@ class PlaylistController(QObject):
         worker = self._worker
         if worker is None:
             return
+        if isinstance(worker, PlaylistRefreshWorker):
+            self._finish_refresh(worker)
+            return
+        self._last_terminal_kind = "operation"
         kind, payload = self._terminal or ("failed", "歌单线程结束但没有终态")
         if isinstance(payload, PlaylistOperationResult):
             history_result = payload
@@ -651,17 +937,6 @@ class PlaylistController(QObject):
             self._append_history(history_result)
         except Exception as error:
             self.warning.emit(f"歌单操作已结束，但历史保存失败：{error}")
-        if isinstance(payload, PlaylistOperationResult):
-            try:
-                names = payload.affected_playlists
-                if not names and payload.playlist_name != "受管歌单":
-                    names = (payload.playlist_name,)
-                for name in names:
-                    self.playlist_changed.emit(name, self.load_playlist(name))
-            except Exception as error:
-                self.failed.emit(f"操作完成但歌单刷新失败：{error}")
-                kind = "failed"
-                payload = str(error)
         if kind == "completed":
             self.completed.emit(payload)
         elif kind == "cancelled":
@@ -675,4 +950,29 @@ class PlaylistController(QObject):
         self._active_created_at = ""
         self._active_items = ()
         worker.deleteLater()
+        self.running_changed.emit(False)
+
+    def _finish_refresh(self, worker: PlaylistRefreshWorker) -> None:
+        self._last_terminal_kind = "refresh"
+        kind, payload = self._terminal or ("refresh_failed", "歌单刷新线程结束但没有终态")
+        if kind == "refresh_completed" and isinstance(payload, PlaylistSnapshot):
+            if self._refresh_remember_on_success:
+                try:
+                    with LibraryRepository(self._database_config) as repository:
+                        repository.set_setting(PLAYLIST_ROOT_KEY, str(payload.root))
+                except Exception as error:
+                    kind = "refresh_failed"
+                    payload = f"歌单目录验证成功，但保存设置失败：{error}"
+                else:
+                    self.root_changed.emit(payload.root)
+        self._worker = None
+        self._terminal = None
+        self._refresh_remember_on_success = False
+        worker.deleteLater()
+        if kind == "refresh_completed":
+            self.snapshot_ready.emit(payload)
+        elif kind == "refresh_cancelled":
+            self.cancelled.emit(None)
+        else:
+            self.failed.emit(str(payload))
         self.running_changed.emit(False)

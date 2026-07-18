@@ -26,6 +26,8 @@ class SettingsDialog(PrototypeDialog):
     cleanup_requested = Signal()
     open_backup_requested = Signal()
     rescan_requested = Signal()
+    playlist_root_requested = Signal()
+    playlist_refresh_requested = Signal()
 
     def __init__(
         self,
@@ -94,8 +96,21 @@ class SettingsDialog(PrototypeDialog):
                 line = QLineEdit("未选择" if value is None else str(value))
                 line.setReadOnly(True)
                 self.path_fields[key] = line
-                form.addRow(label, line)
-            hint = QLabel("这些目录来自你在扫描、歌词匹配和歌单功能中的最近一次明确选择；设置页不会自行扫描。")
+                if key == "playlist":
+                    row = QHBoxLayout()
+                    row.addWidget(line, 1)
+                    choose = QPushButton("选择")
+                    choose.clicked.connect(self.playlist_root_requested)
+                    refresh = QPushButton("刷新")
+                    refresh.clicked.connect(self.playlist_refresh_requested)
+                    self.playlist_choose_button = choose
+                    self.playlist_refresh_button = refresh
+                    row.addWidget(choose)
+                    row.addWidget(refresh)
+                    form.addRow(label, row)
+                else:
+                    form.addRow(label, line)
+            hint = QLabel("音乐和歌词目录来自对应功能；歌单目录可在此明确选择，成功验证后才会切换。")
             hint.setWordWrap(True)
             hint.setObjectName("Hint")
             form.addRow(hint)
@@ -228,11 +243,19 @@ class SettingsDialog(PrototypeDialog):
     def show_message(self, message: str) -> None:
         self.status.setText(message)
 
+    def set_playlist_root(self, root: Path) -> None:
+        if self.live_mode and isinstance(root, Path) and root.is_absolute():
+            self.path_fields["playlist"].setText(str(root))
+
     def complete_save(self) -> None:
         self.accept()
 
     def set_maintenance_running(self, running: bool) -> None:
         for text, button in getattr(self, "maintenance_buttons", {}).items():
             button.setEnabled(not running or text == "打开备份目录")
+        for name in ("playlist_choose_button", "playlist_refresh_button"):
+            button = getattr(self, name, None)
+            if button is not None:
+                button.setEnabled(not running)
         if self.live_mode and running:
             self.status.setText("已有后台任务运行；重新检查和永久清理暂不可用。")
