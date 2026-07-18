@@ -366,7 +366,9 @@ class UiRefreshTests(unittest.TestCase):
         self.assertIn("移入备份", live_buttons)
         self.assertNotIn("界面演示", live_music_text)
         self.assertIn("界面演示", mock_text)
-        self.assertFalse(hasattr(live_music, "delete_lyrics"))
+        self.assertTrue(hasattr(live_music, "backup_linked_lyrics"))
+        self.assertFalse(live_music.backup_linked_lyrics.isChecked())
+        self.assertIn("外部 LRC", live_music.backup_linked_lyrics.text())
 
 
 if __name__ == "__main__":

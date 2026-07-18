@@ -27,6 +27,8 @@ from services.safe_import import import_one
 BACKUP_MANIFEST_KEY = "p7.backup_entries"
 BACKUP_RETENTION_KEY = "p7.retention_days"
 BACKUP_HISTORY_KEY = "p7.operation_history"
+PENDING_CLEANUP_KEY = "p7.pending_cleanup"
+PENDING_LINKED_BACKUP_KEY = "p7.pending_linked_backup"
 _BACKUP_HISTORY_LIMIT = 200
 _BACKUP_ACTIONS = {"backup", "restore", "cleanup"}
 _BACKUP_HISTORY_STATUSES = {"completed", "cancelled", "failed"}
@@ -43,6 +45,12 @@ class BackupInput:
     source_path: Path
     allowed_root: Path
     kind: str
+    include_linked_lyrics: bool = False
+    expected_size_bytes: int | None = None
+    expected_mtime_ns: int | None = None
+    link_group_id: str | None = None
+    lyrics_match_id: str | None = None
+    linked_audio_asset_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +64,10 @@ class BackupEntry:
     created_at: str
     restored_at: str | None = None
     allowed_root: Path | None = None
+    linked_entry_id: str | None = None
+    link_group_id: str | None = None
+    lyrics_match_id: str | None = None
+    linked_audio_asset_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -320,6 +332,18 @@ def _entry_from_json(value: object) -> BackupEntry:
             allowed_root=None
             if value.get("allowed_root") is None
             else Path(str(value["allowed_root"])),
+            linked_entry_id=None
+            if value.get("linked_entry_id") is None
+            else str(value["linked_entry_id"]),
+            link_group_id=None
+            if value.get("link_group_id") is None
+            else str(value["link_group_id"]),
+            lyrics_match_id=None
+            if value.get("lyrics_match_id") is None
+            else str(value["lyrics_match_id"]),
+            linked_audio_asset_id=None
+            if value.get("linked_audio_asset_id") is None
+            else str(value["linked_audio_asset_id"]),
         )
     except Exception as error:
         raise BackupError("备份清单项字段损坏") from error
@@ -332,6 +356,21 @@ def _entry_from_json(value: object) -> BackupEntry:
         or not entry.original_path.is_absolute()
         or not entry.backup_path.is_absolute()
         or (entry.allowed_root is not None and not entry.allowed_root.is_absolute())
+        or (
+            entry.linked_entry_id is not None
+            and (
+                not entry.linked_entry_id
+                or Path(entry.linked_entry_id).name != entry.linked_entry_id
+            )
+        )
+        or any(
+            value is not None and (not value or Path(value).name != value)
+            for value in (
+                entry.link_group_id,
+                entry.lyrics_match_id,
+                entry.linked_audio_asset_id,
+            )
+        )
         or len(entry.sha256) != 64
         or any(character not in "0123456789abcdefABCDEF" for character in entry.sha256)
     ):
@@ -391,6 +430,8 @@ class BackupWorker(QThread):
         try:
             repository = self._repository_factory()
             self._validate_backup_root()
+            self._recover_pending_linked_backup(repository)
+            self._recover_pending_cleanup(repository)
             entries = self._load(repository, self._backup_root)
             if self._action == "backup":
                 result = self._backup(repository, entries)
@@ -421,6 +462,333 @@ class BackupWorker(QThread):
         finally:
             if repository is not None:
                 repository.close()
+
+    def _build_linked_backup_plan(
+        self,
+        audio: BackupInput,
+        lyric: BackupInput,
+        relation,
+    ) -> dict[str, object]:
+        if (
+            audio.link_group_id is None
+            or audio.link_group_id != lyric.link_group_id
+            or audio.lyrics_match_id is None
+            or relation.id != audio.lyrics_match_id
+        ):
+            raise BackupError("关联备份计划与歌词关系不一致")
+        members: list[dict[str, object]] = []
+        created_at = datetime.now(timezone.utc).isoformat()
+        for item in (audio, lyric):
+            metadata = os.lstat(item.source_path)
+            entry_id = str(uuid4())
+            members.append({
+                "entry_id": entry_id,
+                "asset_id": item.asset_id,
+                "kind": item.kind,
+                "source_path": str(item.source_path),
+                "allowed_root": str(item.allowed_root),
+                "backup_path": str(
+                    self._backup_root / entry_id / item.source_path.name
+                ),
+                "expected_size_bytes": int(metadata.st_size),
+                "expected_mtime_ns": int(metadata.st_mtime_ns),
+                "created_at": created_at,
+                "link_group_id": item.link_group_id,
+                "lyrics_match_id": item.lyrics_match_id,
+                "linked_audio_asset_id": item.linked_audio_asset_id,
+                "sha256": None,
+            })
+        return {
+            "version": 2,
+            "state": "planned",
+            "group_id": audio.link_group_id,
+            "members": members,
+            "relation": {
+                "id": relation.id,
+                "audio_asset_id": relation.audio_asset_id,
+                "lyric_asset_id": relation.lyric_asset_id,
+                "source_kind": relation.source_kind,
+                "confidence": relation.confidence,
+                "method": relation.method,
+                "state": relation.state,
+                "is_current": relation.is_current,
+                "created_at": relation.created_at,
+                "updated_at": relation.updated_at,
+            },
+        }
+
+    @staticmethod
+    def _planned_member(
+        plan: dict[str, object],
+        kind: str,
+    ) -> dict[str, object]:
+        raw_members = plan.get("members")
+        if not isinstance(raw_members, list):
+            raise BackupError("关联备份计划成员损坏")
+        matches = [
+            member
+            for member in raw_members
+            if isinstance(member, dict) and member.get("kind") == kind
+        ]
+        if len(matches) != 1:
+            raise BackupError("关联备份计划缺少唯一成员")
+        return matches[0]
+
+    def _advance_linked_backup_plan(
+        self,
+        repository: LibraryRepository,
+        plan: dict[str, object],
+        *,
+        state: str,
+        kind: str | None = None,
+        sha256: str | None = None,
+    ) -> None:
+        plan["state"] = state
+        if kind is not None:
+            member = self._planned_member(plan, kind)
+            member["sha256"] = sha256
+        repository.set_setting(PENDING_LINKED_BACKUP_KEY, plan)
+
+    def _recover_pending_linked_backup(self, repository: LibraryRepository) -> None:
+        setting = repository.get_setting(PENDING_LINKED_BACKUP_KEY)
+        if setting is None or setting.value == []:
+            return
+        value = setting.value
+        if (
+            not isinstance(value, dict)
+            or value.get("version") != 2
+            or not isinstance(value.get("group_id"), str)
+            or not value.get("group_id")
+        ):
+            raise BackupError("关联备份回滚日志损坏")
+        group_id = str(value["group_id"])
+        raw_members = value.get("members")
+        relation = value.get("relation")
+        if (
+            not isinstance(raw_members, list)
+            or len(raw_members) != 2
+            or not isinstance(relation, dict)
+            or relation.get("id") is None
+            or relation.get("source_kind") != "external"
+            or relation.get("state") != "matched"
+            or relation.get("is_current") is not True
+        ):
+            raise BackupError("关联备份计划关系或成员损坏")
+        plans: dict[str, dict[str, object]] = {}
+        for raw_member in raw_members:
+            if not isinstance(raw_member, dict):
+                raise BackupError("关联备份计划成员格式损坏")
+            kind = raw_member.get("kind")
+            entry_id = raw_member.get("entry_id")
+            source_path = Path(str(raw_member.get("source_path", "")))
+            allowed_root = Path(str(raw_member.get("allowed_root", "")))
+            backup_path = Path(str(raw_member.get("backup_path", "")))
+            expected_size = raw_member.get("expected_size_bytes")
+            expected_mtime = raw_member.get("expected_mtime_ns")
+            if (
+                kind not in {"audio", "lyric"}
+                or kind in plans
+                or not isinstance(entry_id, str)
+                or not entry_id
+                or Path(entry_id).name != entry_id
+                or not source_path.is_absolute()
+                or not allowed_root.is_absolute()
+                or not backup_path.is_absolute()
+                or not _within_root(source_path, allowed_root)
+                or backup_path
+                != self._backup_root / entry_id / source_path.name
+                or isinstance(expected_size, bool)
+                or not isinstance(expected_size, int)
+                or expected_size < 0
+                or (
+                    expected_mtime is not None
+                    and (
+                        isinstance(expected_mtime, bool)
+                        or not isinstance(expected_mtime, int)
+                        or expected_mtime < 0
+                    )
+                )
+                or raw_member.get("link_group_id") != group_id
+                or raw_member.get("lyrics_match_id") != relation.get("id")
+                or raw_member.get("linked_audio_asset_id")
+                != relation.get("audio_asset_id")
+            ):
+                raise BackupError("关联备份计划路径或事实损坏")
+            plans[str(kind)] = raw_member
+        if set(plans) != {"audio", "lyric"}:
+            raise BackupError("关联备份计划必须包含音乐和歌词")
+        if (
+            plans["audio"].get("asset_id") != relation.get("audio_asset_id")
+            or plans["lyric"].get("asset_id") != relation.get("lyric_asset_id")
+        ):
+            raise BackupError("关联备份计划资产与关系快照不一致")
+        manifest = self._load_unchecked(repository, self._backup_root)
+        group = [item for item in manifest if item.link_group_id == group_id]
+        if len(group) == 2:
+            self._validate_manifest_groups(manifest)
+            for entry in group:
+                plan = plans[entry.kind]
+                if (
+                    entry.id != plan["entry_id"]
+                    or _path_key(entry.backup_path)
+                    != _path_key(Path(str(plan["backup_path"])))
+                    or not entry.backup_path.exists()
+                    or entry.original_path.exists()
+                    or _verified_file_sha256(entry.backup_path) != entry.sha256
+                ):
+                    raise BackupError("已提交关联备份与计划或文件事实不一致")
+            repository.set_setting(PENDING_LINKED_BACKUP_KEY, [])
+            return
+        if len(group) > 1 or (group and group[0].kind != "audio"):
+            raise BackupError("关联备份回滚日志与清单不一致")
+        for kind in ("lyric", "audio"):
+            plan = plans[kind]
+            source_path = Path(str(plan["source_path"]))
+            backup_path = Path(str(plan["backup_path"]))
+            source_exists = source_path.exists()
+            backup_exists = backup_path.exists()
+            if source_exists and backup_exists:
+                raise BackupError("关联备份恢复时源文件与备份同时存在")
+            if not source_exists and not backup_exists:
+                raise BackupError("关联备份恢复时源文件与备份均不存在")
+            if not backup_exists:
+                continue
+            backup_metadata = os.lstat(backup_path)
+            if backup_metadata.st_size != plan["expected_size_bytes"]:
+                raise BackupError("关联备份恢复时文件大小与计划不一致")
+            actual_sha = _verified_file_sha256(backup_path)
+            planned_sha = plan.get("sha256")
+            if planned_sha is not None and planned_sha != actual_sha:
+                raise BackupError("关联备份恢复时 SHA-256 与计划不一致")
+            restored = import_one(
+                backup_path,
+                source_root=backup_path.parent,
+                target_root=source_path.parent,
+            )
+            if (
+                restored.status != "success"
+                or restored.sha256 != actual_sha
+                or _path_key(restored.target_path) != _path_key(source_path)
+            ):
+                raise BackupError(f"关联文件自动回滚失败：{restored.message}")
+        candidate = [item for item in manifest if item.link_group_id != group_id]
+        self._save(repository, candidate)
+        repository.set_setting(PENDING_LINKED_BACKUP_KEY, [])
+        for plan in plans.values():
+            try:
+                Path(str(plan["backup_path"])).parent.rmdir()
+            except OSError:
+                pass
+
+    def _rollback_incomplete_linked_backup(
+        self,
+        repository: LibraryRepository,
+        entries: list[BackupEntry],
+        audio_entry: BackupEntry,
+        *,
+        reason: str,
+    ) -> list[BackupEntry]:
+        setting = repository.get_setting(PENDING_LINKED_BACKUP_KEY)
+        if setting is None or not isinstance(setting.value, dict):
+            raise BackupError("关联歌词失败但缺少可恢复计划日志")
+        plan = setting.value
+        plan["state"] = "rollback_required"
+        plan["reason"] = reason
+        repository.set_setting(PENDING_LINKED_BACKUP_KEY, plan)
+        self._recover_pending_linked_backup(repository)
+        return self._load(repository, self._backup_root)
+
+    def _recover_pending_cleanup(self, repository: LibraryRepository) -> None:
+        setting = repository.get_setting(PENDING_CLEANUP_KEY)
+        if setting is None or setting.value == []:
+            return
+        value = setting.value
+        if not isinstance(value, dict):
+            raise BackupError("永久清理恢复日志损坏")
+        raw_members = value.get("members")
+        relation = value.get("relation")
+        if not isinstance(raw_members, list) or not raw_members:
+            raise BackupError("永久清理恢复日志成员损坏")
+        members: list[tuple[BackupEntry, Path]] = []
+        for raw_member in raw_members:
+            if not isinstance(raw_member, dict):
+                raise BackupError("永久清理恢复日志成员格式损坏")
+            entry = _entry_from_json(raw_member.get("entry"))
+            tombstone = Path(str(raw_member.get("tombstone_path", "")))
+            if (
+                not tombstone.is_absolute()
+                or not _within_root(tombstone, self._backup_root)
+                or tombstone.parent != entry.backup_path.parent
+            ):
+                raise BackupError("永久清理恢复日志路径损坏")
+            members.append((entry, tombstone))
+        member_entries = [entry for entry, _tombstone in members]
+        if len({entry.id for entry in member_entries}) != len(member_entries):
+            raise BackupError("永久清理恢复日志成员重复")
+        if any(entry.link_group_id is not None for entry in member_entries):
+            self._validate_manifest_groups(member_entries)
+        relation_id: str | None = None
+        if relation is not None:
+            if (
+                not isinstance(relation, dict)
+                or relation.get("source_kind") != "external"
+                or relation.get("state") != "matched"
+                or relation.get("is_current") is not True
+                or not isinstance(relation.get("id"), str)
+                or not relation.get("id")
+                or not isinstance(relation.get("audio_asset_id"), str)
+                or not isinstance(relation.get("lyric_asset_id"), str)
+            ):
+                raise BackupError("永久清理恢复日志关系快照损坏")
+            relation_id = str(relation["id"])
+            if any(
+                entry.lyrics_match_id != relation_id
+                for entry in member_entries
+                if entry.link_group_id is not None
+            ):
+                raise BackupError("永久清理恢复日志关系与组不一致")
+
+        deleted_ids: set[str] = set()
+        recoverable: list[BackupEntry] = []
+        for entry, tombstone in members:
+            backup_exists = entry.backup_path.exists()
+            tombstone_exists = tombstone.exists()
+            if backup_exists and tombstone_exists:
+                raise BackupError("永久清理恢复时备份与墓碑同时存在")
+            if tombstone_exists:
+                os.rename(tombstone, entry.backup_path)
+                recoverable.append(entry)
+            elif backup_exists:
+                recoverable.append(entry)
+            else:
+                deleted_ids.add(entry.id)
+
+        manifest = self._load_unchecked(repository, self._backup_root)
+        member_ids = {entry.id for entry in member_entries}
+        candidate = [entry for entry in manifest if entry.id not in member_ids]
+        if deleted_ids:
+            candidate.extend(
+                replace(
+                    entry,
+                    linked_entry_id=None,
+                    link_group_id=None,
+                    lyrics_match_id=None,
+                    linked_audio_asset_id=None,
+                )
+                for entry in recoverable
+            )
+        else:
+            candidate.extend(member_entries)
+        self._validate_manifest_groups(candidate)
+        self._save(repository, candidate)
+        if relation_id is not None:
+            repository.finalize_external_lyrics_cleanup(
+                match_id=relation_id,
+                journal_key=PENDING_CLEANUP_KEY,
+                restore_relation=not deleted_ids,
+            )
+        else:
+            repository.set_setting(PENDING_CLEANUP_KEY, [])
 
     @staticmethod
     def _append_history(
@@ -524,7 +892,7 @@ class BackupWorker(QThread):
                 raise BackupError(f"备份目录链不安全：{error}") from error
 
     @classmethod
-    def _load(
+    def _load_unchecked(
         cls,
         repository: LibraryRepository,
         backup_root: Path,
@@ -546,6 +914,44 @@ class BackupWorker(QThread):
             cls._validate_entry(repository, backup_root, entry)
         return entries
 
+    @classmethod
+    def _load(
+        cls,
+        repository: LibraryRepository,
+        backup_root: Path,
+    ) -> list[BackupEntry]:
+        entries = cls._load_unchecked(repository, backup_root)
+        cls._validate_manifest_groups(entries)
+        return entries
+
+    @staticmethod
+    def _validate_manifest_groups(entries: list[BackupEntry]) -> None:
+        grouped: dict[str, list[BackupEntry]] = {}
+        for entry in entries:
+            linked_fields = (
+                entry.link_group_id,
+                entry.lyrics_match_id,
+                entry.linked_audio_asset_id,
+            )
+            if entry.link_group_id is None:
+                if any(value is not None for value in linked_fields[1:]):
+                    raise BackupError("非关联备份条目混入关联字段")
+                continue
+            if any(value is None for value in linked_fields):
+                raise BackupError("关联备份组字段不完整")
+            grouped.setdefault(entry.link_group_id, []).append(entry)
+        for group_id, members in grouped.items():
+            if len(members) != 2 or {entry.kind for entry in members} != {"audio", "lyric"}:
+                raise BackupError(f"关联备份组损坏：{group_id}")
+            audio = next(entry for entry in members if entry.kind == "audio")
+            lyric = next(entry for entry in members if entry.kind == "lyric")
+            if (
+                audio.lyrics_match_id != lyric.lyrics_match_id
+                or audio.linked_audio_asset_id != audio.asset_id
+                or lyric.linked_audio_asset_id != audio.asset_id
+            ):
+                raise BackupError(f"关联备份组关系字段不一致：{group_id}")
+
     @staticmethod
     def _save(repository: LibraryRepository, entries: list[BackupEntry]) -> None:
         repository.set_setting(
@@ -557,18 +963,175 @@ class BackupWorker(QThread):
             ],
         )
 
+    def _prepare_backup_inputs(
+        self,
+        repository: LibraryRepository,
+    ) -> tuple[BackupInput, ...]:
+        requested = tuple(self._payload)
+        if not requested or not all(isinstance(item, BackupInput) for item in requested):
+            raise BackupError("备份输入格式无效")
+        asset_ids = [item.asset_id for item in requested]
+        if len(asset_ids) != len(set(asset_ids)):
+            raise BackupError("备份输入包含重复资产")
+        audio_roots = repository.latest_completed_audio_roots(
+            item.asset_id for item in requested if item.kind == "audio"
+        )
+        lyric_roots = repository.latest_completed_lyric_roots(
+            item.asset_id for item in requested if item.kind == "lyric"
+        )
+        links = {
+            item.audio_asset_id: item
+            for item in repository.current_external_lyrics_for_audio_ids(
+                item.asset_id
+                for item in requested
+                if item.kind == "audio" and item.include_linked_lyrics
+            )
+        }
+        expanded: list[BackupInput] = []
+        linked_lyric_ids: set[str] = set()
+        for item in requested:
+            # 普通单文件删除保持既有“逐文件执行、逐文件审计”的部分成功语义。
+            # 只有显式勾选关联歌词时，才必须在移动音乐前完成整个组合的预检。
+            if item.kind != "audio" or not item.include_linked_lyrics:
+                expanded.append(item)
+                continue
+            asset = repository.get_asset_by_id(item.asset_id)
+            expected_root = (
+                audio_roots.get(item.asset_id)
+                if item.kind == "audio"
+                else lyric_roots.get(item.asset_id)
+            )
+            if (
+                asset is None
+                or asset.kind != item.kind
+                or asset.file_state != "active"
+                or _path_key(asset.canonical_path) != _path_key(item.source_path)
+                or expected_root is None
+                or _path_key(expected_root) != _path_key(item.allowed_root)
+            ):
+                raise BackupError("索引、类型、状态或完成扫描来源已变化")
+            metadata = os.lstat(item.source_path)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or _is_reparse(metadata)
+                or metadata.st_size != asset.size_bytes
+                or metadata.st_mtime_ns != asset.mtime_ns
+                or (
+                    item.expected_size_bytes is not None
+                    and item.expected_size_bytes != asset.size_bytes
+                )
+                or (
+                    item.expected_mtime_ns is not None
+                    and item.expected_mtime_ns != asset.mtime_ns
+                )
+            ):
+                raise BackupError("源文件事实已变化，请重新扫描")
+            expanded.append(item)
+            relation = links.get(item.asset_id)
+            if relation is None or relation.lyric_asset_id is None:
+                continue
+            lyric_id = relation.lyric_asset_id
+            if lyric_id in linked_lyric_ids:
+                continue
+            references = repository.current_audio_ids_for_external_lyric(lyric_id)
+            if references != (item.asset_id,):
+                continue
+            lyric = repository.get_asset_by_id(lyric_id)
+            roots = repository.latest_completed_lyric_roots((lyric_id,))
+            lyric_root = roots.get(lyric_id)
+            if lyric is None or lyric.kind != "lyric" or lyric.file_state != "active" or lyric_root is None:
+                raise BackupError("关联外部歌词不是 active 或缺少完成扫描来源")
+            lyric_meta = os.lstat(lyric.canonical_path)
+            if (
+                not stat.S_ISREG(lyric_meta.st_mode)
+                or stat.S_ISLNK(lyric_meta.st_mode)
+                or _is_reparse(lyric_meta)
+                or lyric_meta.st_size != lyric.size_bytes
+                or lyric_meta.st_mtime_ns != lyric.mtime_ns
+            ):
+                raise BackupError("关联外部歌词文件事实已变化")
+            group_id = str(uuid4())
+            expanded[-1] = replace(
+                item,
+                link_group_id=group_id,
+                lyrics_match_id=relation.id,
+                linked_audio_asset_id=item.asset_id,
+            )
+            expanded.append(
+                BackupInput(
+                    lyric.id,
+                    lyric.canonical_path,
+                    lyric_root,
+                    "lyric",
+                    False,
+                    lyric.size_bytes,
+                    lyric.mtime_ns,
+                    group_id,
+                    relation.id,
+                    item.asset_id,
+                )
+            )
+            linked_lyric_ids.add(lyric_id)
+        return tuple(expanded)
+
     def _backup(self, repository: LibraryRepository, entries: list[BackupEntry]) -> BackupRunResult:
         successes = failures = 0
         messages: list[str] = []
         affected_roots: list[tuple[str, Path]] = []
         history_items: list[BackupHistoryItem] = []
         cancelled = False
+        successful_audio_groups: set[str] = set()
+        group_audio_entries: dict[str, BackupEntry] = {}
+        linked_plans: dict[str, dict[str, object]] = {}
+        prepared_payload = self._prepare_backup_inputs(repository)
         current_matches = repository.list_lyrics_matches(current_only=True)
+        current_matches_by_id = {match.id: match for match in current_matches}
         referenced_lyrics = {match.lyric_asset_id for match in current_matches if match.lyric_asset_id}
-        for index, value in enumerate(self._payload):
+        for index, value in enumerate(prepared_payload):
             if self._cancel.is_set():
                 cancelled = True
-                for pending in self._payload[index:]:
+                if (
+                    isinstance(value, BackupInput)
+                    and value.kind == "lyric"
+                    and value.link_group_id in group_audio_entries
+                ):
+                    audio_entry = group_audio_entries[value.link_group_id]
+                    history_items = [
+                        item for item in history_items if item.entry_id != audio_entry.id
+                    ]
+                    successes -= 1
+                    try:
+                        entries[:] = self._rollback_incomplete_linked_backup(
+                            repository,
+                            entries,
+                            audio_entry,
+                            reason="关联歌词备份前观察到取消",
+                        )
+                        history_items.append(self._history_item(
+                            entry_id=None,
+                            asset_id=audio_entry.asset_id,
+                            kind="audio",
+                            source_path=audio_entry.original_path,
+                            backup_path=None,
+                            restore_target=None,
+                            result="cancelled",
+                            message="关联歌词备份前取消，音乐已完整恢复",
+                        ))
+                    except Exception as rollback_error:
+                        failures += 1
+                        messages.append(str(rollback_error))
+                        history_items.append(self._history_item(
+                            entry_id=audio_entry.id,
+                            asset_id=audio_entry.asset_id,
+                            kind="audio",
+                            source_path=audio_entry.original_path,
+                            backup_path=audio_entry.backup_path,
+                            restore_target=audio_entry.original_path,
+                            result="failed",
+                            message=str(rollback_error),
+                        ))
+                for pending in prepared_payload[index:]:
                     if isinstance(pending, BackupInput):
                         history_items.append(
                             self._history_item(
@@ -585,7 +1148,32 @@ class BackupWorker(QThread):
                 break
             if not isinstance(value, BackupInput):
                 raise BackupError("备份输入格式无效")
-            if value.kind == "lyric" and value.asset_id in referenced_lyrics:
+            if (
+                value.kind == "lyric"
+                and value.link_group_id is not None
+                and value.link_group_id not in successful_audio_groups
+            ):
+                failures += 1
+                message = f"{value.source_path.name}：关联音乐未成功备份，歌词未处理"
+                messages.append(message)
+                history_items.append(
+                    self._history_item(
+                        entry_id=None,
+                        asset_id=value.asset_id,
+                        kind=value.kind,
+                        source_path=value.source_path,
+                        backup_path=None,
+                        restore_target=None,
+                        result="failed",
+                        message=message,
+                    )
+                )
+                continue
+            if (
+                value.kind == "lyric"
+                and value.asset_id in referenced_lyrics
+                and value.link_group_id is None
+            ):
                 failures += 1
                 message = f"歌词仍被音乐引用，拒绝删除：{value.source_path.name}"
                 messages.append(message)
@@ -610,7 +1198,36 @@ class BackupWorker(QThread):
                     raise BackupError("索引快照已变化，请重新扫描")
                 if not _within_root(value.source_path, value.allowed_root):
                     raise BackupError("源文件超出授权根")
-                entry_id = str(uuid4())
+                plan: dict[str, object] | None = None
+                if value.link_group_id is not None:
+                    plan = linked_plans.get(value.link_group_id)
+                    if value.kind == "audio":
+                        lyric_input = next(
+                            (
+                                candidate
+                                for candidate in prepared_payload
+                                if isinstance(candidate, BackupInput)
+                                and candidate.kind == "lyric"
+                                and candidate.link_group_id == value.link_group_id
+                            ),
+                            None,
+                        )
+                        relation = current_matches_by_id.get(value.lyrics_match_id)
+                        if lyric_input is None or relation is None:
+                            raise BackupError("关联备份缺少歌词输入或当前关系")
+                        plan = self._build_linked_backup_plan(
+                            value,
+                            lyric_input,
+                            relation,
+                        )
+                        repository.set_setting(PENDING_LINKED_BACKUP_KEY, plan)
+                        linked_plans[value.link_group_id] = plan
+                    if plan is None:
+                        raise BackupError("关联备份计划不存在")
+                    planned_member = self._planned_member(plan, value.kind)
+                    entry_id = str(planned_member["entry_id"])
+                else:
+                    entry_id = str(uuid4())
                 directory = self._backup_root / entry_id
                 directory.mkdir()
                 moved = import_one(
@@ -621,6 +1238,19 @@ class BackupWorker(QThread):
                 if moved.status != "success" or moved.sha256 is None:
                     raise BackupError(moved.message)
                 backup_path = moved.target_path
+                if plan is not None:
+                    self._advance_linked_backup_plan(
+                        repository,
+                        plan,
+                        state=f"{value.kind}_moved",
+                        kind=value.kind,
+                        sha256=moved.sha256,
+                    )
+                    planned_member = self._planned_member(plan, value.kind)
+                    if _path_key(moved.target_path) != _path_key(
+                        Path(str(planned_member["backup_path"]))
+                    ):
+                        raise BackupError("关联备份实际路径与预定路径不一致")
                 entry = BackupEntry(
                     id=entry_id,
                     asset_id=value.asset_id,
@@ -628,8 +1258,15 @@ class BackupWorker(QThread):
                     original_path=value.source_path,
                     backup_path=moved.target_path,
                     sha256=moved.sha256,
-                    created_at=datetime.now(timezone.utc).isoformat(),
+                    created_at=(
+                        str(self._planned_member(plan, value.kind)["created_at"])
+                        if plan is not None
+                        else datetime.now(timezone.utc).isoformat()
+                    ),
                     allowed_root=value.allowed_root,
+                    link_group_id=value.link_group_id,
+                    lyrics_match_id=value.lyrics_match_id,
+                    linked_audio_asset_id=value.linked_audio_asset_id,
                 )
                 self._validate_entry(repository, self._backup_root, entry)
                 candidate_entries = entries + [entry]
@@ -651,7 +1288,36 @@ class BackupWorker(QThread):
                         pass
                     raise
                 entries.append(entry)
+                if plan is not None:
+                    if value.kind == "audio":
+                        self._advance_linked_backup_plan(
+                            repository,
+                            plan,
+                            state="audio_manifest_saved",
+                        )
+                    else:
+                        try:
+                            self._advance_linked_backup_plan(
+                                repository,
+                                plan,
+                                state="group_committed",
+                            )
+                        except Exception as journal_error:
+                            messages.append(
+                                "关联备份组已提交，但状态日志更新失败，"
+                                f"将在下次启动核对：{journal_error}"
+                            )
                 successes += 1
+                if value.kind == "audio" and value.link_group_id is not None:
+                    successful_audio_groups.add(value.link_group_id)
+                    group_audio_entries[value.link_group_id] = entry
+                elif value.kind == "lyric" and value.link_group_id is not None:
+                    try:
+                        repository.set_setting(PENDING_LINKED_BACKUP_KEY, [])
+                    except Exception as journal_error:
+                        messages.append(
+                            f"关联备份已完成，但回滚日志清除失败，将在下次启动核对：{journal_error}"
+                        )
                 root_key = (value.kind, value.allowed_root)
                 if root_key not in affected_roots:
                     affected_roots.append(root_key)
@@ -668,8 +1334,70 @@ class BackupWorker(QThread):
                     )
                 )
             except Exception as error:
-                failures += 1
+                if (
+                    value.kind == "audio"
+                    and value.link_group_id is not None
+                    and value.link_group_id in linked_plans
+                    and value.link_group_id not in group_audio_entries
+                ):
+                    try:
+                        self._recover_pending_linked_backup(repository)
+                    except Exception as recovery_error:
+                        error = BackupError(
+                            f"{error}；关联备份自动恢复失败：{recovery_error}"
+                        )
+                linked_audio = (
+                    group_audio_entries.get(value.link_group_id)
+                    if value.kind == "lyric" and value.link_group_id is not None
+                    else None
+                )
                 message = f"{value.source_path.name}：{error}"
+                if linked_audio is not None:
+                    history_items = [
+                        item for item in history_items if item.entry_id != linked_audio.id
+                    ]
+                    successes -= 1
+                    rollback_message = "关联歌词失败，音乐已完整恢复"
+                    try:
+                        entries[:] = self._rollback_incomplete_linked_backup(
+                            repository,
+                            entries,
+                            linked_audio,
+                            reason=message,
+                        )
+                    except Exception as rollback_error:
+                        rollback_message = str(rollback_error)
+                    failures += 2
+                    message += f"；{rollback_message}"
+                    messages.append(message)
+                    history_items.append(self._history_item(
+                        entry_id=linked_audio.id,
+                        asset_id=linked_audio.asset_id,
+                        kind="audio",
+                        source_path=linked_audio.original_path,
+                        backup_path=(
+                            linked_audio.backup_path
+                            if linked_audio.backup_path.exists()
+                            else None
+                        ),
+                        restore_target=linked_audio.original_path,
+                        result="failed",
+                        message=rollback_message,
+                    ))
+                    history_items.append(
+                        self._history_item(
+                            entry_id=entry_id,
+                            asset_id=value.asset_id,
+                            kind=value.kind,
+                            source_path=value.source_path,
+                            backup_path=backup_path,
+                            restore_target=None,
+                            result="failed",
+                            message=str(error).strip() or error.__class__.__name__,
+                        )
+                    )
+                    continue
+                failures += 1
                 messages.append(message)
                 history_items.append(
                     self._history_item(
@@ -683,6 +1411,18 @@ class BackupWorker(QThread):
                         message=str(error).strip() or error.__class__.__name__,
                     )
                 )
+        successful_entry_ids = {
+            item.entry_id
+            for item in history_items
+            if item.result == "success" and item.entry_id is not None
+        }
+        affected_roots = [
+            (entry.kind, entry.allowed_root)
+            for entry in entries
+            if entry.id in successful_entry_ids
+            and entry.allowed_root is not None
+        ]
+        affected_roots = list(dict.fromkeys(affected_roots))
         return BackupRunResult(
             "backup",
             successes,
@@ -695,6 +1435,121 @@ class BackupWorker(QThread):
         )
 
     def _restore(self, repository: LibraryRepository, entries: list[BackupEntry]) -> BackupRunResult:
+        requested = tuple(str(value) for value in self._payload)
+        if len(requested) != len(set(requested)):
+            raise BackupError("恢复条目编号重复")
+        by_id = {entry.id: entry for entry in entries}
+        if any(entry_id not in by_id for entry_id in requested):
+            raise BackupError("所选备份条目不存在或已不可恢复")
+        selected_ids = set(requested)
+        selected_groups = {
+            by_id[entry_id].link_group_id
+            for entry_id in requested
+            if by_id[entry_id].link_group_id is not None
+        }
+        if not selected_groups:
+            return self._restore_legacy(repository, entries)
+        for entry in entries:
+            if entry.link_group_id in selected_groups:
+                selected_ids.add(entry.id)
+        ordered = [entry for entry in entries if entry.id in selected_ids]
+        units: list[list[BackupEntry]] = []
+        seen_groups: set[str] = set()
+        for entry in ordered:
+            if entry.link_group_id is None:
+                units.append([entry])
+            elif entry.link_group_id not in seen_groups:
+                seen_groups.add(entry.link_group_id)
+                group = [value for value in entries if value.link_group_id == entry.link_group_id]
+                group.sort(key=lambda value: 0 if value.kind == "audio" else 1)
+                if len(group) != 2 or {value.kind for value in group} != {"audio", "lyric"}:
+                    raise BackupError("关联备份组损坏，拒绝部分恢复")
+                units.append(group)
+        current = list(entries)
+        successes = failures = 0
+        messages: list[str] = []
+        history_items: list[BackupHistoryItem] = []
+        affected_roots: list[tuple[str, Path]] = []
+        cancelled = False
+        for unit_index, unit in enumerate(units):
+            if self._cancel.is_set():
+                cancelled = True
+                for pending in units[unit_index:]:
+                    for entry in pending:
+                        history_items.append(self._history_item(
+                            entry_id=entry.id, asset_id=entry.asset_id, kind=entry.kind,
+                            source_path=entry.backup_path, backup_path=entry.backup_path,
+                            restore_target=entry.original_path, result="cancelled",
+                            message="操作已取消，未开始恢复",
+                        ))
+                break
+            moved: list[BackupEntry] = []
+            try:
+                for entry in unit:
+                    self._validate_entry(repository, self._backup_root, entry)
+                    if entry.original_path.exists():
+                        raise BackupError(f"原路径已存在，禁止覆盖：{entry.original_path.name}")
+                    with _locked_directory_chain(self._backup_root, entry.backup_path.parent):
+                        if _verified_file_sha256(entry.backup_path) != entry.sha256:
+                            raise BackupError("备份文件 SHA-256 与清单不一致，拒绝恢复")
+                for entry in unit:
+                    result = import_one(
+                        entry.backup_path,
+                        source_root=entry.backup_path.parent,
+                        target_root=entry.original_path.parent,
+                    )
+                    if (
+                        result.status != "success"
+                        or result.sha256 != entry.sha256
+                        or _path_key(result.target_path) != _path_key(entry.original_path)
+                    ):
+                        raise BackupError("关联恢复落位结果与清单不一致")
+                    moved.append(entry)
+                candidate = [value for value in current if value not in unit]
+                self._save(repository, candidate)
+                current = candidate
+                for entry in unit:
+                    successes += 1
+                    if entry.allowed_root is not None:
+                        key = (entry.kind, entry.allowed_root)
+                        if key not in affected_roots:
+                            affected_roots.append(key)
+                    history_items.append(self._history_item(
+                        entry_id=entry.id, asset_id=entry.asset_id, kind=entry.kind,
+                        source_path=entry.backup_path, backup_path=entry.backup_path,
+                        restore_target=entry.original_path, result="success",
+                        message="已按关联组恢复到原路径",
+                    ))
+            except Exception as error:
+                rollback_errors: list[str] = []
+                for entry in reversed(moved):
+                    rollback = import_one(
+                        entry.original_path,
+                        source_root=entry.original_path.parent,
+                        target_root=entry.backup_path.parent,
+                    )
+                    if (
+                        rollback.status != "success"
+                        or _path_key(rollback.target_path) != _path_key(entry.backup_path)
+                    ):
+                        rollback_errors.append(rollback.message)
+                failures += len(unit)
+                message = str(error).strip() or error.__class__.__name__
+                if rollback_errors:
+                    message += "；关联组回滚失败：" + "；".join(rollback_errors)
+                messages.append(message)
+                for entry in unit:
+                    history_items.append(self._history_item(
+                        entry_id=entry.id, asset_id=entry.asset_id, kind=entry.kind,
+                        source_path=entry.backup_path, backup_path=entry.backup_path,
+                        restore_target=entry.original_path, result="failed", message=message,
+                    ))
+        return BackupRunResult(
+            "restore", successes, failures, tuple(messages), tuple(affected_roots),
+            "cancelled" if cancelled else "completed", None, tuple(history_items),
+        )
+
+    def _restore_legacy(self, repository: LibraryRepository, entries: list[BackupEntry]) -> BackupRunResult:
         wanted_order = tuple(str(value) for value in self._payload)
         wanted = set(wanted_order)
         if len(wanted) != len(wanted_order):
@@ -833,77 +1688,117 @@ class BackupWorker(QThread):
         successes = failures = 0
         messages: list[str] = []
         history_items: list[BackupHistoryItem] = []
-        eligible: list[BackupEntry] = []
+        eligible_ids: set[str] = set()
         for entry in entries:
             created = _aware_datetime(entry.created_at, label="备份清单创建时间")
             if entry.restored_at is None and created <= threshold:
-                eligible.append(entry)
+                eligible_ids.add(entry.id)
+        units: list[list[BackupEntry]] = []
+        seen_groups: set[str] = set()
+        for entry in entries:
+            if entry.link_group_id is None:
+                if entry.id in eligible_ids:
+                    units.append([entry])
+                continue
+            if entry.link_group_id in seen_groups:
+                continue
+            seen_groups.add(entry.link_group_id)
+            group = [
+                member for member in entries
+                if member.link_group_id == entry.link_group_id
+            ]
+            group.sort(key=lambda member: 0 if member.kind == "audio" else 1)
+            if all(member.id in eligible_ids for member in group):
+                units.append(group)
         cancelled = False
-        for position, entry in enumerate(eligible):
+        for position, unit in enumerate(units):
             if self._cancel.is_set():
                 cancelled = True
-                for pending in eligible[position:]:
-                    history_items.append(
-                        self._history_item(
-                            entry_id=pending.id,
-                            asset_id=pending.asset_id,
-                            kind=pending.kind,
-                            source_path=pending.backup_path,
-                            backup_path=pending.backup_path,
-                            restore_target=None,
-                            result="cancelled",
-                            message="操作已取消，未开始永久清理",
+                for pending_unit in units[position:]:
+                    for pending in pending_unit:
+                        history_items.append(
+                            self._history_item(
+                                entry_id=pending.id,
+                                asset_id=pending.asset_id,
+                                kind=pending.kind,
+                                source_path=pending.backup_path,
+                                backup_path=pending.backup_path,
+                                restore_target=None,
+                                result="cancelled",
+                                message="操作已取消，未开始永久清理",
+                            )
                         )
-                    )
                 break
+            tombstones = {
+                entry.id: entry.backup_path.parent
+                / f".{entry.backup_path.name}.{uuid4().hex}.cleanup"
+                for entry in unit
+            }
+            journal = {
+                "version": 2,
+                "state": "planned",
+                "members": [
+                    {
+                        "entry": _entry_to_json(entry),
+                        "tombstone_path": str(tombstones[entry.id]),
+                    }
+                    for entry in unit
+                ],
+                "deleted_entry_ids": [],
+            }
+            renamed: list[BackupEntry] = []
+            relation_id = (
+                unit[0].lyrics_match_id
+                if len(unit) == 2 and unit[0].link_group_id is not None
+                else None
+            )
             try:
-                self._validate_entry(repository, self._backup_root, entry)
-                tombstone = entry.backup_path.parent / f".{entry.backup_path.name}.{uuid4().hex}.cleanup"
-                with _locked_directory_chain(self._backup_root, entry.backup_path.parent):
-                    if _verified_file_sha256(entry.backup_path) != entry.sha256:
-                        raise BackupError("备份文件 SHA-256 与清单不一致，拒绝清理")
-                    os.rename(entry.backup_path, tombstone)
-                    candidate = [value for value in current if value.id != entry.id]
-                    try:
-                        self._save(repository, candidate)
-                    except Exception:
-                        os.rename(tombstone, entry.backup_path)
-                        raise
-                    try:
-                        os.unlink(tombstone)
-                    except Exception as unlink_error:
-                        os.rename(tombstone, entry.backup_path)
-                        try:
-                            self._save(repository, current)
-                        except Exception as manifest_error:
-                            raise BackupError(
-                                f"清理失败且清单恢复失败：{manifest_error}"
-                            ) from unlink_error
-                        raise
-                    current = candidate
-                try:
-                    entry.backup_path.parent.rmdir()
-                except OSError:
-                    pass
-                successes += 1
-                history_items.append(
-                    self._history_item(
-                        entry_id=entry.id,
-                        asset_id=entry.asset_id,
-                        kind=entry.kind,
-                        source_path=entry.backup_path,
-                        backup_path=entry.backup_path,
-                        restore_target=None,
-                        result="success",
-                        message="已永久清理备份文件",
+                for entry in unit:
+                    self._validate_entry(repository, self._backup_root, entry)
+                    with _locked_directory_chain(
+                        self._backup_root,
+                        entry.backup_path.parent,
+                    ):
+                        if _verified_file_sha256(entry.backup_path) != entry.sha256:
+                            raise BackupError("备份文件 SHA-256 与清单不一致，拒绝清理")
+                repository.set_setting(PENDING_CLEANUP_KEY, journal)
+                for entry in unit:
+                    os.rename(entry.backup_path, tombstones[entry.id])
+                    renamed.append(entry)
+                journal["state"] = "tombstoned"
+                if relation_id is not None:
+                    audio = next(entry for entry in unit if entry.kind == "audio")
+                    lyric = next(entry for entry in unit if entry.kind == "lyric")
+                    repository.cancel_external_lyrics_match_with_journal(
+                        match_id=relation_id,
+                        audio_asset_id=audio.asset_id,
+                        lyric_asset_id=lyric.asset_id,
+                        journal_key=PENDING_CLEANUP_KEY,
+                        journal=journal,
                     )
-                )
+                else:
+                    repository.set_setting(PENDING_CLEANUP_KEY, journal)
             except Exception as error:
-                failures += 1
-                message = f"{entry.backup_path.name}：{error}"
+                for entry in reversed(renamed):
+                    tombstone = tombstones[entry.id]
+                    if tombstone.exists() and not entry.backup_path.exists():
+                        os.rename(tombstone, entry.backup_path)
+                try:
+                    if relation_id is not None:
+                        repository.finalize_external_lyrics_cleanup(
+                            match_id=relation_id,
+                            journal_key=PENDING_CLEANUP_KEY,
+                            restore_relation=True,
+                        )
+                    else:
+                        repository.set_setting(PENDING_CLEANUP_KEY, [])
+                except Exception as compensation_error:
+                    error = BackupError(f"{error}；清理前补偿失败：{compensation_error}")
+                failures += len(unit)
+                message = str(error).strip() or error.__class__.__name__
                 messages.append(message)
-                history_items.append(
-                    self._history_item(
+                for entry in unit:
+                    history_items.append(self._history_item(
                         entry_id=entry.id,
                         asset_id=entry.asset_id,
                         kind=entry.kind,
@@ -911,9 +1806,111 @@ class BackupWorker(QThread):
                         backup_path=entry.backup_path,
                         restore_target=None,
                         result="failed",
-                        message=str(error).strip() or error.__class__.__name__,
+                        message=message,
+                    ))
+                continue
+
+            deleted: list[BackupEntry] = []
+            unlink_error: Exception | None = None
+            for entry in unit:
+                try:
+                    os.unlink(tombstones[entry.id])
+                    deleted.append(entry)
+                except Exception as error:
+                    unlink_error = error
+                    break
+            remaining = [entry for entry in unit if entry not in deleted]
+            for entry in remaining:
+                tombstone = tombstones[entry.id]
+                if tombstone.exists() and not entry.backup_path.exists():
+                    os.rename(tombstone, entry.backup_path)
+            if not deleted:
+                candidate = list(current)
+            else:
+                candidate = [entry for entry in current if entry not in unit]
+                candidate.extend(
+                    replace(
+                        entry,
+                        linked_entry_id=None,
+                        link_group_id=None,
+                        lyrics_match_id=None,
+                        linked_audio_asset_id=None,
                     )
+                    for entry in remaining
                 )
+            persistence_error: Exception | None = None
+            try:
+                self._validate_manifest_groups(candidate)
+                self._save(repository, candidate)
+                if relation_id is not None:
+                    repository.finalize_external_lyrics_cleanup(
+                        match_id=relation_id,
+                        journal_key=PENDING_CLEANUP_KEY,
+                        restore_relation=not deleted,
+                    )
+                else:
+                    repository.set_setting(PENDING_CLEANUP_KEY, [])
+                current = candidate
+            except Exception as error:
+                persistence_error = error
+
+            if unlink_error is None:
+                successes += len(unit)
+                for entry in unit:
+                    history_items.append(self._history_item(
+                        entry_id=entry.id,
+                        asset_id=entry.asset_id,
+                        kind=entry.kind,
+                        source_path=entry.backup_path,
+                        backup_path=entry.backup_path,
+                        restore_target=None,
+                        result="success",
+                        message=(
+                            "已永久清理备份文件"
+                            if persistence_error is None
+                            else f"文件已永久清理，恢复日志待下次核对：{persistence_error}"
+                        ),
+                    ))
+            elif deleted:
+                successes += len(deleted)
+                failures += len(remaining)
+                message = (
+                    f"关联组部分清理：已永久删除 {len(deleted)} 项，"
+                    f"仍可恢复 {len(remaining)} 项；{unlink_error}"
+                )
+                if persistence_error is not None:
+                    message += f"；恢复日志待下次核对：{persistence_error}"
+                messages.append(message)
+                for entry in deleted:
+                    history_items.append(self._history_item(
+                        entry_id=entry.id, asset_id=entry.asset_id, kind=entry.kind,
+                        source_path=entry.backup_path, backup_path=entry.backup_path,
+                        restore_target=None, result="success",
+                        message="已永久清理；关联关系保持取消",
+                    ))
+                for entry in remaining:
+                    history_items.append(self._history_item(
+                        entry_id=entry.id, asset_id=entry.asset_id, kind=entry.kind,
+                        source_path=entry.backup_path, backup_path=entry.backup_path,
+                        restore_target=None, result="failed", message=message,
+                    ))
+            else:
+                failures += len(unit)
+                message = f"永久清理未删除任何文件，关联组已补偿：{unlink_error}"
+                if persistence_error is not None:
+                    message += f"；补偿日志待下次核对：{persistence_error}"
+                messages.append(message)
+                for entry in unit:
+                    history_items.append(self._history_item(
+                        entry_id=entry.id, asset_id=entry.asset_id, kind=entry.kind,
+                        source_path=entry.backup_path, backup_path=entry.backup_path,
+                        restore_target=None, result="failed", message=message,
+                    ))
+            for entry in deleted:
+                try:
+                    entry.backup_path.parent.rmdir()
+                except OSError:
+                    pass
         return BackupRunResult(
             "cleanup",
             successes,

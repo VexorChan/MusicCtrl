@@ -142,6 +142,98 @@ class LyricsRepositoryTests(unittest.TestCase):
         with self.assertRaises(RecordNotFoundError):
             self.repository.cancel_current_lyrics_match(audio.id)
 
+    def test_authoritative_external_query_reference_and_reinstate(self) -> None:
+        audio = self._asset("linked.mp3", kind="audio")
+        lyric = self._asset("linked.lrc", kind="lyric")
+        match = self.repository.commit_lyrics_match(
+            audio_asset_id=audio.id,
+            lyric_asset_id=lyric.id,
+            source_kind="external",
+            confidence=100,
+            method="automatic",
+        )
+        self.assertEqual(
+            self.repository.current_external_lyrics_for_audio_ids((audio.id,)),
+            (match,),
+        )
+        self.assertEqual(
+            self.repository.current_audio_ids_for_external_lyric(lyric.id),
+            (audio.id,),
+        )
+        self.repository.cancel_current_lyrics_match(audio.id)
+        restored = self.repository.reinstate_lyrics_match(match.id)
+        self.assertTrue(restored.is_current)
+        self.assertEqual(restored.state, "matched")
+        self.assertEqual(self.repository.list_lyrics_matches(current_only=True), (restored,))
+
+    def test_cleanup_journal_and_relation_cancel_are_atomic_and_recoverable(self) -> None:
+        audio = self._asset("journal.mp3", kind="audio")
+        lyric = self._asset("journal.lrc", kind="lyric")
+        match = self.repository.commit_lyrics_match(
+            audio_asset_id=audio.id,
+            lyric_asset_id=lyric.id,
+            source_kind="external",
+            confidence=100,
+            method="automatic",
+        )
+        cancelled = self.repository.cancel_external_lyrics_match_with_journal(
+            match_id=match.id,
+            audio_asset_id=audio.id,
+            lyric_asset_id=lyric.id,
+            journal_key="test.cleanup",
+            journal={"state": "tombstoned", "members": [{"id": "fixture"}]},
+        )
+        setting = self.repository.get_setting("test.cleanup")
+        self.assertEqual((cancelled.state, cancelled.is_current), ("cancelled", False))
+        self.assertEqual(setting.value["relation"]["id"], match.id)
+        self.assertEqual(setting.value["relation"]["audio_asset_id"], audio.id)
+        restored = self.repository.finalize_external_lyrics_cleanup(
+            match_id=match.id,
+            journal_key="test.cleanup",
+            restore_relation=True,
+        )
+        self.assertEqual((restored.state, restored.is_current), ("matched", True))
+        self.assertEqual(self.repository.get_setting("test.cleanup").value, [])
+        # 重启恢复重复执行必须幂等，不能再次改变关系。
+        restored_again = self.repository.finalize_external_lyrics_cleanup(
+            match_id=match.id,
+            journal_key="test.cleanup",
+            restore_relation=True,
+        )
+        self.assertEqual(restored_again.id, match.id)
+
+    def test_cleanup_cancel_failure_rolls_back_journal_in_same_transaction(self) -> None:
+        audio = self._asset("atomic-journal.mp3", kind="audio")
+        lyric = self._asset("atomic-journal.lrc", kind="lyric")
+        match = self.repository.commit_lyrics_match(
+            audio_asset_id=audio.id,
+            lyric_asset_id=lyric.id,
+            source_kind="external",
+            confidence=100,
+            method="automatic",
+        )
+        self.repository._connection.execute(  # test-only deterministic SQL failure
+            """
+            CREATE TRIGGER fail_cleanup_cancel
+            BEFORE UPDATE ON lyrics_matches
+            WHEN NEW.state = 'cancelled'
+            BEGIN
+                SELECT RAISE(ABORT, 'injected cleanup cancel failure');
+            END
+            """
+        )
+        with self.assertRaisesRegex(Exception, "injected cleanup cancel failure"):
+            self.repository.cancel_external_lyrics_match_with_journal(
+                match_id=match.id,
+                audio_asset_id=audio.id,
+                lyric_asset_id=lyric.id,
+                journal_key="test.cleanup.atomic",
+                journal={"state": "tombstoned"},
+            )
+        self.assertIsNone(self.repository.get_setting("test.cleanup.atomic"))
+        current = self.repository.list_lyrics_matches(current_only=True)
+        self.assertEqual((current[0].id, current[0].state), (match.id, "matched"))
+
     def test_replacement_insert_failure_rolls_back_current_history_change(self) -> None:
         audio = self._asset("atomic.mp3", kind="audio")
         first = self._asset("atomic-first.lrc", kind="lyric")

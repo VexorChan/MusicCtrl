@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QCheckBox, QLabel, QVBoxLayout, QWidget
 
 from dialogs.common import PrototypeDialog, footer_buttons
 
@@ -50,6 +50,11 @@ class DeleteConfirmDialog(PrototypeDialog):
         )
         warning.setObjectName("Hint")
         root.addWidget(warning)
+        self.backup_linked_lyrics = QCheckBox("同时备份当前匹配的外部 LRC")
+        self.backup_linked_lyrics.setChecked(False)
+        self.backup_linked_lyrics.setVisible(live_mode)
+        self.backup_linked_lyrics.setToolTip("仅处理当前外部 LRC；内嵌歌词不会作为文件处理")
+        root.addWidget(self.backup_linked_lyrics)
         root.addStretch(1)
         footer, _primary = footer_buttons(
             self, "移入备份" if live_mode else "删除", danger=True

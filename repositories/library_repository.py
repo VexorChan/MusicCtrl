@@ -1145,11 +1145,14 @@ class LibraryRepository:
         ).fetchall()
         return tuple(self._asset_from_row(row) for row in rows)
 
-    def latest_completed_audio_roots(
+    def _latest_completed_roots(
         self,
         asset_ids: Iterable[str],
+        *,
+        kind: str,
+        mode: str,
     ) -> dict[str, Path]:
-        """Return each audio asset's latest trustworthy completed scan root.
+        """Return each asset's latest trustworthy completed scan root.
 
         The provenance is reconstructed from the existing scan history.  This
         method deliberately performs no writes and does not fall back to an
@@ -1179,7 +1182,7 @@ class LibraryRepository:
         ).fetchall()
         normalized_to_ids: dict[str, list[str]] = {}
         for row in asset_rows:
-            if row["kind"] != "audio":
+            if row["kind"] != kind:
                 continue
             try:
                 _, normalized_path = _canonicalize_path(
@@ -1205,11 +1208,12 @@ class LibraryRepository:
                 ss.completed_at
             FROM scan_items AS si
             JOIN scan_sessions AS ss ON ss.id = si.session_id
-            WHERE ss.mode = 'audio'
+            WHERE ss.mode = ?
               AND ss.status = 'completed'
               AND si.status = 'indexed'
             ORDER BY ss.completed_at DESC, ss.started_at DESC, ss.id DESC
-            """
+            """,
+            (mode,),
         ).fetchall()
 
         roots: dict[str, Path] = {}
@@ -1240,6 +1244,18 @@ class LibraryRepository:
             for asset_id in matching_ids:
                 roots.setdefault(asset_id, source_root)
         return roots
+
+    def latest_completed_audio_roots(
+        self,
+        asset_ids: Iterable[str],
+    ) -> dict[str, Path]:
+        return self._latest_completed_roots(asset_ids, kind="audio", mode="audio")
+
+    def latest_completed_lyric_roots(
+        self,
+        asset_ids: Iterable[str],
+    ) -> dict[str, Path]:
+        return self._latest_completed_roots(asset_ids, kind="lyric", mode="lyric")
 
     @staticmethod
     def _lyrics_match_from_row(row: sqlite3.Row) -> LyricsMatchRecord:
@@ -1282,6 +1298,244 @@ class LibraryRepository:
             tuple(parameters),
         ).fetchall()
         return tuple(self._lyrics_match_from_row(row) for row in rows)
+
+    def current_external_lyrics_for_audio_ids(
+        self,
+        audio_asset_ids: Iterable[str],
+    ) -> tuple[LyricsMatchRecord, ...]:
+        """Return authoritative current external relations for selected audio."""
+
+        self._require_open_in_owner_thread()
+        requested: list[str] = []
+        seen: set[str] = set()
+        for asset_id in audio_asset_ids:
+            if not isinstance(asset_id, str) or not asset_id.strip():
+                raise RepositoryDataError("audio_asset_id 必须是非空字符串")
+            if asset_id not in seen:
+                seen.add(asset_id)
+                requested.append(asset_id)
+        if not requested:
+            return ()
+        placeholders = ", ".join("?" for _ in requested)
+        rows = self._connection.execute(
+            f"""
+            SELECT * FROM lyrics_matches
+            WHERE is_current = 1
+              AND state = 'matched'
+              AND source_kind = 'external'
+              AND audio_asset_id IN ({placeholders})
+            ORDER BY audio_asset_id, created_at, id
+            """,
+            tuple(requested),
+        ).fetchall()
+        return tuple(self._lyrics_match_from_row(row) for row in rows)
+
+    def current_audio_ids_for_external_lyric(self, lyric_asset_id: str) -> tuple[str, ...]:
+        self._require_open_in_owner_thread()
+        if not isinstance(lyric_asset_id, str) or not lyric_asset_id.strip():
+            raise RepositoryDataError("lyric_asset_id 必须是非空字符串")
+        rows = self._connection.execute(
+            """
+            SELECT audio_asset_id FROM lyrics_matches
+            WHERE lyric_asset_id = ? AND source_kind = 'external'
+              AND state = 'matched' AND is_current = 1
+            ORDER BY audio_asset_id
+            """,
+            (lyric_asset_id,),
+        ).fetchall()
+        return tuple(row["audio_asset_id"] for row in rows)
+
+    def reinstate_lyrics_match(self, match_id: str) -> LyricsMatchRecord:
+        """Restore one cancelled historical relation after both files recover."""
+
+        self._require_open_in_owner_thread()
+        if not isinstance(match_id, str) or not match_id.strip():
+            raise RepositoryDataError("match_id 不能为空")
+        with self._transaction():
+            self._reinstate_external_lyrics_match(match_id)
+        restored = self._connection.execute(
+            "SELECT * FROM lyrics_matches WHERE id = ?",
+            (match_id,),
+        ).fetchone()
+        return self._lyrics_match_from_row(restored)
+
+    def _reinstate_external_lyrics_match(self, match_id: str) -> sqlite3.Row:
+        row = self._connection.execute(
+            "SELECT * FROM lyrics_matches WHERE id = ?",
+            (match_id,),
+        ).fetchone()
+        if row is None:
+            raise RecordNotFoundError(f"歌词匹配历史不存在：{match_id}")
+        if row["source_kind"] != "external" or row["lyric_asset_id"] is None:
+            raise RepositoryDataError("只允许恢复外部歌词关系")
+        if row["is_current"] or row["state"] != "cancelled":
+            raise RepositoryDataError("歌词关系不是可恢复的已取消状态")
+        audio = self._connection.execute(
+            "SELECT kind, file_state FROM assets WHERE id = ?",
+            (row["audio_asset_id"],),
+        ).fetchone()
+        lyric = self._connection.execute(
+            "SELECT kind, file_state FROM assets WHERE id = ?",
+            (row["lyric_asset_id"],),
+        ).fetchone()
+        if (
+            audio is None or audio["kind"] != "audio" or audio["file_state"] != "active"
+            or lyric is None or lyric["kind"] != "lyric" or lyric["file_state"] != "active"
+        ):
+            raise RepositoryDataError("音频或歌词资产不是 active，不能恢复关系")
+        conflict = self._connection.execute(
+            """
+            SELECT 1 FROM lyrics_matches
+            WHERE is_current = 1 AND state = 'matched'
+              AND id != ? AND (audio_asset_id = ? OR lyric_asset_id = ?)
+            """,
+            (match_id, row["audio_asset_id"], row["lyric_asset_id"]),
+        ).fetchone()
+        if conflict is not None:
+            raise RepositoryDataError("音频或歌词已有当前匹配，不能恢复旧关系")
+        self._connection.execute(
+            """
+            UPDATE lyrics_matches
+            SET state = 'matched', is_current = 1, updated_at = ?
+            WHERE id = ? AND state = 'cancelled' AND is_current = 0
+            """,
+            (_utc_now(), match_id),
+        )
+        return row
+
+    @staticmethod
+    def _encode_setting_value(value: object) -> str:
+        try:
+            return json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        except (TypeError, ValueError) as exc:
+            raise RepositoryDataError(
+                "设置值必须兼容标准 JSON，且不能包含 NaN 或 Infinity"
+            ) from exc
+
+    def cancel_external_lyrics_match_with_journal(
+        self,
+        *,
+        match_id: str,
+        audio_asset_id: str,
+        lyric_asset_id: str,
+        journal_key: str,
+        journal: dict[str, object],
+    ) -> LyricsMatchRecord:
+        """Atomically persist an exact relation snapshot and cancel that relation."""
+
+        self._require_open_in_owner_thread()
+        if any(
+            not isinstance(value, str) or not value.strip()
+            for value in (match_id, audio_asset_id, lyric_asset_id, journal_key)
+        ) or not isinstance(journal, dict):
+            raise RepositoryDataError("歌词清理日志参数无效")
+        now = _utc_now()
+        with self._transaction():
+            row = self._connection.execute(
+                """
+                SELECT * FROM lyrics_matches
+                WHERE id = ? AND audio_asset_id = ? AND lyric_asset_id = ?
+                  AND source_kind = 'external' AND state = 'matched' AND is_current = 1
+                """,
+                (match_id, audio_asset_id, lyric_asset_id),
+            ).fetchone()
+            if row is None:
+                raise RepositoryDataError("当前外部歌词关系与清理快照不一致")
+            persisted = dict(journal)
+            persisted["relation"] = {
+                "id": row["id"],
+                "audio_asset_id": row["audio_asset_id"],
+                "lyric_asset_id": row["lyric_asset_id"],
+                "source_kind": row["source_kind"],
+                "confidence": int(row["confidence"]),
+                "method": row["method"],
+                "state": row["state"],
+                "is_current": bool(row["is_current"]),
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+            encoded = self._encode_setting_value(persisted)
+            self._connection.execute(
+                """
+                INSERT INTO settings(key, value_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value_json = excluded.value_json,
+                    updated_at = excluded.updated_at
+                """,
+                (journal_key, encoded, now),
+            )
+            cursor = self._connection.execute(
+                """
+                UPDATE lyrics_matches
+                SET state = 'cancelled', is_current = 0, updated_at = ?
+                WHERE id = ? AND audio_asset_id = ? AND lyric_asset_id = ?
+                  AND source_kind = 'external' AND state = 'matched' AND is_current = 1
+                """,
+                (now, match_id, audio_asset_id, lyric_asset_id),
+            )
+            if cursor.rowcount != 1:
+                raise RepositoryDataError("当前外部歌词关系取消失败")
+        result = self._connection.execute(
+            "SELECT * FROM lyrics_matches WHERE id = ?",
+            (match_id,),
+        ).fetchone()
+        return self._lyrics_match_from_row(result)
+
+    def finalize_external_lyrics_cleanup(
+        self,
+        *,
+        match_id: str,
+        journal_key: str,
+        restore_relation: bool,
+    ) -> LyricsMatchRecord:
+        """Atomically keep/restore the exact relation and clear its recovery journal."""
+
+        self._require_open_in_owner_thread()
+        if (
+            not isinstance(match_id, str)
+            or not match_id.strip()
+            or not isinstance(journal_key, str)
+            or not journal_key.strip()
+            or not isinstance(restore_relation, bool)
+        ):
+            raise RepositoryDataError("歌词清理收尾参数无效")
+        with self._transaction():
+            row = self._connection.execute(
+                "SELECT * FROM lyrics_matches WHERE id = ?",
+                (match_id,),
+            ).fetchone()
+            if row is None or row["source_kind"] != "external":
+                raise RepositoryDataError("歌词清理关系快照不存在或类型错误")
+            if restore_relation:
+                if row["state"] == "cancelled" and not row["is_current"]:
+                    self._reinstate_external_lyrics_match(match_id)
+                elif row["state"] != "matched" or not row["is_current"]:
+                    raise RepositoryDataError("歌词关系不是可恢复或已恢复状态")
+            elif row["state"] != "cancelled" or row["is_current"]:
+                raise RepositoryDataError("永久删除后歌词关系必须保持已取消")
+            encoded = self._encode_setting_value([])
+            self._connection.execute(
+                """
+                INSERT INTO settings(key, value_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value_json = excluded.value_json,
+                    updated_at = excluded.updated_at
+                """,
+                (journal_key, encoded, _utc_now()),
+            )
+        result = self._connection.execute(
+            "SELECT * FROM lyrics_matches WHERE id = ?",
+            (match_id,),
+        ).fetchone()
+        return self._lyrics_match_from_row(result)
 
     def commit_lyrics_match(
         self,
@@ -1411,16 +1665,7 @@ class LibraryRepository:
         self._require_open_in_owner_thread()
         if not isinstance(key, str) or not key.strip():
             raise RepositoryDataError("设置 key 必须是非空字符串")
-        try:
-            value_json = json.dumps(
-                value,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            )
-        except (TypeError, ValueError) as exc:
-            raise RepositoryDataError("设置值必须兼容标准 JSON，且不能包含 NaN 或 Infinity") from exc
+        value_json = self._encode_setting_value(value)
 
         updated_at = _utc_now()
         with self._transaction():

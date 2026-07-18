@@ -1477,13 +1477,30 @@ class MainWindow(QMainWindow):
                 page.status.setText(f"无法从歌单移除：{error}")
         elif self._backup_controller is not None and page.kind in {"music", "lyrics"}:
             try:
-                items = tuple(self._backup_input(record, page.kind) for record in records)
+                include_linked_lyrics = bool(
+                    page.kind == "music"
+                    and isinstance(dialog, DeleteConfirmDialog)
+                    and dialog.backup_linked_lyrics.isChecked()
+                )
+                items = tuple(
+                    self._backup_input(
+                        record,
+                        page.kind,
+                        include_linked_lyrics=include_linked_lyrics,
+                    )
+                    for record in records
+                )
                 self._backup_controller.start_backup(items)
             except Exception as error:
                 page.status.setText(f"无法备份删除：{error}")
 
     @staticmethod
-    def _backup_input(record: dict[str, object], kind: str) -> BackupInput:
+    def _backup_input(
+        record: dict[str, object],
+        kind: str,
+        *,
+        include_linked_lyrics: bool = False,
+    ) -> BackupInput:
         allowed_root = record.get("_allowed_root")
         path = record.get("_canonical_path")
         asset_id = record.get("_asset_id")
@@ -1491,7 +1508,17 @@ class MainWindow(QMainWindow):
             raise ValueError("所选记录缺少可验证的扫描来源，请重新扫描")
         if record.get("_file_state", "active") != "active":
             raise ValueError("只允许备份删除 active 文件")
-        return BackupInput(asset_id, path, allowed_root, "audio" if kind == "music" else "lyric")
+        size_bytes = record.get("_size_bytes")
+        mtime_ns = record.get("_mtime_ns")
+        return BackupInput(
+            asset_id,
+            path,
+            allowed_root,
+            "audio" if kind == "music" else "lyric",
+            include_linked_lyrics,
+            size_bytes if isinstance(size_bytes, int) and not isinstance(size_bytes, bool) else None,
+            mtime_ns if isinstance(mtime_ns, int) and not isinstance(mtime_ns, bool) else None,
+        )
 
     def _backup_completed(self, result: object) -> None:
         action = getattr(result, "action", "backup")
