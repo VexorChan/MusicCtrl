@@ -5,14 +5,18 @@ from tempfile import TemporaryDirectory
 import unittest
 import wave
 
-from PySide6.QtCore import QCoreApplication, QEventLoop, QTimer
+from PySide6.QtCore import QCoreApplication, QEventLoop, QTimer, Qt
 from PySide6.QtWidgets import QApplication
 
 from database import DatabaseConfig
 from dialogs.lyrics_match_dialog import LyricsMatchDialog
 from main import build_app
 from repositories import IndexBatchItem, LibraryRepository
-from services.lyrics_match_controller import LyricsMatchController
+from services.lyrics_match_controller import (
+    LyricsMatchController,
+    LyricsReviewItem,
+    LyricsScanResult,
+)
 from ui.main_window import MainWindow
 
 
@@ -105,6 +109,50 @@ class P4IntegrationTests(unittest.TestCase):
             self.assertNotIn("import sqlite3", text)
             self.assertNotIn("from repositories", text)
             self.assertNotIn("from database", text)
+
+    def test_live_tabs_use_extended_selection_union_checked_and_match_guard(self) -> None:
+        dialog = LyricsMatchDialog(live_mode=True)
+        self.addCleanup(dialog.close)
+        lyric = self.lyrics_root / "candidate.lrc"
+        common = {
+            "audio_label": "歌曲.wav",
+            "lyric_asset_id": "lyric-1",
+            "lyric_path": lyric,
+            "source_kind": "external",
+            "confidence": 80,
+            "requires_confirmation": True,
+            "message": "需确认",
+        }
+        items = (
+            LyricsReviewItem("t1", "a1", status="未匹配", **common),
+            LyricsReviewItem(
+                "t2", "a2", status="冲突",
+                **{**common, "lyric_asset_id": "lyric-2"},
+            ),
+            LyricsReviewItem(
+                "t3", "a3", status="已忽略", ignored=True,
+                requires_confirmation=False,
+                **{key: value for key, value in common.items() if key != "requires_confirmation"},
+            ),
+        )
+        dialog.show_results(LyricsScanResult(self.lyrics_root, 1, 0, items))
+
+        self.assertEqual(dialog.unmatched_results.selectionMode().name, "ExtendedSelection")
+        self.assertEqual(dialog.conflict_results.selectionMode().name, "ExtendedSelection")
+        self.assertEqual((dialog.unmatched_results.rowCount(), dialog.conflict_results.rowCount()), (1, 2))
+        dialog.unmatched_results.selectRow(0)
+        dialog.conflict_results.item(0, 0).setCheckState(Qt.CheckState.Checked)
+        emitted: list[tuple[str, ...]] = []
+        dialog.candidates_requested.connect(emitted.append)
+        dialog._use_selected()
+        self.assertEqual(emitted, [("t1", "t2")])
+
+        dialog.unmatched_results.clearSelection()
+        dialog.conflict_results.clearSelection()
+        dialog.conflict_results.item(0, 0).setCheckState(Qt.CheckState.Unchecked)
+        dialog.unmatched_results.selectRow(0)
+        dialog._update_live_actions()
+        self.assertFalse(dialog.cancel_match_button.isEnabled())
 
 
 if __name__ == "__main__":

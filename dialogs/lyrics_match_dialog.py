@@ -27,6 +27,9 @@ from ui.components import make_status_badge
 class LyricsMatchDialog(PrototypeDialog):
     scan_requested = Signal(object)
     candidate_requested = Signal(str)
+    candidates_requested = Signal(object)
+    ignore_requested = Signal(object)
+    unignore_requested = Signal(object)
     cancel_match_requested = Signal(str)
     cancel_scan_requested = Signal()
 
@@ -95,33 +98,51 @@ class LyricsMatchDialog(PrototypeDialog):
         self.summary.setWordWrap(True)
         root.addWidget(self.summary)
 
-        self.results = QTableWidget(0, 5)
-        self.results.setHorizontalHeaderLabels(["音频", "歌词候选", "置信度", "状态", "说明"])
-        self.results.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.results.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
-        self.results.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.results.horizontalHeader().setStretchLastSection(True)
-        self.results.setColumnWidth(0, 220)
-        self.results.setColumnWidth(1, 240)
-        self.results.setColumnWidth(2, 80)
-        self.results.setColumnWidth(3, 120)
-        self.results.currentCellChanged.connect(lambda *_args: self._update_live_actions())
-        root.addWidget(self.results, 1)
+        self.result_tabs = QTabWidget()
+        self.unmatched_results = self._live_results_table()
+        self.conflict_results = self._live_results_table()
+        self._tables = (self.unmatched_results, self.conflict_results)
+        self.results = self.unmatched_results  # 兼容既有只读集成探针
+        self.result_tabs.addTab(self.unmatched_results, "未匹配  0")
+        self.result_tabs.addTab(self.conflict_results, "重复与冲突  0")
+        root.addWidget(self.result_tabs, 1)
 
         actions = QHBoxLayout()
-        self.use_button = QPushButton("确认使用所选歌词")
+        self.use_button = QPushButton("批量确认所选歌词")
         self.use_button.setObjectName("PrimaryButton")
         self.use_button.clicked.connect(self._use_selected)
         self.cancel_match_button = QPushButton("取消当前匹配")
         self.cancel_match_button.clicked.connect(self._cancel_selected_match)
+        self.ignore_button = QPushButton("标记忽略")
+        self.ignore_button.clicked.connect(self._ignore_selected)
+        self.unignore_button = QPushButton("取消忽略")
+        self.unignore_button.clicked.connect(self._unignore_selected)
         actions.addWidget(self.use_button)
         actions.addWidget(self.cancel_match_button)
+        actions.addWidget(self.ignore_button)
+        actions.addWidget(self.unignore_button)
         actions.addStretch(1)
         self.close_button = QPushButton("关闭")
         self.close_button.clicked.connect(self.close)
         actions.addWidget(self.close_button)
         root.addLayout(actions)
         self._update_live_actions()
+
+    def _live_results_table(self) -> QTableWidget:
+        table = QTableWidget(0, 6)
+        table.setHorizontalHeaderLabels(["选择", "音频", "歌词候选", "置信度", "状态", "说明"])
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.horizontalHeader().setStretchLastSection(True)
+        table.setColumnWidth(0, 54)
+        table.setColumnWidth(1, 200)
+        table.setColumnWidth(2, 220)
+        table.setColumnWidth(3, 72)
+        table.setColumnWidth(4, 110)
+        table.itemSelectionChanged.connect(self._update_live_actions)
+        table.itemChanged.connect(lambda _item: self._update_live_actions())
+        return table
 
     def _browse_root(self) -> None:
         selected = QFileDialog.getExistingDirectory(self, "选择 LRC 歌词目录", self.path_input.text())
@@ -147,7 +168,8 @@ class LyricsMatchDialog(PrototypeDialog):
         self.start_button.setEnabled(not running)
         self.start_button.setText("正在扫描…" if running else "开始扫描并匹配")
         if running:
-            self.results.setRowCount(0)
+            for table in self._tables:
+                table.setRowCount(0)
             self.summary.setText("正在后台扫描、索引并匹配；关闭窗口会安全取消。")
         self._update_live_actions()
         if not running and self._close_pending:
@@ -158,12 +180,27 @@ class LyricsMatchDialog(PrototypeDialog):
         if not self.live_mode:
             return
         items = tuple(getattr(result, "items", ()))
-        self.results.setRowCount(len(items))
+        unmatched = tuple(item for item in items if getattr(item, "status", "") not in {"冲突", "已忽略"})
+        conflicts = tuple(item for item in items if getattr(item, "status", "") in {"冲突", "已忽略"})
+        self._populate_live_table(self.unmatched_results, unmatched)
+        self._populate_live_table(self.conflict_results, conflicts)
+        self.result_tabs.setTabText(0, f"未匹配  {len(unmatched)}")
+        self.result_tabs.setTabText(1, f"重复与冲突  {len(conflicts)}")
+        self.summary.setText(
+            f"已索引 {getattr(result, 'indexed_count', 0)} 个 LRC，"
+            f"自动匹配 {getattr(result, 'automatic_count', 0)} 项；其余请人工确认。"
+        )
+        self._update_live_actions()
+
+    def _populate_live_table(self, table: QTableWidget, items: tuple[object, ...]) -> None:
+        table.blockSignals(True)
+        table.setRowCount(len(items))
         for row, item in enumerate(items):
             candidate = "内嵌歌词" if getattr(item, "source_kind", "") == "embedded" else (
                 "—" if getattr(item, "lyric_path", None) is None else Path(item.lyric_path).name
             )
             values = (
+                "",
                 getattr(item, "audio_label", ""),
                 candidate,
                 f"{getattr(item, 'confidence', 0)}%",
@@ -179,44 +216,97 @@ class LyricsMatchDialog(PrototypeDialog):
                     Qt.ItemDataRole.UserRole + 3,
                     bool(getattr(item, "requires_confirmation", False)),
                 )
-                self.results.setItem(row, column, cell)
-        self.summary.setText(
-            f"已索引 {getattr(result, 'indexed_count', 0)} 个 LRC，"
-            f"自动匹配 {getattr(result, 'automatic_count', 0)} 项；其余请人工确认。"
-        )
-        if items:
-            self.results.selectRow(0)
-        self._update_live_actions()
+                cell.setData(
+                    Qt.ItemDataRole.UserRole + 4,
+                    bool(getattr(item, "has_current_match", False)),
+                )
+                cell.setData(Qt.ItemDataRole.UserRole + 5, bool(getattr(item, "ignored", False)))
+                if column == 0:
+                    cell.setFlags(cell.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                    cell.setCheckState(Qt.CheckState.Unchecked)
+                    cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                table.setItem(row, column, cell)
+        table.blockSignals(False)
 
     def show_warning(self, message: str) -> None:
         if self.live_mode:
             self.summary.setText(message)
 
+    def _selected_cells(self) -> tuple[QTableWidgetItem, ...]:
+        if not self.live_mode:
+            return ()
+        cells: list[QTableWidgetItem] = []
+        seen: set[tuple[int, int]] = set()
+        for table_index, table in enumerate(self._tables):
+            rows = {index.row() for index in table.selectionModel().selectedRows()}
+            rows.update(
+                row for row in range(table.rowCount())
+                if table.item(row, 0).checkState() == Qt.CheckState.Checked
+            )
+            for row in sorted(rows):
+                key = (table_index, row)
+                if key not in seen:
+                    seen.add(key)
+                    cells.append(table.item(row, 0))
+        return tuple(cells)
+
     def _selected_cell(self) -> QTableWidgetItem | None:
-        row = self.results.currentRow() if self.live_mode else -1
-        return None if row < 0 else self.results.item(row, 0)
+        cells = self._selected_cells()
+        return cells[0] if len(cells) == 1 else None
 
     def _update_live_actions(self) -> None:
         if not self.live_mode:
             return
-        cell = self._selected_cell()
-        has_manual_candidate = bool(
-            cell
-            and cell.data(Qt.ItemDataRole.UserRole + 2)
+        cells = self._selected_cells()
+        manual = tuple(
+            cell for cell in cells
+            if cell.data(Qt.ItemDataRole.UserRole + 2)
             and cell.data(Qt.ItemDataRole.UserRole + 3)
+            and not cell.data(Qt.ItemDataRole.UserRole + 5)
         )
-        self.use_button.setEnabled(not self._running and has_manual_candidate)
-        self.cancel_match_button.setEnabled(not self._running and cell is not None)
+        self.use_button.setEnabled(not self._running and bool(manual) and len(manual) == len(cells))
+        self.cancel_match_button.setEnabled(
+            not self._running
+            and len(cells) == 1
+            and bool(cells[0].data(Qt.ItemDataRole.UserRole + 4))
+        )
+        self.ignore_button.setEnabled(
+            not self._running and bool(cells)
+            and any(not cell.data(Qt.ItemDataRole.UserRole + 5) for cell in cells)
+        )
+        self.unignore_button.setEnabled(
+            not self._running and bool(cells)
+            and all(cell.data(Qt.ItemDataRole.UserRole + 5) for cell in cells)
+        )
 
     def _use_selected(self) -> None:
-        cell = self._selected_cell()
-        if cell is not None:
-            self.candidate_requested.emit(str(cell.data(Qt.ItemDataRole.UserRole)))
+        cells = self._selected_cells()
+        tokens = tuple(str(cell.data(Qt.ItemDataRole.UserRole)) for cell in cells)
+        if tokens:
+            self.candidates_requested.emit(tokens)
+            if len(tokens) == 1:
+                self.candidate_requested.emit(tokens[0])
 
     def _cancel_selected_match(self) -> None:
         cell = self._selected_cell()
         if cell is not None:
             self.cancel_match_requested.emit(str(cell.data(Qt.ItemDataRole.UserRole + 1)))
+
+    def _selected_audio_ids(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(
+            str(cell.data(Qt.ItemDataRole.UserRole + 1))
+            for cell in self._selected_cells()
+        ))
+
+    def _ignore_selected(self) -> None:
+        audio_ids = self._selected_audio_ids()
+        if audio_ids:
+            self.ignore_requested.emit(audio_ids)
+
+    def _unignore_selected(self) -> None:
+        audio_ids = self._selected_audio_ids()
+        if audio_ids:
+            self.unignore_requested.emit(audio_ids)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self.live_mode and self._running:

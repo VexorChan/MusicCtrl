@@ -854,6 +854,10 @@ class MainWindow(QMainWindow):
         else:
             self._lyrics_context_scope_active = True
         if self._lyrics_dialog is not None:
+            snapshot_loader = getattr(self._lyrics_match_controller, "review_snapshot", None)
+            snapshot = snapshot_loader() if callable(snapshot_loader) else None
+            if snapshot is not None:
+                self._lyrics_dialog.show_results(snapshot)
             if scope is not None:
                 self._lyrics_dialog.show_warning(
                     f"已限定 {len(scope) if isinstance(scope, tuple) else 0} 首音乐；请选择歌词目录并点击开始。"
@@ -869,13 +873,19 @@ class MainWindow(QMainWindow):
         dialog.destroyed.connect(lambda: setattr(self, "_lyrics_dialog", None))
         dialog.destroyed.connect(self._clear_lyrics_context_scope)
         dialog.scan_requested.connect(self._start_lyrics_scan)
-        dialog.candidate_requested.connect(self._commit_lyrics_candidate)
+        dialog.candidates_requested.connect(self._commit_lyrics_candidates)
+        dialog.ignore_requested.connect(self._ignore_lyrics_assets)
+        dialog.unignore_requested.connect(self._unignore_lyrics_assets)
         dialog.cancel_match_requested.connect(self._cancel_lyrics_match)
         dialog.cancel_scan_requested.connect(self._lyrics_match_controller.request_cancel)
         remembered = self._lyrics_match_controller.remembered_root()
         if remembered is not None:
             dialog.path_input.setText(str(remembered))
         dialog.set_running(self._lyrics_match_controller.running)
+        snapshot_loader = getattr(self._lyrics_match_controller, "review_snapshot", None)
+        snapshot = snapshot_loader() if callable(snapshot_loader) else None
+        if snapshot is not None:
+            dialog.show_results(snapshot)
         if scope is not None:
             dialog.show_warning(
                 f"已限定 {len(scope) if isinstance(scope, tuple) else 0} 首音乐；请选择歌词目录并点击开始。"
@@ -912,7 +922,9 @@ class MainWindow(QMainWindow):
 
     def _lyrics_cancelled(self, count: int) -> None:
         if self._lyrics_dialog is not None:
-            self._lyrics_dialog.show_warning(f"歌词扫描已取消；已安全提交 {count} 个索引。")
+            self._lyrics_dialog.show_warning(
+                f"歌词任务已取消；已完成 {count} 项匹配关系处理，未开始的项目未执行。"
+            )
 
     def _lyrics_failed(self, message: str) -> None:
         if self._lyrics_dialog is not None:
@@ -928,12 +940,35 @@ class MainWindow(QMainWindow):
         self._background_running_changed(running)
 
     def _commit_lyrics_candidate(self, token: str) -> None:
+        self._commit_lyrics_candidates((token,))
+
+    def _commit_lyrics_candidates(self, tokens: object) -> None:
+        if self._lyrics_match_controller is None or self._lyrics_dialog is None:
+            return
+        frozen = tuple(tokens) if isinstance(tokens, tuple) else ()
+        if self._has_running_background_task():
+            self._lyrics_dialog.show_warning("已有后台任务运行，请完成后再提交歌词匹配。")
+            return
+        try:
+            self._lyrics_match_controller.commit_candidates(frozen)
+        except Exception as error:
+            self._lyrics_dialog.show_warning(f"无法保存歌词匹配：{error}")
+
+    def _ignore_lyrics_assets(self, audio_asset_ids: object) -> None:
         if self._lyrics_match_controller is None or self._lyrics_dialog is None:
             return
         try:
-            self._lyrics_match_controller.commit_candidate(token)
+            self._lyrics_match_controller.ignore_audio_assets(tuple(audio_asset_ids))
         except Exception as error:
-            self._lyrics_dialog.show_warning(f"无法保存歌词匹配：{error}")
+            self._lyrics_dialog.show_warning(f"无法忽略所选音乐：{error}")
+
+    def _unignore_lyrics_assets(self, audio_asset_ids: object) -> None:
+        if self._lyrics_match_controller is None or self._lyrics_dialog is None:
+            return
+        try:
+            self._lyrics_match_controller.unignore_audio_assets(tuple(audio_asset_ids))
+        except Exception as error:
+            self._lyrics_dialog.show_warning(f"无法取消忽略：{error}")
 
     def _cancel_lyrics_match(self, audio_asset_id: str) -> None:
         if self._lyrics_match_controller is None or self._lyrics_dialog is None:
