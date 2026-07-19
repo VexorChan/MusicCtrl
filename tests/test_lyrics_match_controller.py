@@ -14,14 +14,17 @@ from database import DatabaseConfig
 from main import build_app
 from mutagen.id3 import USLT
 from mutagen.wave import WAVE
-from repositories import IndexBatchItem, LibraryRepository
+from repositories import AssetUpsert, IndexBatchItem, LibraryRepository
+from services.backup_manager import BackupController
 from services.lyrics_match_controller import (
     IGNORED_AUDIO_ASSET_IDS_KEY,
+    LAST_SUCCESSFUL_LYRICS_ROOT_KEY,
     LyricsBatchCommitWorker,
     LyricsIgnoreWorker,
     LyricsMatchController,
     LyricsMatchWorker,
 )
+from ui.main_window import MainWindow
 
 
 class LyricsMatchControllerTests(unittest.TestCase):
@@ -138,6 +141,88 @@ class LyricsMatchControllerTests(unittest.TestCase):
         self.assertEqual(len(matches), 1)
         self.assertEqual(matches[0].audio_asset_id, audio_id)
         self.assertEqual(matches[0].lyric_asset_id, lyrics[0].id)
+
+    def test_library_uses_each_lyrics_asset_completed_root_and_old_root_can_backup(self) -> None:
+        root_a = self.root / "lyrics-a"
+        root_b = self.root / "lyrics-b"
+        orphan_root = self.root / "lyrics-orphan"
+        for root in (root_a, root_b, orphan_root):
+            root.mkdir()
+        path_a = root_a / "歌曲甲-歌手甲.lrc"
+        path_b = root_b / "歌曲乙-歌手乙.lrc"
+        orphan_path = orphan_root / "无来源-歌手丙.lrc"
+        for path in (path_a, path_b, orphan_path):
+            path.write_text("[00:01.00]test", encoding="utf-8")
+
+        with LibraryRepository(self.config) as repository:
+            for scan_root, path in ((root_a, path_a), (root_b, path_b)):
+                metadata = path.stat()
+                session = repository.create_scan_session(
+                    mode="lyric",
+                    source_folder=scan_root,
+                )
+                repository.index_scan_batch(
+                    session.id,
+                    (
+                        IndexBatchItem(
+                            path,
+                            metadata.st_size,
+                            metadata.st_mtime_ns,
+                            kind="lyric",
+                        ),
+                    ),
+                )
+                repository.finish_scan_session(session.id, status="completed")
+            orphan_metadata = orphan_path.stat()
+            repository.upsert_asset(
+                AssetUpsert(
+                    orphan_path,
+                    orphan_metadata.st_size,
+                    orphan_metadata.st_mtime_ns,
+                    kind="lyric",
+                )
+            )
+            repository.set_setting(
+                LAST_SUCCESSFUL_LYRICS_ROOT_KEY,
+                str(root_b),
+            )
+
+        controller = LyricsMatchController(self.config)
+        records = {
+            record["_canonical_path"].name: record
+            for record in controller.load_lyrics_library()
+        }
+        self.assertEqual(records[path_a.name]["_allowed_root"], root_a)
+        self.assertEqual(records[path_b.name]["_allowed_root"], root_b)
+        self.assertIsNone(records[orphan_path.name]["_allowed_root"])
+
+        backup_input = MainWindow._backup_input(records[path_a.name], "lyrics")
+        self.assertEqual(backup_input.allowed_root, root_a)
+        backup = BackupController(
+            backup_root=self.root / "backups",
+            repository_factory=lambda: LibraryRepository(self.config),
+        )
+        observed: dict[str, list[object]] = {"completed": [], "failed": []}
+        backup.completed.connect(observed["completed"].append)
+        backup.failed.connect(observed["failed"].append)
+        loop = QEventLoop()
+        backup.running_changed.connect(
+            lambda running: loop.quit() if not running else None
+        )
+        timeout = QTimer()
+        timeout.setSingleShot(True)
+        timeout.timeout.connect(loop.quit)
+        backup.start_backup((backup_input,))
+        timeout.start(5000)
+        loop.exec()
+        timeout.stop()
+
+        self.assertFalse(backup.running)
+        self.assertEqual(observed["failed"], [])
+        self.assertEqual(len(observed["completed"]), 1)
+        self.assertEqual(observed["completed"][0].success_count, 1)
+        self.assertFalse(path_a.exists())
+        self.assertEqual(len(backup.list_entries()), 1)
 
     def test_low_confidence_is_not_auto_committed_and_manual_token_can_commit(self) -> None:
         audio_id = self.seed_audio("晴天-周杰伦.wav")
