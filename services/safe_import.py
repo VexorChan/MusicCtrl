@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
+import json
 import os
 from pathlib import Path
 import stat
@@ -16,16 +17,26 @@ from uuid import uuid4
 
 from PySide6.QtCore import QObject, QThread, Signal
 
+from database import DatabaseConfig
 from services.file_safety import _is_reparse, _locked_directory_chain, _within_root
-from repositories import LibraryRepository
+from repositories import LibraryRepository, RepositoryCommitOutcomeUnknown
 
 
 SUPPORTED_AUDIO = {".mp3", ".flac", ".wav", ".m4a", ".ogg", ".aac"}
 _CANDIDATE_PREFIX = ".musicctrl-import-"
 IMPORT_HISTORY_KEY = "p6.import_history"
+PENDING_IMPORT_KEY = "p6.pending_import"
+_JOURNAL_VERSION = 1
+_JOURNAL_STATES = {
+    "planned", "candidate_ready", "target_placed", "source_deleted", "done"
+}
 
 
 class SafeImportError(RuntimeError):
+    pass
+
+
+class _JournalPersistenceError(SafeImportError):
     pass
 
 
@@ -88,8 +99,9 @@ def _validate_mode(mode: object) -> str:
 
 
 def _result_to_history(result: ImportRunResult) -> dict[str, object]:
+    batch_id = result.plan_id or str(uuid4())
     return {
-        "id": str(uuid4()),
+        "id": batch_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "mode": _validate_mode(result.mode),
         "source_root": str(result.source_root),
@@ -115,6 +127,162 @@ def _result_to_history(result: ImportRunResult) -> dict[str, object]:
             for item in result.items
         ],
     }
+
+
+def _candidate_path(target_root: Path, batch_id: str, index: int) -> Path:
+    return target_root / f"{_CANDIDATE_PREFIX}{batch_id}-{index}.tmp"
+
+
+def _journal_for_plan(plan: ImportPreviewPlan) -> dict[str, object]:
+    if not isinstance(plan.id, str) or not plan.id:
+        raise SafeImportError("导入批次编号无效")
+    _validate_roots(plan.source_root, plan.target_root)
+    seen_source: set[str] = set()
+    seen_target: set[str] = set()
+    items: list[dict[str, object]] = []
+    for index, item in enumerate(plan.items):
+        source_key = _path_key(item.source_path)
+        target_key = _path_key(item.target_path)
+        if (
+            not item.source_path.is_absolute()
+            or not item.target_path.is_absolute()
+            or not _within_root(item.source_path, plan.source_root)
+            or not _within_root(item.target_path, plan.target_root)
+            or source_key in seen_source
+            or target_key in seen_target
+            or (
+                item.status != "failed"
+                and len(item.expected_sha256) != 64
+            )
+        ):
+            raise SafeImportError("导入计划包含越界、重复或损坏项目")
+        seen_source.add(source_key)
+        seen_target.add(target_key)
+        state = "planned" if item.status == "ready" else "done"
+        items.append({
+            "source_path": str(item.source_path),
+            "target_path": str(item.target_path),
+            "candidate_path": str(_candidate_path(plan.target_root, plan.id, index)),
+            "preview_status": item.status,
+            "state": state,
+            "sha256": item.expected_sha256 or None,
+            "size_bytes": item.expected_size_bytes if item.expected_size_bytes >= 0 else None,
+            "mtime_ns": item.expected_mtime_ns if item.expected_mtime_ns >= 0 else None,
+            "message": item.message,
+        })
+    return {
+        "version": _JOURNAL_VERSION,
+        "batch_id": plan.id,
+        "mode": _validate_mode(plan.mode),
+        "source_root": str(plan.source_root),
+        "target_root": str(plan.target_root),
+        "created_at": plan.created_at,
+        "items": items,
+    }
+
+
+def _validate_journal(value: object) -> dict[str, object]:
+    if not isinstance(value, dict) or value.get("version") != _JOURNAL_VERSION:
+        raise SafeImportError("待恢复导入日志版本或格式损坏")
+    batch_id = value.get("batch_id")
+    raw_items = value.get("items")
+    source_root = Path(str(value.get("source_root", "")))
+    target_root = Path(str(value.get("target_root", "")))
+    _validate_mode(value.get("mode"))
+    if (
+        not isinstance(batch_id, str)
+        or not batch_id
+        or not isinstance(raw_items, list)
+        or not source_root.is_absolute()
+        or not target_root.is_absolute()
+    ):
+        raise SafeImportError("待恢复导入日志字段损坏")
+    _validate_roots(source_root, target_root)
+    seen_source: set[str] = set()
+    seen_target: set[str] = set()
+    seen_candidate: set[str] = set()
+    for index, item in enumerate(raw_items):
+        if not isinstance(item, dict) or item.get("state") not in _JOURNAL_STATES:
+            raise SafeImportError("待恢复导入项目状态损坏")
+        source = Path(str(item.get("source_path", "")))
+        target = Path(str(item.get("target_path", "")))
+        candidate = Path(str(item.get("candidate_path", "")))
+        digest = item.get("sha256")
+        size = item.get("size_bytes")
+        mtime_ns = item.get("mtime_ns")
+        preview_status = item.get("preview_status")
+        if (
+            not source.is_absolute()
+            or not target.is_absolute()
+            or not candidate.is_absolute()
+            or not _within_root(source, source_root)
+            or not _within_root(target, target_root)
+            or not _within_root(candidate, target_root)
+            or _path_key(target) != _path_key(target_root / source.name)
+            or _path_key(target.parent) != _path_key(target_root)
+            or _path_key(candidate.parent) != _path_key(target_root)
+            or _path_key(candidate) != _path_key(_candidate_path(target_root, batch_id, index))
+            or preview_status not in {"ready", "duplicate", "conflict", "failed"}
+            or (preview_status != "ready" and item.get("state") != "done")
+            or (
+                preview_status != "failed"
+                and (
+                    not isinstance(digest, str)
+                    or len(digest) != 64
+                    or any(character not in "0123456789abcdefABCDEF" for character in digest)
+                    or not isinstance(size, int)
+                    or isinstance(size, bool)
+                    or size < 0
+                    or not isinstance(mtime_ns, int)
+                    or isinstance(mtime_ns, bool)
+                    or mtime_ns < 0
+                )
+            )
+            or (
+                preview_status == "failed"
+                and (digest is not None or size is not None or mtime_ns is not None)
+            )
+        ):
+            raise SafeImportError("待恢复导入项目路径或校验值损坏")
+        keys = (_path_key(source), _path_key(target), _path_key(candidate))
+        if keys[0] in seen_source or keys[1] in seen_target or keys[2] in seen_candidate:
+            raise SafeImportError("待恢复导入日志包含重复路径")
+        seen_source.add(keys[0])
+        seen_target.add(keys[1])
+        seen_candidate.add(keys[2])
+    return dict(value)
+
+
+def _finalize_with_readback(
+    repository: LibraryRepository,
+    repository_factory,
+    *,
+    batch_id: str,
+    entry: dict[str, object],
+) -> None:
+    try:
+        repository.finalize_import_journal(
+            pending_key=PENDING_IMPORT_KEY,
+            history_key=IMPORT_HISTORY_KEY,
+            batch_id=batch_id,
+            history_entry=entry,
+        )
+    except RepositoryCommitOutcomeUnknown:
+        with repository_factory() as readback:
+            pending, matching = readback.read_import_finalize_state(
+                pending_key=PENDING_IMPORT_KEY,
+                history_key=IMPORT_HISTORY_KEY,
+                batch_id=batch_id,
+            )
+        if pending is None and _canonical_json(matching) == _canonical_json(entry):
+            return
+        raise
+
+
+def _canonical_json(value: object) -> str:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
 
 
 def _load_history(repository: LibraryRepository) -> list[dict[str, object]]:
@@ -362,6 +530,8 @@ def import_one(
     expected_sha256: str | None = None,
     expected_identity: tuple[int, int, int, int] | None = None,
     expected_target_absent: bool = False,
+    candidate_path: Path | None = None,
+    stage_callback=None,
 ) -> ImportItemResult:
     _validate_roots(source_root, target_root)
     if not isinstance(source, Path) or not source.is_absolute() or not _within_root(source, source_root):
@@ -395,14 +565,26 @@ def import_one(
                 if target_hash == source_hash and target_identity[2] == identity[2]:
                     return ImportItemResult(source, target, "duplicate", "目标已有相同内容，已保留源文件", source_hash)
                 return ImportItemResult(source, target, "conflict", "同名目标内容不同，禁止覆盖", source_hash)
-            handle = tempfile.NamedTemporaryFile(
-                mode="wb",
-                prefix=_CANDIDATE_PREFIX,
-                suffix=".tmp",
-                dir=target_root,
-                delete=False,
-            )
-            candidate = Path(handle.name)
+            if candidate_path is None:
+                handle = tempfile.NamedTemporaryFile(
+                    mode="wb",
+                    prefix=_CANDIDATE_PREFIX,
+                    suffix=".tmp",
+                    dir=target_root,
+                    delete=False,
+                )
+                candidate = Path(handle.name)
+            else:
+                if (
+                    not candidate_path.is_absolute()
+                    or not _within_root(candidate_path, target_root)
+                    or candidate_path.parent != target_root
+                    or not candidate_path.name.startswith(_CANDIDATE_PREFIX)
+                    or os.path.lexists(candidate_path)
+                ):
+                    raise SafeImportError("导入候选路径无效或已存在")
+                candidate = candidate_path
+                handle = candidate.open("xb")
             with handle, source.open("rb") as source_handle:
                 while True:
                     if cancel_event is not None and cancel_event.is_set():
@@ -419,10 +601,18 @@ def import_one(
                 candidate, cancel_event=cancel_event
             ) != source_hash:
                 raise SafeImportError("目标临时文件大小或 SHA-256 校验失败")
+            if stage_callback is not None:
+                stage_callback("candidate_ready")
             if target.exists():
                 raise SafeImportError("目标在导入期间出现，禁止覆盖")
             os.rename(candidate, target)
             candidate = None
+            if stage_callback is not None:
+                try:
+                    stage_callback("target_placed")
+                except Exception:
+                    os.unlink(target)
+                    raise
             try:
                 target_hash = _sha256(target, cancel_event=cancel_event)
             except InterruptedError:
@@ -447,6 +637,9 @@ def import_one(
                         f"源文件删除失败且目标副本回滚失败，需要人工处理：{rollback_error}"
                     ) from error
                 raise SafeImportError("源文件删除失败，已移除目标副本") from error
+            if stage_callback is not None:
+                stage_callback("source_deleted")
+                stage_callback("done")
         return ImportItemResult(source, target, "success", "大小和 SHA-256 校验通过，已安全移动", source_hash)
     finally:
         if candidate is not None and candidate.exists():
@@ -523,9 +716,10 @@ class SafeImportWorker(QThread):
     cancelled = Signal(object)
     failed = Signal(object)
 
-    def __init__(self, *, plan: ImportPreviewPlan, parent=None) -> None:
+    def __init__(self, *, plan: ImportPreviewPlan, repository_factory, parent=None) -> None:
         super().__init__(parent)
         self._plan = plan
+        self._repository_factory = repository_factory
         self._cancel = threading.Event()
 
     def request_cancel(self) -> None:
@@ -533,8 +727,17 @@ class SafeImportWorker(QThread):
 
     def run(self) -> None:
         results: list[ImportItemResult] = []
+        repository: LibraryRepository | None = None
         try:
             _validate_roots(self._plan.source_root, self._plan.target_root)
+            journal = _journal_for_plan(self._plan)
+            repository = self._repository_factory()
+            # The complete plan is durable before the first candidate, rename, or unlink.
+            repository.create_import_journal(
+                pending_key=PENDING_IMPORT_KEY,
+                batch_id=self._plan.id,
+                journal=journal,
+            )
             for index, item in enumerate(self._plan.items):
                 if item.status != "ready":
                     results.append(ImportItemResult(
@@ -544,9 +747,24 @@ class SafeImportWorker(QThread):
                     continue
                 if self._cancel.is_set():
                     self._append_unstarted(results, index, "cancelled", "用户取消，未执行")
-                    self.cancelled.emit(self._result(results, "cancelled", "用户取消导入"))
+                    cancelled = self._result(results, "cancelled", "用户取消导入")
+                    self._finalize(repository, cancelled)
+                    self.cancelled.emit(cancelled)
                     return
                 try:
+                    def advance(state: str, *, item_index: int = index) -> None:
+                        raw_items = journal["items"]
+                        assert isinstance(raw_items, list)
+                        current = raw_items[item_index]
+                        assert isinstance(current, dict)
+                        current["state"] = state
+                        try:
+                            repository.set_setting(PENDING_IMPORT_KEY, journal)
+                        except Exception as error:
+                            raise _JournalPersistenceError(
+                                f"导入恢复日志推进失败：{error}"
+                            ) from error
+
                     result = import_one(
                         item.source_path,
                         source_root=self._plan.source_root,
@@ -558,23 +776,62 @@ class SafeImportWorker(QThread):
                             item.expected_size_bytes, item.expected_mtime_ns,
                         ),
                         expected_target_absent=True,
+                        candidate_path=_candidate_path(
+                            self._plan.target_root, self._plan.id, index
+                        ),
+                        stage_callback=advance,
                     )
                 except InterruptedError:
                     self._append_unstarted(results, index, "cancelled", "用户取消，未执行")
-                    self.cancelled.emit(self._result(results, "cancelled", "用户取消导入"))
+                    cancelled = self._result(results, "cancelled", "用户取消导入")
+                    self._finalize(repository, cancelled)
+                    self.cancelled.emit(cancelled)
                     return
+                except _JournalPersistenceError:
+                    raise
                 except Exception as error:
+                    raw_items = journal["items"]
+                    assert isinstance(raw_items, list)
+                    current = raw_items[index]
+                    assert isinstance(current, dict)
+                    candidate = _candidate_path(self._plan.target_root, self._plan.id, index)
+                    target = self._plan.target_root / item.source_path.name
+                    if (
+                        current.get("state") != "planned"
+                        or os.path.lexists(candidate)
+                    ):
+                        raise _JournalPersistenceError(
+                            f"导入中断且磁盘可能存在待恢复状态：{error}"
+                        ) from error
                     result = ImportItemResult(
                         item.source_path, item.target_path, "failed",
                         str(error).strip() or error.__class__.__name__, item.expected_sha256,
                     )
                 results.append(result)
-            self.completed.emit(self._result(results, "completed", ""))
+            final = self._result(results, "completed", "")
+            self._finalize(repository, final)
+            self.completed.emit(final)
         except Exception as error:
             self._append_unstarted(results, len(results), "failed", "执行未完成")
-            self.failed.emit(self._result(
+            failed = self._result(
                 results, "failed", str(error).strip() or error.__class__.__name__
-            ))
+            )
+            self.failed.emit(failed)
+        finally:
+            if repository is not None:
+                try:
+                    repository.close()
+                except Exception:
+                    pass
+
+    def _finalize(self, repository: LibraryRepository, result: ImportRunResult) -> None:
+        entry = _result_to_history(result)
+        _finalize_with_readback(
+            repository,
+            self._repository_factory,
+            batch_id=self._plan.id,
+            entry=entry,
+        )
 
     def _append_unstarted(
         self, results: list[ImportItemResult], start_index: int, status: str, message: str
@@ -604,6 +861,384 @@ class SafeImportWorker(QThread):
             terminal_message=message,
             plan_id=self._plan.id,
         )
+
+
+class SafeImportRecoveryWorker(QThread):
+    """Reconcile one durable import journal without ever deleting a source file."""
+
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, *, repository_factory, parent=None) -> None:
+        super().__init__(parent)
+        self._repository_factory = repository_factory
+        self._cancel = threading.Event()
+
+    def request_cancel(self) -> None:
+        self._cancel.set()
+
+    @staticmethod
+    def _inspect(
+        path: Path,
+        root: Path,
+        digest: str,
+        size: int,
+        cancel_event: threading.Event,
+    ) -> tuple[bool, tuple[int, int, int, int] | None]:
+        if not os.path.lexists(path):
+            return False, None
+        if os.name != "nt":
+            return False, None
+        try:
+            import ctypes
+            from ctypes import wintypes
+            import msvcrt
+
+            with _locked_directory_chain(root, path.parent):
+                metadata = os.lstat(path)
+                if stat.S_ISLNK(metadata.st_mode) or _is_reparse(metadata):
+                    return False, None
+                identity = (
+                    int(metadata.st_dev), int(metadata.st_ino),
+                    int(metadata.st_size), int(metadata.st_mtime_ns),
+                )
+                if not stat.S_ISREG(metadata.st_mode):
+                    return False, None
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                create_file = kernel32.CreateFileW
+                create_file.argtypes = (
+                    wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                    wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
+                    wintypes.HANDLE,
+                )
+                create_file.restype = wintypes.HANDLE
+                close_handle = kernel32.CloseHandle
+                close_handle.argtypes = (wintypes.HANDLE,)
+                raw_handle = create_file(
+                    os.fspath(path),
+                    0x80000000,  # GENERIC_READ
+                    0x00000001,  # share read only: block writes/deletes/renames
+                    None,
+                    3,
+                    0x00200000 | 0x08000000,
+                    None,
+                )
+                invalid_handle = ctypes.c_void_p(-1).value
+                if raw_handle == invalid_handle:
+                    return False, None
+                fd = -1
+                try:
+                    fd = msvcrt.open_osfhandle(int(raw_handle), os.O_RDONLY | os.O_BINARY)
+                    raw_handle = invalid_handle
+                    with os.fdopen(fd, "rb", closefd=True) as handle:
+                        fd = -1
+                        opened = os.fstat(handle.fileno())
+                        opened_identity = (
+                            int(opened.st_dev), int(opened.st_ino),
+                            int(opened.st_size), int(opened.st_mtime_ns),
+                        )
+                        if opened_identity != identity:
+                            return False, None
+                        hasher = hashlib.sha256()
+                        while chunk := handle.read(1024 * 1024):
+                            if cancel_event.is_set():
+                                raise InterruptedError("用户取消导入恢复")
+                            hasher.update(chunk)
+                        after = os.fstat(handle.fileno())
+                        after_identity = (
+                            int(after.st_dev), int(after.st_ino),
+                            int(after.st_size), int(after.st_mtime_ns),
+                        )
+                        latest = os.lstat(path)
+                        latest_identity = (
+                            int(latest.st_dev), int(latest.st_ino),
+                            int(latest.st_size), int(latest.st_mtime_ns),
+                        )
+                        good = (
+                            after_identity == identity
+                            and latest_identity == identity
+                            and opened.st_size == size
+                            and hasher.hexdigest() == digest
+                        )
+                        return good, identity
+                finally:
+                    if fd >= 0:
+                        os.close(fd)
+                    if raw_handle != invalid_handle:
+                        close_handle(raw_handle)
+        except (OSError, SafeImportError):
+            return False, None
+
+    @staticmethod
+    def _remove_owned(
+        path: Path,
+        root: Path,
+        *,
+        expected_identity: tuple[int, int, int, int] | None,
+        expected_digest: str,
+        cancel_event: threading.Event,
+        allow_any_regular_content: bool = False,
+    ) -> None:
+        """Delete only the exact regular file inspected for this journal item."""
+
+        if os.name != "nt":
+            raise SafeImportError("当前平台不能证明候选文件删除身份，已停止自动恢复")
+        import ctypes
+        from ctypes import wintypes
+        import msvcrt
+
+        with _locked_directory_chain(root, path.parent):
+            if cancel_event.is_set():
+                raise InterruptedError("用户取消导入恢复")
+            metadata = os.lstat(path)
+            identity = (
+                int(metadata.st_dev), int(metadata.st_ino),
+                int(metadata.st_size), int(metadata.st_mtime_ns),
+            )
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or _is_reparse(metadata)
+                or identity != expected_identity
+            ):
+                raise SafeImportError("待清理文件身份已变化，已停止自动恢复")
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            create_file = kernel32.CreateFileW
+            create_file.argtypes = (
+                wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+            )
+            create_file.restype = wintypes.HANDLE
+            close_handle = kernel32.CloseHandle
+            close_handle.argtypes = (wintypes.HANDLE,)
+            set_info = kernel32.SetFileInformationByHandle
+            set_info.argtypes = (
+                wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD,
+            )
+            set_info.restype = wintypes.BOOL
+
+            class FileDispositionInfo(ctypes.Structure):
+                _fields_ = [("DeleteFile", wintypes.BOOL)]
+
+            raw_handle = create_file(
+                os.fspath(path),
+                0x80000000 | 0x00010000,  # GENERIC_READ | DELETE
+                0x00000001,  # share read only: block write/delete/rename swaps
+                None,
+                3,  # OPEN_EXISTING
+                0x00200000 | 0x08000000,  # OPEN_REPARSE_POINT | SEQUENTIAL_SCAN
+                None,
+            )
+            invalid_handle = ctypes.c_void_p(-1).value
+            if raw_handle == invalid_handle:
+                raise SafeImportError(
+                    f"无法锁定待清理候选文件（Windows 错误 {ctypes.get_last_error()}）"
+                )
+            fd = -1
+            try:
+                fd = msvcrt.open_osfhandle(int(raw_handle), os.O_RDONLY | os.O_BINARY)
+                raw_handle = invalid_handle  # descriptor now owns the native handle
+                with os.fdopen(fd, "rb", closefd=True) as handle:
+                    fd = -1
+                    handle_meta = os.fstat(handle.fileno())
+                    handle_identity = (
+                        int(handle_meta.st_dev), int(handle_meta.st_ino),
+                        int(handle_meta.st_size), int(handle_meta.st_mtime_ns),
+                    )
+                    if handle_identity != identity:
+                        raise SafeImportError("待清理文件在打开时发生变化，已停止自动恢复")
+                    if not allow_any_regular_content:
+                        digest = hashlib.sha256()
+                        while chunk := handle.read(1024 * 1024):
+                            if cancel_event.is_set():
+                                raise InterruptedError("用户取消导入恢复")
+                            digest.update(chunk)
+                        if digest.hexdigest() != expected_digest:
+                            raise SafeImportError("候选文件内容已变化，已停止自动恢复")
+                    latest = os.lstat(path)
+                    latest_identity = (
+                        int(latest.st_dev), int(latest.st_ino),
+                        int(latest.st_size), int(latest.st_mtime_ns),
+                    )
+                    if latest_identity != identity or cancel_event.is_set():
+                        raise SafeImportError("待清理路径已变化或恢复已取消")
+                    disposition = FileDispositionInfo(True)
+                    os_handle = wintypes.HANDLE(msvcrt.get_osfhandle(handle.fileno()))
+                    if not set_info(
+                        os_handle, 4, ctypes.byref(disposition), ctypes.sizeof(disposition)
+                    ):
+                        raise SafeImportError(
+                            f"候选文件安全删除失败（Windows 错误 {ctypes.get_last_error()}）"
+                        )
+            finally:
+                if fd >= 0:
+                    os.close(fd)
+                if raw_handle != invalid_handle:
+                    close_handle(raw_handle)
+
+    def run(self) -> None:
+        repository: LibraryRepository | None = None
+        try:
+            repository = self._repository_factory()
+            setting = repository.get_setting(PENDING_IMPORT_KEY)
+            if setting is None:
+                self.completed.emit(None)
+                return
+            journal = _validate_journal(setting.value)
+            batch_id = str(journal["batch_id"])
+            _, existing = repository.read_import_finalize_state(
+                pending_key=PENDING_IMPORT_KEY,
+                history_key=IMPORT_HISTORY_KEY,
+                batch_id=batch_id,
+            )
+            if existing is not None:
+                _finalize_with_readback(
+                    repository,
+                    self._repository_factory,
+                    batch_id=batch_id,
+                    entry=existing,
+                )
+                self.completed.emit(existing)
+                return
+            source_root = Path(str(journal["source_root"]))
+            target_root = Path(str(journal["target_root"]))
+            raw_items = journal["items"]
+            assert isinstance(raw_items, list)
+            results: list[ImportItemResult] = []
+            manual: list[str] = []
+            ready_success = 0
+            ready_total = 0
+            for raw in raw_items:
+                if self._cancel.is_set():
+                    raise InterruptedError("用户取消导入恢复，日志已保留")
+                assert isinstance(raw, dict)
+                source = Path(str(raw["source_path"]))
+                target = Path(str(raw["target_path"]))
+                candidate = Path(str(raw["candidate_path"]))
+                preview_status = str(raw["preview_status"])
+                if preview_status != "ready":
+                    results.append(ImportItemResult(
+                        source, target, preview_status, str(raw.get("message", "")),
+                        None if raw.get("sha256") is None else str(raw["sha256"]),
+                    ))
+                    continue
+                digest = str(raw["sha256"])
+                size = int(raw["size_bytes"])
+                ready_total += 1
+                state = str(raw["state"])
+                source_good, _ = self._inspect(
+                    source, source_root, digest, size, self._cancel
+                )
+                target_good, target_identity = self._inspect(
+                    target, target_root, digest, size, self._cancel
+                )
+                candidate_good, candidate_identity = self._inspect(
+                    candidate, target_root, digest, size, self._cancel
+                )
+                candidate_exists = os.path.lexists(candidate)
+                target_exists = os.path.lexists(target)
+                source_exists = os.path.lexists(source)
+                if (
+                    state in {"planned", "candidate_ready"}
+                    and source_good
+                    and candidate_exists
+                    and (state == "planned" or candidate_good)
+                    and not target_exists
+                ):
+                    self._remove_owned(
+                        candidate,
+                        target_root,
+                        expected_identity=candidate_identity,
+                        expected_digest=digest,
+                        cancel_event=self._cancel,
+                        allow_any_regular_content=(state == "planned" and not candidate_good),
+                    )
+                    results.append(ImportItemResult(
+                        source, target, "failed", "已删除未落位候选并保留源文件", digest
+                    ))
+                elif (
+                    state in {"candidate_ready", "target_placed"}
+                    and source_good
+                    and target_good
+                    and not candidate_exists
+                ):
+                    results.append(ImportItemResult(
+                        source, target, "failed",
+                        "源文件与目标副本均存在；为避免误删已全部保留", digest
+                    ))
+                elif (
+                    state in {"target_placed", "source_deleted", "done"}
+                    and (not source_exists)
+                    and target_good
+                    and not candidate_exists
+                ):
+                    ready_success += 1
+                    results.append(ImportItemResult(
+                        source, target, "success", "已确认源删除且目标校验通过", digest
+                    ))
+                elif (
+                    state == "planned"
+                    and source_good
+                    and not target_exists
+                    and not candidate_exists
+                ):
+                    results.append(ImportItemResult(
+                        source, target, "failed", "文件操作尚未开始，源文件保持不变", digest
+                    ))
+                elif (
+                    state in {"candidate_ready", "target_placed"}
+                    and source_good
+                    and not target_exists
+                    and not candidate_exists
+                ):
+                    results.append(ImportItemResult(
+                        source, target, "failed", "目标副本已回滚，源文件保持不变", digest
+                    ))
+                else:
+                    manual.append(source.name)
+                    results.append(ImportItemResult(
+                        source, target, "failed", "磁盘状态不明确，需要人工处理", digest
+                    ))
+            if manual:
+                self.failed.emit("导入恢复需要人工处理，日志已保留：" + "、".join(manual))
+                return
+            terminal = (
+                "completed"
+                if ready_total > 0
+                and ready_success == ready_total
+                and all(item.status in {"success", "duplicate", "conflict"} for item in results)
+                else "failed"
+            )
+            result = ImportRunResult(
+                source_root,
+                target_root,
+                tuple(results),
+                ready_success,
+                sum(item.status == "duplicate" for item in results),
+                sum(item.status == "conflict" for item in results),
+                sum(item.status == "failed" for item in results),
+                mode=str(journal["mode"]),
+                terminal_status=terminal,
+                terminal_message="" if terminal == "completed" else "导入已安全回滚或需要重新执行",
+                plan_id=batch_id,
+            )
+            entry = _result_to_history(result)
+            _finalize_with_readback(
+                repository,
+                self._repository_factory,
+                batch_id=batch_id,
+                entry=entry,
+            )
+            self.completed.emit(result)
+        except Exception as error:
+            self.failed.emit(str(error).strip() or error.__class__.__name__)
+        finally:
+            if repository is not None:
+                try:
+                    repository.close()
+                except Exception:
+                    pass
 
 
 class SafeImportUndoWorker(QThread):
@@ -804,8 +1439,23 @@ class SafeImportController(QObject):
 
     def __init__(self, repository_factory=None, parent: QObject | None = None) -> None:
         super().__init__(parent)
+        self._ephemeral_repository_dir = None
+        if repository_factory is None:
+            self._ephemeral_repository_dir = tempfile.TemporaryDirectory(
+                prefix="musicctrl-import-controller-"
+            )
+            config = DatabaseConfig(
+                Path(self._ephemeral_repository_dir.name) / "library.sqlite3"
+            )
+            repository_factory = lambda: LibraryRepository(config)
         self._repository_factory = repository_factory
-        self._worker: SafeImportPreviewWorker | SafeImportWorker | SafeImportUndoWorker | None = None
+        self._worker: (
+            SafeImportPreviewWorker
+            | SafeImportWorker
+            | SafeImportRecoveryWorker
+            | SafeImportUndoWorker
+            | None
+        ) = None
         self._terminal: tuple[str, object] | None = None
         self._current_plan: ImportPreviewPlan | None = None
         self._phase = "idle"
@@ -854,13 +1504,26 @@ class SafeImportController(QObject):
         if plan.ready_count <= 0:
             raise SafeImportError("预览中没有可执行项目")
         self._current_plan = None
-        worker = SafeImportWorker(plan=plan)
+        worker = SafeImportWorker(plan=plan, repository_factory=self._repository_factory)
         worker.completed.connect(lambda value: self._cache("completed", value))
         worker.cancelled.connect(lambda value: self._cache("cancelled", value))
         worker.failed.connect(lambda value: self._cache("failed", value))
         worker.finished.connect(self._finished)
         self._worker = worker
         self._phase = "execute"
+        self._terminal = None
+        self.running_changed.emit(True)
+        worker.start()
+
+    def start_recovery(self) -> None:
+        if self.running:
+            raise RuntimeError("已有安全导入任务正在运行")
+        worker = SafeImportRecoveryWorker(repository_factory=self._repository_factory)
+        worker.completed.connect(lambda value: self._cache("completed", value))
+        worker.failed.connect(lambda value: self._cache("failed", value))
+        worker.finished.connect(self._finished)
+        self._worker = worker
+        self._phase = "recovery"
         self._terminal = None
         self.running_changed.emit(True)
         worker.start()
@@ -906,22 +1569,8 @@ class SafeImportController(QObject):
             return
         kind, value = self._terminal or ("failed", "导入线程结束但没有终态")
         phase = self._phase
-        audit_warning: str | None = None
         if phase == "preview" and kind == "completed" and isinstance(value, ImportPreviewPlan):
             self._current_plan = value
-        if (
-            phase == "execute"
-            and isinstance(value, ImportRunResult)
-            and value.action == "import"
-            and self._repository_factory is not None
-        ):
-            try:
-                with self._repository_factory() as repository:
-                    history = _load_history(repository)
-                    history = (history + [_result_to_history(value)])[-200:]
-                    repository.set_setting(IMPORT_HISTORY_KEY, history)
-            except Exception as error:
-                audit_warning = f"文件操作已结束，但历史保存失败：{error}"
         self._worker = None
         self._terminal = None
         self._phase = "idle"
@@ -943,5 +1592,3 @@ class SafeImportController(QObject):
                 self.failed.emit(value.terminal_message or "安全导入失败")
             else:
                 self.failed.emit(str(value))
-        if audit_warning:
-            self.warning.emit(audit_warning)

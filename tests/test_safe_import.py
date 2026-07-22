@@ -15,6 +15,8 @@ from database import DatabaseConfig
 from repositories import LibraryRepository
 
 from services.safe_import import (
+    IMPORT_HISTORY_KEY,
+    PENDING_IMPORT_KEY,
     SafeImportError,
     SafeImportPreviewWorker,
     cleanup_stale_candidates,
@@ -22,6 +24,10 @@ from services.safe_import import (
     iter_import_files,
     import_one,
     SafeImportController,
+    _journal_for_plan,
+    _result_to_history,
+    ImportItemResult,
+    ImportRunResult,
 )
 
 
@@ -130,6 +136,311 @@ class SafeImportTests(unittest.TestCase):
         self.assertEqual(len(completed), 1)
         self.assertEqual(failed, [])
         self.assertEqual(completed[0].success_count, 1)
+
+    def test_planned_journal_write_failure_causes_zero_file_change(self) -> None:
+        source = self.source / "journal.mp3"
+        payload = b"journal-write-must-precede-files"
+        source.write_bytes(payload)
+
+        class FailingRepository:
+            def create_import_journal(inner_self, *, pending_key, batch_id, journal):
+                self.assertEqual(pending_key, PENDING_IMPORT_KEY)
+                self.assertEqual(batch_id, journal["batch_id"])
+                raise RuntimeError("journal unavailable")
+
+            def close(inner_self):
+                return None
+
+        controller = SafeImportController(lambda: FailingRepository())
+        failures: list[str] = []
+        controller.failed.connect(failures.append)
+        controller.start_preview(self.source, self.target, "audio")
+        self._wait_for_controller(controller)
+        plan = controller.current_plan
+        self.assertIsNotNone(plan)
+        controller.start_execute(plan.id)
+        self._wait_for_controller(controller)
+
+        self.assertTrue(failures)
+        self.assertEqual(source.read_bytes(), payload)
+        self.assertEqual(tuple(self.target.iterdir()), ())
+
+    def test_recovery_rolls_forward_target_only_then_real_undo_succeeds(self) -> None:
+        source = self.source / "recovery.mp3"
+        payload = b"verified target-only recovery"
+        source.write_bytes(payload)
+        config = DatabaseConfig(self.root / "recovery.sqlite3")
+        controller = SafeImportController(lambda: LibraryRepository(config))
+        controller.start_preview(self.source, self.target, "audio")
+        self._wait_for_controller(controller)
+        plan = controller.current_plan
+        self.assertIsNotNone(plan)
+        journal = _journal_for_plan(plan)
+        target = self.target / source.name
+        target.write_bytes(payload)
+        source.unlink()
+        journal["items"][0]["state"] = "source_deleted"
+        with LibraryRepository(config) as repository:
+            repository.set_setting(PENDING_IMPORT_KEY, journal)
+
+        controller.start_recovery()
+        self._wait_for_controller(controller)
+        history = controller.list_history()
+        self.assertEqual(len(history), 1)
+        self.assertTrue(history[0]["complete"])
+        with LibraryRepository(config) as repository:
+            self.assertIsNone(repository.get_setting(PENDING_IMPORT_KEY))
+
+        controller.undo_last_complete()
+        self._wait_for_controller(controller)
+        self.assertEqual(source.read_bytes(), payload)
+        self.assertFalse(target.exists())
+
+    def test_recovery_removes_owned_candidate_but_never_source(self) -> None:
+        source = self.source / "candidate.mp3"
+        payload = b"candidate"
+        source.write_bytes(payload)
+        config = DatabaseConfig(self.root / "candidate.sqlite3")
+        controller = SafeImportController(lambda: LibraryRepository(config))
+        controller.start_preview(self.source, self.target, "audio")
+        self._wait_for_controller(controller)
+        plan = controller.current_plan
+        journal = _journal_for_plan(plan)
+        candidate = Path(journal["items"][0]["candidate_path"])
+        candidate.write_bytes(payload)
+        journal["items"][0]["state"] = "candidate_ready"
+        with LibraryRepository(config) as repository:
+            repository.set_setting(PENDING_IMPORT_KEY, journal)
+
+        controller.start_recovery()
+        self._wait_for_controller(controller)
+        self.assertEqual(source.read_bytes(), payload)
+        self.assertFalse(candidate.exists())
+        self.assertFalse((self.target / source.name).exists())
+        self.assertFalse(controller.list_history()[0]["complete"])
+
+    def test_recovery_planned_state_never_deletes_external_target(self) -> None:
+        source = self.source / "external.mp3"
+        payload = b"same bytes do not prove ownership"
+        source.write_bytes(payload)
+        config = DatabaseConfig(self.root / "planned-external.sqlite3")
+        controller = SafeImportController(lambda: LibraryRepository(config))
+        controller.start_preview(self.source, self.target, "audio")
+        self._wait_for_controller(controller)
+        plan = controller.current_plan
+        journal = _journal_for_plan(plan)
+        target = self.target / source.name
+        target.write_bytes(payload)
+        with LibraryRepository(config) as repository:
+            repository.set_setting(PENDING_IMPORT_KEY, journal)
+
+        failures: list[str] = []
+        controller.failed.connect(failures.append)
+        controller.start_recovery()
+        self._wait_for_controller(controller)
+
+        self.assertTrue(failures)
+        self.assertEqual(source.read_bytes(), payload)
+        self.assertEqual(target.read_bytes(), payload)
+        with LibraryRepository(config) as repository:
+            self.assertIsNotNone(repository.get_setting(PENDING_IMPORT_KEY))
+
+    def test_recovery_done_state_with_recreated_source_never_deletes_target(self) -> None:
+        source = self.source / "recreated.mp3"
+        payload = b"completed target and newly recreated source"
+        source.write_bytes(payload)
+        config = DatabaseConfig(self.root / "done-recreated.sqlite3")
+        controller = SafeImportController(lambda: LibraryRepository(config))
+        controller.start_preview(self.source, self.target, "audio")
+        self._wait_for_controller(controller)
+        plan = controller.current_plan
+        journal = _journal_for_plan(plan)
+        journal["items"][0]["state"] = "done"
+        target = self.target / source.name
+        target.write_bytes(payload)
+        with LibraryRepository(config) as repository:
+            repository.set_setting(PENDING_IMPORT_KEY, journal)
+
+        failures: list[str] = []
+        controller.failed.connect(failures.append)
+        controller.start_recovery()
+        self._wait_for_controller(controller)
+
+        self.assertTrue(failures)
+        self.assertEqual(source.read_bytes(), payload)
+        self.assertEqual(target.read_bytes(), payload)
+        with LibraryRepository(config) as repository:
+            self.assertIsNotNone(repository.get_setting(PENDING_IMPORT_KEY))
+
+    def test_recovery_candidate_ready_keeps_both_source_and_target(self) -> None:
+        source = self.source / "candidate-ready.mp3"
+        payload = b"same content is not ownership proof"
+        source.write_bytes(payload)
+        config = DatabaseConfig(self.root / "candidate-ready-target.sqlite3")
+        controller = SafeImportController(lambda: LibraryRepository(config))
+        controller.start_preview(self.source, self.target, "audio")
+        self._wait_for_controller(controller)
+        plan = controller.current_plan
+        journal = _journal_for_plan(plan)
+        journal["items"][0]["state"] = "candidate_ready"
+        target = self.target / source.name
+        target.write_bytes(payload)
+        with LibraryRepository(config) as repository:
+            repository.set_setting(PENDING_IMPORT_KEY, journal)
+
+        controller.start_recovery()
+        self._wait_for_controller(controller)
+
+        self.assertEqual(source.read_bytes(), payload)
+        self.assertEqual(target.read_bytes(), payload)
+        history = controller.list_history()
+        self.assertEqual(history[-1]["terminal_status"], "failed")
+        self.assertFalse(history[-1]["complete"])
+
+    def test_recovery_removes_partial_planned_candidate(self) -> None:
+        source = self.source / "partial.mp3"
+        source.write_bytes(b"complete source payload")
+        config = DatabaseConfig(self.root / "partial-candidate.sqlite3")
+        controller = SafeImportController(lambda: LibraryRepository(config))
+        controller.start_preview(self.source, self.target, "audio")
+        self._wait_for_controller(controller)
+        plan = controller.current_plan
+        journal = _journal_for_plan(plan)
+        candidate = Path(journal["items"][0]["candidate_path"])
+        candidate.write_bytes(b"partial")
+        with LibraryRepository(config) as repository:
+            repository.set_setting(PENDING_IMPORT_KEY, journal)
+
+        controller.start_recovery()
+        self._wait_for_controller(controller)
+
+        self.assertFalse(candidate.exists())
+        self.assertTrue(source.exists())
+        with LibraryRepository(config) as repository:
+            self.assertIsNone(repository.get_setting(PENDING_IMPORT_KEY))
+
+    def test_recovery_corrupt_journal_fails_closed_and_keeps_it(self) -> None:
+        source = self.source / "keep.mp3"
+        source.write_bytes(b"keep")
+        config = DatabaseConfig(self.root / "corrupt.sqlite3")
+        corrupt = {"version": 999, "batch_id": "bad"}
+        with LibraryRepository(config) as repository:
+            repository.set_setting(PENDING_IMPORT_KEY, corrupt)
+        controller = SafeImportController(lambda: LibraryRepository(config))
+        failures: list[str] = []
+        controller.failed.connect(failures.append)
+        controller.start_recovery()
+        self._wait_for_controller(controller)
+        self.assertTrue(failures)
+        self.assertEqual(source.read_bytes(), b"keep")
+        with LibraryRepository(config) as repository:
+            self.assertEqual(repository.get_setting(PENDING_IMPORT_KEY).value, corrupt)
+
+    def test_recovery_exact_history_residual_only_clears_pending_journal(self) -> None:
+        source = self.source / "exact.mp3"
+        payload = b"exact"
+        source.write_bytes(payload)
+        config = DatabaseConfig(self.root / "exact.sqlite3")
+        controller = SafeImportController(lambda: LibraryRepository(config))
+        controller.start_preview(self.source, self.target, "audio")
+        self._wait_for_controller(controller)
+        plan = controller.current_plan
+        journal = _journal_for_plan(plan)
+        target = self.target / source.name
+        target.write_bytes(payload)
+        source.unlink()
+        journal["items"][0]["state"] = "done"
+        result = ImportRunResult(
+            self.source, self.target,
+            (ImportItemResult(source, target, "success", "done",
+                              hashlib.sha256(payload).hexdigest()),),
+            1, 0, 0, 0, plan_id=plan.id,
+        )
+        entry = _result_to_history(result)
+        with LibraryRepository(config) as repository:
+            repository.set_setting(PENDING_IMPORT_KEY, journal)
+            repository.set_setting(IMPORT_HISTORY_KEY, [entry])
+
+        controller.start_recovery()
+        self._wait_for_controller(controller)
+        with LibraryRepository(config) as repository:
+            self.assertIsNone(repository.get_setting(PENDING_IMPORT_KEY))
+            self.assertEqual(repository.get_setting(IMPORT_HISTORY_KEY).value, [entry])
+
+    def test_fault_after_unlink_leaves_target_only_and_recovery_is_idempotent(self) -> None:
+        source = self.source / "after-unlink.mp3"
+        payload = b"after unlink"
+        source.write_bytes(payload)
+        config = DatabaseConfig(self.root / "after-unlink.sqlite3")
+        controller = SafeImportController(lambda: LibraryRepository(config))
+        controller.start_preview(self.source, self.target, "audio")
+        self._wait_for_controller(controller)
+        plan = controller.current_plan
+        original = LibraryRepository.set_setting
+        injected = threading.Event()
+
+        def fail_after_unlink(repository, key, value):
+            items = value.get("items", []) if isinstance(value, dict) else []
+            if (
+                key == PENDING_IMPORT_KEY
+                and any(item.get("state") == "source_deleted" for item in items)
+                and not injected.is_set()
+            ):
+                injected.set()
+                raise RuntimeError("fault after unlink")
+            return original(repository, key, value)
+
+        with mock.patch.object(LibraryRepository, "set_setting", new=fail_after_unlink):
+            controller.start_execute(plan.id)
+            self._wait_for_controller(controller)
+        target = self.target / source.name
+        self.assertTrue(injected.is_set())
+        self.assertFalse(source.exists())
+        self.assertEqual(target.read_bytes(), payload)
+
+        controller.start_recovery()
+        self._wait_for_controller(controller)
+        self.assertTrue(controller.list_history()[0]["complete"])
+        before = controller.list_history()
+        controller.start_recovery()
+        self._wait_for_controller(controller)
+        self.assertEqual(controller.list_history(), before)
+        self.assertEqual(target.read_bytes(), payload)
+
+    def test_fault_after_rename_rolls_target_back_and_recovery_keeps_source(self) -> None:
+        source = self.source / "after-rename.mp3"
+        payload = b"after rename"
+        source.write_bytes(payload)
+        config = DatabaseConfig(self.root / "after-rename.sqlite3")
+        controller = SafeImportController(lambda: LibraryRepository(config))
+        controller.start_preview(self.source, self.target, "audio")
+        self._wait_for_controller(controller)
+        plan = controller.current_plan
+        original = LibraryRepository.set_setting
+        injected = threading.Event()
+
+        def fail_after_rename(repository, key, value):
+            items = value.get("items", []) if isinstance(value, dict) else []
+            if (
+                key == PENDING_IMPORT_KEY
+                and any(item.get("state") == "target_placed" for item in items)
+                and not injected.is_set()
+            ):
+                injected.set()
+                raise RuntimeError("fault after rename")
+            return original(repository, key, value)
+
+        with mock.patch.object(LibraryRepository, "set_setting", new=fail_after_rename):
+            controller.start_execute(plan.id)
+            self._wait_for_controller(controller)
+        self.assertTrue(injected.is_set())
+        self.assertEqual(source.read_bytes(), payload)
+        self.assertFalse((self.target / source.name).exists())
+
+        controller.start_recovery()
+        self._wait_for_controller(controller)
+        self.assertEqual(source.read_bytes(), payload)
+        self.assertFalse(controller.list_history()[0]["complete"])
 
     def test_preview_is_read_only_and_same_batch_targets_both_conflict(self) -> None:
         first = self.source / "one"

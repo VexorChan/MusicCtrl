@@ -1681,6 +1681,111 @@ class LibraryRepository:
             )
         return SettingRecord(key=key, value=_strict_json_loads(value_json), updated_at=updated_at)
 
+    def finalize_import_journal(
+        self,
+        *,
+        pending_key: str,
+        history_key: str,
+        batch_id: str,
+        history_entry: dict[str, object],
+    ) -> None:
+        """Append one exact import history entry and clear its pending journal atomically."""
+        self._require_open_in_owner_thread()
+        if any(not isinstance(value, str) or not value.strip() for value in (
+            pending_key, history_key, batch_id
+        )):
+            raise RepositoryDataError("导入日志 key 和批次编号必须是非空字符串")
+        if not isinstance(history_entry, dict) or history_entry.get("id") != batch_id:
+            raise RepositoryDataError("导入历史批次与待恢复日志不一致")
+        encoded_entry = self._encode_setting_value(history_entry)
+        exact_entry = _strict_json_loads(encoded_entry)
+        now = _utc_now()
+        with self._transaction(operation_id=batch_id, item_id=pending_key):
+            pending_row = self._connection.execute(
+                "SELECT value_json FROM settings WHERE key = ?", (pending_key,)
+            ).fetchone()
+            if pending_row is not None:
+                pending = _strict_json_loads(pending_row["value_json"])
+                if not isinstance(pending, dict) or pending.get("batch_id") != batch_id:
+                    raise RepositoryDataError("待恢复日志批次与完成历史不一致")
+            history_row = self._connection.execute(
+                "SELECT value_json FROM settings WHERE key = ?", (history_key,)
+            ).fetchone()
+            history = [] if history_row is None else _strict_json_loads(history_row["value_json"])
+            if not isinstance(history, list) or not all(isinstance(item, dict) for item in history):
+                raise RepositoryDataError("导入历史格式损坏")
+            matches = [item for item in history if item.get("id") == batch_id]
+            encoded_matches = [self._encode_setting_value(item) for item in matches]
+            if len(matches) > 1 or (encoded_matches and encoded_matches[0] != encoded_entry):
+                raise RepositoryDataError("已存在同批次但内容不同的导入历史")
+            if not matches:
+                if pending_row is None:
+                    raise RepositoryDataError("待恢复日志不存在，不能盲目补写历史")
+                history = (history + [exact_entry])[-200:]
+                encoded_history = self._encode_setting_value(history)
+                self._connection.execute(
+                    """
+                    INSERT INTO settings(key, value_json, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value_json = excluded.value_json,
+                        updated_at = excluded.updated_at
+                    """,
+                    (history_key, encoded_history, now),
+                )
+            self._connection.execute("DELETE FROM settings WHERE key = ?", (pending_key,))
+
+    def create_import_journal(
+        self,
+        *,
+        pending_key: str,
+        batch_id: str,
+        journal: dict[str, object],
+    ) -> None:
+        """Persist a complete new import plan without overwriting unresolved work."""
+        self._require_open_in_owner_thread()
+        if (
+            not isinstance(pending_key, str)
+            or not pending_key.strip()
+            or not isinstance(batch_id, str)
+            or not batch_id.strip()
+            or not isinstance(journal, dict)
+            or journal.get("batch_id") != batch_id
+        ):
+            raise RepositoryDataError("待恢复导入日志参数损坏")
+        encoded = self._encode_setting_value(journal)
+        try:
+            with self._transaction():
+                self._connection.execute(
+                    "INSERT INTO settings(key, value_json, updated_at) VALUES (?, ?, ?)",
+                    (pending_key, encoded, _utc_now()),
+                )
+        except sqlite3.IntegrityError as error:
+            raise RepositoryDataError("存在尚未处理的安全导入恢复日志") from error
+
+    def read_import_finalize_state(
+        self,
+        *,
+        pending_key: str,
+        history_key: str,
+        batch_id: str,
+    ) -> tuple[object | None, dict[str, object] | None]:
+        """Read back an uncertain import finalization without changing the database."""
+        self._require_open_in_owner_thread()
+        if any(not isinstance(value, str) or not value.strip() for value in (
+            pending_key, history_key, batch_id
+        )):
+            raise RepositoryDataError("导入日志 key 和批次编号必须是非空字符串")
+        pending = self.get_setting(pending_key)
+        history = self.get_setting(history_key)
+        value = [] if history is None else history.value
+        if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+            raise RepositoryDataError("导入历史格式损坏")
+        matches = [dict(item) for item in value if item.get("id") == batch_id]
+        if len(matches) > 1:
+            raise RepositoryDataError("导入历史包含重复批次")
+        return (None if pending is None else pending.value, matches[0] if matches else None)
+
     def get_setting(self, key: str) -> SettingRecord | None:
         self._require_open_in_owner_thread()
         if not isinstance(key, str) or not key.strip():

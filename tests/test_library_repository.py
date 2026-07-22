@@ -16,6 +16,7 @@ from repositories.library_repository import (
     LibraryRepository,
     RecordNotFoundError,
     RepositoryClosedError,
+    RepositoryCommitOutcomeUnknown,
     RepositoryDataError,
     RepositoryPathError,
     RepositoryThreadError,
@@ -938,6 +939,109 @@ class LibraryRepositoryTests(unittest.TestCase):
             repository.list_assets()
         with self.assertRaises(RepositoryClosedError):
             repository.close()
+
+    def test_import_journal_finalize_is_atomic_idempotent_and_exact(self) -> None:
+        repository = self.create_repository()
+        pending_key = "p6.pending_import"
+        history_key = "p6.import_history"
+        pending = {"batch_id": "batch-1", "version": 1}
+        entry = {"id": "batch-1", "complete": True}
+        repository.set_setting(pending_key, pending)
+        repository.finalize_import_journal(
+            pending_key=pending_key,
+            history_key=history_key,
+            batch_id="batch-1",
+            history_entry=entry,
+        )
+        self.assertEqual(
+            repository.read_import_finalize_state(
+                pending_key=pending_key,
+                history_key=history_key,
+                batch_id="batch-1",
+            ),
+            (None, entry),
+        )
+        repository.finalize_import_journal(
+            pending_key=pending_key,
+            history_key=history_key,
+            batch_id="batch-1",
+            history_entry=entry,
+        )
+        with self.assertRaises(RepositoryDataError):
+            repository.finalize_import_journal(
+                pending_key=pending_key,
+                history_key=history_key,
+                batch_id="batch-1",
+                history_entry={"id": "batch-1", "complete": False},
+            )
+
+    def test_create_import_journal_never_overwrites_unresolved_batch(self) -> None:
+        repository = self.create_repository()
+        first = {"batch_id": "first", "version": 1}
+        repository.create_import_journal(
+            pending_key="p6.pending_import", batch_id="first", journal=first
+        )
+        with self.assertRaises(RepositoryDataError):
+            repository.create_import_journal(
+                pending_key="p6.pending_import",
+                batch_id="second",
+                journal={"batch_id": "second", "version": 1},
+            )
+        self.assertEqual(repository.get_setting("p6.pending_import").value, first)
+
+    def test_import_journal_finalize_uses_type_strict_json_equality(self) -> None:
+        repository = self.create_repository()
+        pending = {"batch_id": "typed", "version": 1}
+        damaged_history = [{"id": "typed", "complete": 1}]
+        repository.set_setting("p6.pending_import", pending)
+        repository.set_setting("p6.import_history", damaged_history)
+
+        with self.assertRaises(RepositoryDataError):
+            repository.finalize_import_journal(
+                pending_key="p6.pending_import",
+                history_key="p6.import_history",
+                batch_id="typed",
+                history_entry={"id": "typed", "complete": True},
+            )
+
+        self.assertEqual(repository.get_setting("p6.pending_import").value, pending)
+        self.assertEqual(
+            repository.get_setting("p6.import_history").value, damaged_history
+        )
+    def test_import_finalize_reports_commit_outcome_unknown_and_supports_readback(self) -> None:
+        repository = self.create_repository()
+        repository.set_setting("p6.pending_import", {"batch_id": "batch-2", "version": 1})
+        entry = {"id": "batch-2", "complete": True}
+        real_connection = repository._connection
+
+        class CommitThenRaise:
+            @property
+            def in_transaction(inner_self):
+                return real_connection.in_transaction
+
+            def execute(inner_self, sql, parameters=()):
+                result = real_connection.execute(sql, parameters)
+                if sql == "COMMIT":
+                    raise RuntimeError("transport failed after commit")
+                return result
+
+        repository._connection = CommitThenRaise()
+        with self.assertRaises(RepositoryCommitOutcomeUnknown):
+            repository.finalize_import_journal(
+                pending_key="p6.pending_import",
+                history_key="p6.import_history",
+                batch_id="batch-2",
+                history_entry=entry,
+            )
+        repository._connection = real_connection
+        self.assertEqual(
+            repository.read_import_finalize_state(
+                pending_key="p6.pending_import",
+                history_key="p6.import_history",
+                batch_id="batch-2",
+            ),
+            (None, entry),
+        )
 
 
 if __name__ == "__main__":
