@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QStandardPaths, Qt
+from PySide6.QtCore import QStandardPaths, QTimer, Qt
 from PySide6.QtGui import QFont, QIcon
 from PySide6.QtWidgets import QApplication
 
@@ -88,6 +88,7 @@ def main() -> int:
         use_model_view=True,
     )
     window.show()
+    QTimer.singleShot(0, window.start_pending_safe_import_recovery)
     return app.exec()
 
 

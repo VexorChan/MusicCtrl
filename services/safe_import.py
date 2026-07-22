@@ -868,6 +868,7 @@ class SafeImportRecoveryWorker(QThread):
 
     completed = Signal(object)
     failed = Signal(str)
+    pending_detected = Signal()
 
     def __init__(self, *, repository_factory, parent=None) -> None:
         super().__init__(parent)
@@ -1085,6 +1086,7 @@ class SafeImportRecoveryWorker(QThread):
             if setting is None:
                 self.completed.emit(None)
                 return
+            self.pending_detected.emit()
             journal = _validate_journal(setting.value)
             batch_id = str(journal["batch_id"])
             _, existing = repository.read_import_finalize_state(
@@ -1436,6 +1438,7 @@ class SafeImportController(QObject):
     running_changed = Signal(bool)
 
     warning = Signal(str)
+    recovery_detected = Signal()
 
     def __init__(self, repository_factory=None, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -1519,6 +1522,7 @@ class SafeImportController(QObject):
         if self.running:
             raise RuntimeError("已有安全导入任务正在运行")
         worker = SafeImportRecoveryWorker(repository_factory=self._repository_factory)
+        worker.pending_detected.connect(self.recovery_detected.emit)
         worker.completed.connect(lambda value: self._cache("completed", value))
         worker.failed.connect(lambda value: self._cache("failed", value))
         worker.finished.connect(self._finished)

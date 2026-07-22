@@ -245,9 +245,12 @@ class ImportDialog(PrototypeDialog):
         self.scan_path.setEnabled(not running)
         self.target_path.setEnabled(not running)
         if running:
+            messages = {
+                "preview": "正在生成只读预览；关闭窗口会先协作取消。",
+                "recovery": "检测到上次未完成的安全导入，正在核对磁盘并恢复；不会覆盖或盲目删除文件。",
+            }
             self.summary.setText(
-                "正在生成只读预览；关闭窗口会先协作取消。"
-                if phase == "preview" else "正在校验并安全导入；关闭窗口会先协作取消。"
+                messages.get(phase, "正在校验并安全导入；关闭窗口会先协作取消。")
             )
 
     def show_result(self, result: object, *, cancelled: bool = False) -> None:

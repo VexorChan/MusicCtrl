@@ -81,6 +81,7 @@ class MainWindow(QMainWindow):
         self._pending_refresh_roots: list[tuple[str, Path]] = []
         self._playlist_snapshot_generation = 0
         self._pending_playlist_navigation: str | None = None
+        self._safe_import_recovery_active = False
         self.setWindowTitle("乐库整理助手")
         app = QApplication.instance()
         if app is not None and not app.windowIcon().isNull():
@@ -207,6 +208,10 @@ class MainWindow(QMainWindow):
             safe_import_controller.failed.connect(self._safe_import_failed)
             safe_import_controller.warning.connect(self._safe_import_warning)
             safe_import_controller.running_changed.connect(self._safe_import_running_changed)
+            if hasattr(safe_import_controller, "recovery_detected"):
+                safe_import_controller.recovery_detected.connect(
+                    self._safe_import_recovery_detected
+                )
         if backup_controller is not None:
             backup_controller.completed.connect(self._backup_completed)
             backup_controller.failed.connect(self._backup_failed)
@@ -425,6 +430,27 @@ class MainWindow(QMainWindow):
     def _start_safe_import(self, source_root: Path, target_root: Path, mode: str) -> None:
         self._start_safe_import_preview(source_root, target_root, mode)
 
+    def start_pending_safe_import_recovery(self) -> None:
+        """Start durable P6 recovery after the production window becomes responsive."""
+
+        controller = self._safe_import_controller
+        if controller is None or controller.running or self._close_pending:
+            return
+        self._safe_import_recovery_active = True
+        try:
+            controller.start_recovery()
+        except Exception as error:
+            self._safe_import_recovery_active = False
+            if self._import_dialog is not None:
+                self._import_dialog.show_failed(f"无法启动上次导入恢复：{error}")
+
+    def _safe_import_recovery_detected(self) -> None:
+        if not self._safe_import_recovery_active or self._close_pending:
+            return
+        self.open_import()
+        if self._import_dialog is not None:
+            self._import_dialog.set_running(True, "recovery")
+
     def _start_safe_import_preview(self, source_root: Path, target_root: Path, mode: str) -> None:
         if self._safe_import_controller is None or self._import_dialog is None:
             return
@@ -490,7 +516,12 @@ class MainWindow(QMainWindow):
             self._import_dialog.show_failed(str(error))
 
     def _safe_import_completed(self, result: object) -> None:
-        if self._import_dialog is not None:
+        recovering = self._safe_import_recovery_active
+        self._safe_import_recovery_active = False
+        if recovering and isinstance(result, dict):
+            if self._import_dialog is not None:
+                self._import_dialog.summary.setText("上次导入记录已核对完成，恢复日志已安全清理。")
+        elif self._import_dialog is not None:
             self._import_dialog.show_result(result)
         if getattr(result, "success_count", 0):
             action = getattr(result, "action", "import")
@@ -512,8 +543,13 @@ class MainWindow(QMainWindow):
             self._import_dialog.show_result(result, cancelled=True)
 
     def _safe_import_failed(self, message: str) -> None:
+        recovering = self._safe_import_recovery_active
+        self._safe_import_recovery_active = False
+        if recovering and self._import_dialog is None and not self._close_pending:
+            self.open_import()
         if self._import_dialog is not None:
-            self._import_dialog.show_failed(message)
+            prefix = "恢复上次导入失败，恢复日志已保留：" if recovering else ""
+            self._import_dialog.show_failed(prefix + message)
 
     def _safe_import_warning(self, message: str) -> None:
         if self._import_dialog is not None:
