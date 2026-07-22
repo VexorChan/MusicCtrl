@@ -14,30 +14,31 @@
 - M1～P8 的既有功能提交仍在 Git 历史中。
 - `80bf836 fix: preserve lyric scan root provenance` 已本地提交并通过此前独立复核；尚待网络恢复后推送。
 - `20185c2 fix: recover interrupted safe imports safely` 已原子提交：持久化恢复日志、状态感知恢复、Windows 句柄级验证/候选删除、历史与日志原子收尾。
-- 当前本地共有 3 个待推送提交：`80bf836`、`20185c2`、进度文档提交；工作区已清理。
+- `7099d16 fix: recover interrupted imports on startup` 已原子提交：启动后后台检测 pending journal，仅在需要恢复或检测失败时显示窗口，恢复期间与其他后台任务互斥。
+- 当前本地共有 4 个待推送提交；工作区已清理。
 - 最终验证结果：
   - `python -m unittest tests.test_library_repository tests.test_safe_import -q`：75/75 PASS。
-  - `python -m unittest discover -q`：372/372 PASS。
+  - `python -m unittest discover -q`：377/377 PASS。
   - `python -m compileall -q .`：PASS。
   - `python smoke_test.py`：PASS。
   - `git diff --check`：PASS（仅 LF/CRLF 提示）。
 
 ## 正在执行
 
-- 推送本地 3 个提交并回读远端状态。
+- 推送本地 4 个提交并回读远端状态。
 - 2026-07-22 最新 push/fetch 均失败：`github.com:443` 连接重置/无法连接；本地提交和工作区未受影响。
 
 ## 待完成
 
 1. 推送 `80bf836` 与 `20185c2`，回读 `HEAD == origin/main`。
-2. 接入启动时的未完成导入恢复提示/流程。
-3. 完善重命名与受管歌单快捷方式失败后的可恢复闭环。
-4. 修正文档中“只读导入原型”与当前真实安全导入功能的冲突。
-5. 最终全量回归并重新构建、安装和验证 EXE/桌面快捷方式。
+2. 完善重命名与受管歌单快捷方式失败后的可恢复闭环。
+3. 修正文档中“只读导入原型”与当前真实安全导入功能的冲突。
+4. 最终全量回归并重新构建、安装和验证 EXE/桌面快捷方式。
 
 ## 已知问题与风险
 
-- GitHub 网络多次出现 443 连接重置；当前 `origin/main=dbbea1d`，本地领先 3 个提交。
+- GitHub 网络多次出现 443 连接重置；当前 `origin/main=dbbea1d`，本地领先 4 个提交。
+- 音乐重命名成功后，受管歌单快捷方式更新仍是独立后续任务；失败会留下指向旧文件的快捷方式，当前没有持久化重试入口。
 - 当前解释器为 Python 3.13.5，而项目目标文档部分位置仍写 Python 3.12；最终构建应固定并记录版本。
 - 共享 Anaconda 环境的 `pip check` 存在项目外既有依赖冲突；最终交付应使用隔离构建环境。
 - 安全导入恢复不自动删除目标文件；候选仅在 Windows 同一受锁句柄完成身份/内容校验后删除。非 Windows 平台会失败关闭并保留恢复记录。
@@ -46,4 +47,4 @@
 ## 下一步
 
 - 网络恢复后在项目根执行 `git push origin main`，再用 `git rev-list --left-right --count origin/main...HEAD` 确认输出 `0 0`。
-- 推送成功后接入启动时的未完成导入恢复提示，不与当前已冻结提交混包。
+- 下一功能包将为重命名后的快捷方式联动增加持久化待修复记录、启动恢复和用户可见重试；不与已冻结启动恢复提交混包。
