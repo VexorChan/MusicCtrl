@@ -83,6 +83,7 @@ class MainWindow(QMainWindow):
         self._pending_playlist_navigation: str | None = None
         self._safe_import_recovery_active = False
         self._playlist_retarget_recovery_queued = False
+        self._pending_safe_rename_items: tuple[SafeRenameInput, ...] = ()
         self.setWindowTitle("乐库整理助手")
         app = QApplication.instance()
         if app is not None and not app.windowIcon().isNull():
@@ -183,6 +184,16 @@ class MainWindow(QMainWindow):
             if hasattr(playlist_controller, "warning"):
                 playlist_controller.warning.connect(self._playlist_warning)
             playlist_controller.running_changed.connect(self._background_running_changed)
+            if hasattr(playlist_controller, "retarget_impact_ready"):
+                playlist_controller.retarget_impact_ready.connect(
+                    self._playlist_retarget_impact_ready
+                )
+                playlist_controller.retarget_impact_cancelled.connect(
+                    self._playlist_retarget_impact_cancelled
+                )
+                playlist_controller.retarget_impact_failed.connect(
+                    self._playlist_retarget_impact_failed
+                )
             if hasattr(playlist_controller, "recovery_detected"):
                 playlist_controller.recovery_detected.connect(
                     self._playlist_recovery_detected
@@ -785,7 +796,13 @@ class MainWindow(QMainWindow):
         self._background_running_changed(running)
 
     def _cancel_active_rename_task(self) -> None:
-        if self._safe_rename_controller is not None and self._safe_rename_controller.running:
+        if (
+            self._pending_safe_rename_items
+            and self._playlist_controller is not None
+            and self._playlist_controller.running
+        ):
+            self._playlist_controller.request_cancel()
+        elif self._safe_rename_controller is not None and self._safe_rename_controller.running:
             self._safe_rename_controller.request_cancel()
         elif self._metadata_preview_controller is not None and self._metadata_preview_controller.running:
             self._metadata_preview_controller.request_cancel()
@@ -859,8 +876,52 @@ class MainWindow(QMainWindow):
             self._rename_dialog.show_warning(str(error))
             return
 
+        frozen_items = tuple(items)
+        try:
+            if self._playlist_controller is None:
+                playlist_root = None
+            elif hasattr(self._playlist_controller, "retarget_impact_root"):
+                playlist_root = self._playlist_controller.retarget_impact_root()
+            else:
+                playlist_root = self._playlist_controller.remembered_root()
+        except Exception as error:
+            self._rename_dialog.show_failed(
+                f"无法读取受管歌单目录：{error}；没有修改文件。"
+            )
+            return
+        if playlist_root is None or not hasattr(
+            self._playlist_controller, "start_retarget_impact"
+        ):
+            self._confirm_and_start_safe_rename(frozen_items, 0)
+            return
+        try:
+            impact_items = tuple(
+                PlaylistRetargetInput(
+                    source_path=item.source_path,
+                    target_path=item.target_path,
+                    audio_root=item.allowed_root,
+                )
+                for item in frozen_items
+            )
+            self._pending_safe_rename_items = frozen_items
+            self._rename_dialog.set_running(True)
+            self._rename_dialog.show_warning("正在统计受影响的受管歌单快捷方式…")
+            self._playlist_controller.start_retarget_impact(impact_items)
+        except Exception as error:
+            self._pending_safe_rename_items = ()
+            self._rename_dialog.set_running(False)
+            self._rename_dialog.show_failed(f"无法统计受影响的歌单快捷方式：{error}")
+
+    def _confirm_and_start_safe_rename(
+        self,
+        items: tuple[SafeRenameInput, ...],
+        shortcut_count: int,
+    ) -> None:
+        if self._safe_rename_controller is None or self._rename_dialog is None:
+            return
         confirmation_message = (
             f"将实际修改 {len(items)} 个文件名。\n\n"
+            f"受影响的受管歌单快捷方式：{shortcut_count} 个。\n"
             "所有文件只在原目录内重命名，目标存在时绝不覆盖。\n"
         )
         confirmation_message += (
@@ -880,9 +941,32 @@ class MainWindow(QMainWindow):
             self._rename_dialog.show_warning("已取消确认；没有创建操作，也没有修改文件。")
             return
         try:
-            self._safe_rename_controller.start(tuple(items))
+            self._safe_rename_controller.start(items)
         except Exception as error:
             self._rename_dialog.show_failed(str(error))
+
+    def _playlist_retarget_impact_ready(self, count: int) -> None:
+        items = self._pending_safe_rename_items
+        self._pending_safe_rename_items = ()
+        if self._rename_dialog is not None:
+            self._rename_dialog.set_running(False)
+        if not items or self._close_pending:
+            return
+        self._confirm_and_start_safe_rename(items, count)
+
+    def _playlist_retarget_impact_cancelled(self) -> None:
+        self._pending_safe_rename_items = ()
+        if self._rename_dialog is not None:
+            self._rename_dialog.set_running(False)
+            self._rename_dialog.show_warning("已取消快捷方式影响统计；没有修改文件。")
+
+    def _playlist_retarget_impact_failed(self, message: str) -> None:
+        self._pending_safe_rename_items = ()
+        if self._rename_dialog is not None:
+            self._rename_dialog.set_running(False)
+            self._rename_dialog.show_failed(
+                f"无法统计受影响的歌单快捷方式：{message}；没有修改文件。"
+            )
 
     def _safe_rename_completed(self, result: object) -> None:
         if self._rename_dialog is not None:

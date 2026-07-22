@@ -134,6 +134,48 @@ class _FakeSafeRenameController(QObject):
         self.running_changed.emit(False)
 
 
+class _FakePlaylistController(QObject):
+    playlists_changed = Signal(object)
+    playlist_changed = Signal(str, object)
+    completed = Signal(object)
+    cancelled = Signal(object)
+    failed = Signal(str)
+    warning = Signal(str)
+    running_changed = Signal(bool)
+    retarget_impact_ready = Signal(int)
+    retarget_impact_cancelled = Signal()
+    retarget_impact_failed = Signal(str)
+
+    def __init__(self, root: Path) -> None:
+        super().__init__()
+        self.root = root
+        self.running = False
+        self.impact_starts: list[tuple] = []
+        self.cancel_requests = 0
+
+    def remembered_root(self) -> Path:
+        return self.root
+
+    def retarget_impact_root(self) -> Path:
+        return self.root
+
+    def list_playlists(self):
+        return ()
+
+    def start_retarget_impact(self, items) -> None:
+        self.impact_starts.append(tuple(items))
+        self.running = True
+        self.running_changed.emit(True)
+
+    def publish_impact(self, count: int) -> None:
+        self.running = False
+        self.retarget_impact_ready.emit(count)
+        self.running_changed.emit(False)
+
+    def request_cancel(self) -> None:
+        self.cancel_requests += 1
+
+
 class P2RenameIntegrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -232,6 +274,111 @@ class P2RenameIntegrationTests(unittest.TestCase):
             self.assertEqual(request.expected_size_bytes, record["_size_bytes"])
             self.assertEqual(request.expected_mtime_ns, record["_mtime_ns"])
         finally:
+            self._dispose(window)
+
+    def test_playlist_impact_is_async_and_confirmation_shows_count(self) -> None:
+        source = self.music / "old.mp3"
+        scan = _FakeScanController((self._record(source),))
+        metadata = _FakeMetadataController()
+        safe = _FakeSafeRenameController()
+        playlist_root = self.root / "playlists"
+        playlist_root.mkdir()
+        playlist = _FakePlaylistController(playlist_root)
+        window = MainWindow(scan, metadata, safe, None, playlist)
+        window.show()
+        try:
+            dialog = self._select_first_row_and_open(window, metadata)
+            metadata.publish((self._preview(source),))
+            dialog.id3_checkbox.setChecked(False)
+            with patch.object(
+                QMessageBox,
+                "question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ) as question:
+                dialog.primary_button.click()
+                self.assertEqual(len(playlist.impact_starts), 1)
+                self.assertEqual(safe.starts, [])
+                self.assertFalse(question.called)
+                playlist.publish_impact(3)
+            self.assertEqual(len(safe.starts), 1)
+            self.assertIn("受影响的受管歌单快捷方式：3 个", question.call_args.args[2])
+        finally:
+            playlist.running = False
+            self._dispose(window)
+
+    def test_playlist_impact_failure_never_starts_rename(self) -> None:
+        source = self.music / "old.mp3"
+        scan = _FakeScanController((self._record(source),))
+        metadata = _FakeMetadataController()
+        safe = _FakeSafeRenameController()
+        playlist_root = self.root / "playlists"
+        playlist_root.mkdir()
+        playlist = _FakePlaylistController(playlist_root)
+        window = MainWindow(scan, metadata, safe, None, playlist)
+        window.show()
+        try:
+            dialog = self._select_first_row_and_open(window, metadata)
+            metadata.publish((self._preview(source),))
+            dialog.primary_button.click()
+            playlist.running = False
+            playlist.retarget_impact_failed.emit("读取失败")
+            playlist.running_changed.emit(False)
+            self.assertEqual(safe.starts, [])
+            self.assertIn("读取失败", dialog.summary.text())
+        finally:
+            playlist.running = False
+            self._dispose(window)
+
+    def test_playlist_root_read_failure_never_starts_rename(self) -> None:
+        source = self.music / "old.mp3"
+        scan = _FakeScanController((self._record(source),))
+        metadata = _FakeMetadataController()
+        safe = _FakeSafeRenameController()
+        playlist_root = self.root / "playlists"
+        playlist_root.mkdir()
+        playlist = _FakePlaylistController(playlist_root)
+        window = MainWindow(scan, metadata, safe, None, playlist)
+        window.show()
+        try:
+            dialog = self._select_first_row_and_open(window, metadata)
+            metadata.publish((self._preview(source),))
+            dialog.id3_checkbox.setChecked(False)
+            with patch.object(
+                playlist,
+                "retarget_impact_root",
+                side_effect=RuntimeError("设置库不可读"),
+            ):
+                dialog.primary_button.click()
+            self.assertEqual(playlist.impact_starts, [])
+            self.assertEqual(safe.starts, [])
+            self.assertIn("设置库不可读", dialog.summary.text())
+        finally:
+            playlist.running = False
+            self._dispose(window)
+
+    def test_playlist_impact_can_be_cancelled_from_rename_dialog(self) -> None:
+        source = self.music / "old.mp3"
+        scan = _FakeScanController((self._record(source),))
+        metadata = _FakeMetadataController()
+        safe = _FakeSafeRenameController()
+        playlist_root = self.root / "playlists"
+        playlist_root.mkdir()
+        playlist = _FakePlaylistController(playlist_root)
+        window = MainWindow(scan, metadata, safe, None, playlist)
+        window.show()
+        try:
+            dialog = self._select_first_row_and_open(window, metadata)
+            metadata.publish((self._preview(source),))
+            dialog.id3_checkbox.setChecked(False)
+            dialog.primary_button.click()
+            self.assertTrue(window._pending_safe_rename_items)
+
+            window._cancel_active_rename_task()
+
+            self.assertEqual(playlist.cancel_requests, 1)
+            self.assertEqual(safe.starts, [])
+        finally:
+            playlist.running = False
             self._dispose(window)
 
     def test_default_sync_uses_last_hyphen_for_supported_formats_and_skips_wav(self) -> None:

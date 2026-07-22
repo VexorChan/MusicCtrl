@@ -149,6 +149,70 @@ class PlaylistControllerTests(unittest.TestCase):
         self.assertFalse(old_shortcut.exists())
         self.assertTrue(rows[0]["_shortcut_path"].is_file())
 
+    def test_retarget_impact_counts_managed_shortcuts_read_only(self) -> None:
+        self.controller.create_playlist("怀旧")
+        for name in ("通勤", "怀旧"):
+            create_shortcut(
+                target_path=self.audio,
+                audio_root=self.audio_root,
+                shortcut_path=self.playlist_root / name / f"{self.audio.name}.lnk",
+                playlist_root=self.playlist_root,
+            )
+        shortcut_bytes = {
+            path: path.read_bytes() for path in self.playlist_root.rglob("*.lnk")
+        }
+        history_before = self.controller.list_history()
+        ready: list[int] = []
+        self.controller.retarget_impact_ready.connect(ready.append)
+
+        self.controller.start_retarget_impact(
+            (
+                PlaylistRetargetInput(
+                    self.audio,
+                    self.audio_root / "晴天现场版-周杰伦.mp3",
+                    self.audio_root,
+                ),
+            )
+        )
+        self._wait()
+
+        self.assertEqual(ready, [2])
+        self.assertEqual(
+            {path: path.read_bytes() for path in self.playlist_root.rglob("*.lnk")},
+            shortcut_bytes,
+        )
+        self.assertEqual(self.controller.list_history(), history_before)
+
+    def test_retarget_impact_read_error_fails_instead_of_underreporting(self) -> None:
+        create_shortcut(
+            target_path=self.audio,
+            audio_root=self.audio_root,
+            shortcut_path=self.playlist_root / "通勤" / f"{self.audio.name}.lnk",
+            playlist_root=self.playlist_root,
+        )
+        ready: list[int] = []
+        failures: list[str] = []
+        self.controller.retarget_impact_ready.connect(ready.append)
+        self.controller.retarget_impact_failed.connect(failures.append)
+
+        with patch(
+            "services.playlist_controller.read_shortcut",
+            side_effect=PermissionError("拒绝访问快捷方式"),
+        ):
+            self.controller.start_retarget_impact(
+                (
+                    PlaylistRetargetInput(
+                        self.audio,
+                        self.audio_root / "晴天现场版-周杰伦.mp3",
+                        self.audio_root,
+                    ),
+                )
+            )
+            self._wait()
+
+        self.assertEqual(ready, [])
+        self.assertEqual(failures, ["拒绝访问快捷方式"])
+
     def test_retarget_converges_existing_new_link_and_rejects_wrong_target(self) -> None:
         item = PlaylistAudioInput(self.asset.id, self.audio, self.audio_root, "active")
         self.controller.start_add("通勤", (item,))

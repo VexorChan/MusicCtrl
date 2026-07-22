@@ -695,6 +695,64 @@ class PlaylistShortcutWorker(QThread):
             self.failed.emit(str(error).strip() or error.__class__.__name__)
 
 
+class PlaylistRetargetImpactWorker(QThread):
+    """Count managed shortcuts affected by a rename without writing anything."""
+
+    completed = Signal(int)
+    cancelled = Signal()
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        *,
+        playlist_root: Path,
+        items: tuple[PlaylistRetargetInput, ...],
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._playlist_root = playlist_root
+        self._items = items
+        self._cancel = threading.Event()
+
+    def request_cancel(self) -> None:
+        self._cancel.set()
+        self.requestInterruption()
+
+    def run(self) -> None:
+        try:
+            root_identity = _directory_identity(self._playlist_root)
+            _retarget_journal(
+                batch_id="impact-preview",
+                playlist_root=self._playlist_root,
+                items=self._items,
+                playlist_root_identity=root_identity,
+            )
+            source_keys = {_path_key(item.source_path) for item in self._items}
+            count = 0
+            for playlist in _safe_playlist_directories(self._playlist_root):
+                if self._cancel.is_set():
+                    self.cancelled.emit()
+                    return
+                for shortcut_path in sorted(playlist.glob("*.lnk")):
+                    if self._cancel.is_set():
+                        self.cancelled.emit()
+                        return
+                    info = read_shortcut(
+                        shortcut_path,
+                        playlist_root=self._playlist_root,
+                    )
+                    if _path_key(info.target_path) in source_keys:
+                        count += 1
+            if _directory_identity(self._playlist_root) != root_identity:
+                raise ValueError("歌单根在影响统计期间发生变化")
+            if self._cancel.is_set():
+                self.cancelled.emit()
+                return
+            self.completed.emit(count)
+        except Exception as error:
+            self.failed.emit(str(error).strip() or error.__class__.__name__)
+
+
 class PlaylistRetargetRecoveryLoader(QThread):
     completed = Signal(object)
     failed = Signal(str)
@@ -900,12 +958,16 @@ class PlaylistController(QObject):
     snapshot_ready = Signal(object)
     root_changed = Signal(object)
     recovery_detected = Signal()
+    retarget_impact_ready = Signal(int)
+    retarget_impact_cancelled = Signal()
+    retarget_impact_failed = Signal(str)
 
     def __init__(self, database_config: DatabaseConfig, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._database_config = database_config
         self._worker: (
             PlaylistShortcutWorker
+            | PlaylistRetargetImpactWorker
             | PlaylistRefreshWorker
             | PlaylistRetargetRecoveryLoader
             | None
@@ -959,6 +1021,19 @@ class PlaylistController(QObject):
             return None
         path = Path(setting.value)
         return path if path.is_absolute() else None
+
+    def retarget_impact_root(self) -> Path | None:
+        """Read the optional managed root while preserving storage failures."""
+        with LibraryRepository(self._database_config) as repository:
+            setting = repository.get_setting(PLAYLIST_ROOT_KEY)
+        if setting is None:
+            return None
+        if not isinstance(setting.value, str):
+            raise ValueError("歌单目录设置格式损坏")
+        path = Path(setting.value)
+        if not path.is_absolute():
+            raise ValueError("歌单目录设置不是绝对路径")
+        return path
 
     def set_root(self, root: Path) -> None:
         if not isinstance(root, Path) or not root.is_absolute():
@@ -1164,6 +1239,25 @@ class PlaylistController(QObject):
             retarget_items=actionable,
         )
 
+    def start_retarget_impact(self, items: tuple[PlaylistRetargetInput, ...]) -> None:
+        if self.running:
+            raise RuntimeError("歌单操作已经在运行")
+        payload = tuple(items)
+        if not payload:
+            raise ValueError("至少选择一个重命名项")
+        worker = PlaylistRetargetImpactWorker(
+            playlist_root=self._require_root(),
+            items=payload,
+        )
+        worker.completed.connect(lambda count: self._cache("impact_completed", count))
+        worker.cancelled.connect(lambda: self._cache("impact_cancelled", None))
+        worker.failed.connect(lambda message: self._cache("impact_failed", message))
+        worker.finished.connect(self._finished)
+        self._worker = worker
+        self._terminal = None
+        self.running_changed.emit(True)
+        worker.start()
+
     def start_pending_retarget_recovery(self) -> None:
         """Resume a durable shortcut retarget without touching SQLite on the UI thread."""
         if self.running:
@@ -1256,6 +1350,23 @@ class PlaylistController(QObject):
             return
         if isinstance(worker, PlaylistRetargetRecoveryLoader):
             self._finish_retarget_recovery_loader(worker)
+            return
+        if isinstance(worker, PlaylistRetargetImpactWorker):
+            kind, payload = self._terminal or (
+                "impact_failed",
+                "快捷方式影响统计线程结束但没有终态",
+            )
+            self._last_terminal_kind = "impact"
+            self._worker = None
+            self._terminal = None
+            worker.deleteLater()
+            if kind == "impact_completed" and isinstance(payload, int):
+                self.retarget_impact_ready.emit(payload)
+            elif kind == "impact_cancelled":
+                self.retarget_impact_cancelled.emit()
+            else:
+                self.retarget_impact_failed.emit(str(payload))
+            self.running_changed.emit(False)
             return
         if isinstance(worker, PlaylistRefreshWorker):
             self._finish_refresh(worker)
