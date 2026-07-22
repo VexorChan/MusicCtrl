@@ -89,6 +89,7 @@ def main() -> int:
     )
     window.show()
     QTimer.singleShot(0, window.start_pending_safe_import_recovery)
+    QTimer.singleShot(0, window.start_pending_playlist_retarget_recovery)
     return app.exec()
 
 

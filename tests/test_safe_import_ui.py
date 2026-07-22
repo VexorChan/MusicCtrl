@@ -5,6 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import threading
 import time
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -38,6 +39,64 @@ class _ScanController(QObject):
 
     def request_cancel(self):
         pass
+
+
+class _StartupSafeImportController(QObject):
+    completed = Signal(object)
+    cancelled = Signal(object)
+    failed = Signal(str)
+    warning = Signal(str)
+    running_changed = Signal(bool)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.running = False
+        self.phase = "recovery"
+        self.starts = 0
+
+    def start_recovery(self) -> None:
+        self.starts += 1
+        self.running = True
+        self.running_changed.emit(True)
+
+    def finish(self) -> None:
+        self.running = False
+        self.running_changed.emit(False)
+
+    def request_cancel(self) -> None:
+        self.finish()
+
+
+class _StartupPlaylistController(QObject):
+    completed = Signal(object)
+    cancelled = Signal(object)
+    failed = Signal(str)
+    warning = Signal(str)
+    running_changed = Signal(bool)
+    recovery_detected = Signal()
+    snapshot_ready = Signal(object)
+    root_changed = Signal(object)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.running = False
+        self.starts = 0
+        self.last_terminal_kind = ""
+
+    def remembered_root(self):
+        return None
+
+    def start_pending_retarget_recovery(self) -> None:
+        self.starts += 1
+        self.running = True
+        self.running_changed.emit(True)
+
+    def finish(self) -> None:
+        self.running = False
+        self.running_changed.emit(False)
+
+    def request_cancel(self) -> None:
+        self.finish()
 
 
 class SafeImportUiTests(unittest.TestCase):
@@ -262,6 +321,52 @@ class SafeImportUiTests(unittest.TestCase):
         self._wait(controller)
         self.assertIsNone(window._import_dialog)
 
+    def test_playlist_recovery_queues_behind_import_and_reports_status(self) -> None:
+        safe_import = _StartupSafeImportController()
+        playlist = _StartupPlaylistController()
+        window = MainWindow(
+            playlist_controller=playlist,
+            safe_import_controller=safe_import,
+        )
+        self.addCleanup(window.close)
+
+        window.start_pending_safe_import_recovery()
+        window.start_pending_playlist_retarget_recovery()
+        self.assertEqual(safe_import.starts, 1)
+        self.assertEqual(playlist.starts, 0)
+        self.assertTrue(window._playlist_retarget_recovery_queued)
+
+        safe_import.finish()
+        self.assertEqual(playlist.starts, 1)
+        self.assertFalse(window._playlist_retarget_recovery_queued)
+        playlist.recovery_detected.emit()
+        self.assertIn("正在安全重试", window.pages["所有音乐"].status.text())
+
+        playlist.warning.emit("日志收尾失败")
+        self.assertIn("日志收尾失败", window.pages["所有音乐"].status.text())
+        playlist.completed.emit(
+            SimpleNamespace(
+                action="retarget",
+                success_count=1,
+                skipped_count=0,
+                failure_count=1,
+            )
+        )
+        self.assertIn("下次启动会自动重试", window.pages["所有音乐"].status.text())
+        playlist.finish()
+
+    def test_close_pending_discards_queued_playlist_recovery(self) -> None:
+        playlist = _StartupPlaylistController()
+        window = MainWindow(playlist_controller=playlist)
+        self.addCleanup(window.close)
+        window._playlist_retarget_recovery_queued = True
+        window._close_pending = True
+
+        window._background_running_changed(False)
+
+        self.assertFalse(window._playlist_retarget_recovery_queued)
+        self.assertEqual(playlist.starts, 0)
+
     def test_production_main_schedules_recovery_after_show(self) -> None:
         config = DatabaseConfig(self.root / "main-wiring.sqlite3")
         fake_app = mock.Mock()
@@ -296,8 +401,12 @@ class SafeImportUiTests(unittest.TestCase):
 
         self.assertEqual(result, 23)
         fake_window.show.assert_called_once_with()
-        single_shot.assert_called_once_with(
-            0, fake_window.start_pending_safe_import_recovery
+        self.assertEqual(
+            single_shot.call_args_list,
+            [
+                mock.call(0, fake_window.start_pending_safe_import_recovery),
+                mock.call(0, fake_window.start_pending_playlist_retarget_recovery),
+            ],
         )
 
 

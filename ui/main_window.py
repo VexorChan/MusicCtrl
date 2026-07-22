@@ -82,6 +82,7 @@ class MainWindow(QMainWindow):
         self._playlist_snapshot_generation = 0
         self._pending_playlist_navigation: str | None = None
         self._safe_import_recovery_active = False
+        self._playlist_retarget_recovery_queued = False
         self.setWindowTitle("乐库整理助手")
         app = QApplication.instance()
         if app is not None and not app.windowIcon().isNull():
@@ -179,7 +180,13 @@ class MainWindow(QMainWindow):
             playlist_controller.completed.connect(self._playlist_completed)
             playlist_controller.cancelled.connect(self._playlist_cancelled)
             playlist_controller.failed.connect(self._playlist_failed)
+            if hasattr(playlist_controller, "warning"):
+                playlist_controller.warning.connect(self._playlist_warning)
             playlist_controller.running_changed.connect(self._background_running_changed)
+            if hasattr(playlist_controller, "recovery_detected"):
+                playlist_controller.recovery_detected.connect(
+                    self._playlist_recovery_detected
+                )
             if hasattr(playlist_controller, "snapshot_ready"):
                 playlist_controller.snapshot_ready.connect(self._apply_playlist_snapshot)
                 playlist_controller.root_changed.connect(self._playlist_root_changed)
@@ -444,6 +451,41 @@ class MainWindow(QMainWindow):
             if self._import_dialog is not None:
                 self._import_dialog.show_failed(f"无法启动上次导入恢复：{error}")
 
+    def start_pending_playlist_retarget_recovery(self) -> None:
+        """Queue P5 recovery behind any already-running startup or user task."""
+
+        if self._playlist_controller is None or self._close_pending:
+            return
+        self._playlist_retarget_recovery_queued = True
+        self._maybe_start_pending_playlist_retarget_recovery()
+
+    def _maybe_start_pending_playlist_retarget_recovery(self) -> None:
+        if not self._playlist_retarget_recovery_queued:
+            return
+        if self._close_pending:
+            self._playlist_retarget_recovery_queued = False
+            return
+        controller = self._playlist_controller
+        if controller is None:
+            self._playlist_retarget_recovery_queued = False
+            return
+        if self._has_running_background_task():
+            return
+        self._playlist_retarget_recovery_queued = False
+        try:
+            controller.start_pending_retarget_recovery()
+        except Exception as error:
+            page = self.pages.get("所有音乐")
+            if page is not None:
+                page.status.setText(f"无法启动待修复快捷方式恢复：{error}")
+
+    def _playlist_recovery_detected(self) -> None:
+        if self._close_pending:
+            return
+        page = self.pages.get("所有音乐")
+        if page is not None:
+            page.status.setText("检测到上次未完成的歌单快捷方式修复，正在安全重试…")
+
     def _safe_import_recovery_detected(self) -> None:
         if not self._safe_import_recovery_active or self._close_pending:
             return
@@ -586,9 +628,11 @@ class MainWindow(QMainWindow):
                 self._has_running_background_task()
             )
         if self._close_pending and not self._has_running_background_task():
+            self._playlist_retarget_recovery_queued = False
             QTimer.singleShot(0, self.close)
             return
         if not running:
+            self._maybe_start_pending_playlist_retarget_recovery()
             QTimer.singleShot(0, self._drain_library_refresh)
 
     def _queue_library_refresh(self, roots: object) -> None:
@@ -1413,8 +1457,25 @@ class MainWindow(QMainWindow):
             success = getattr(result, "success_count", 0)
             skipped = getattr(result, "skipped_count", 0)
             failed = getattr(result, "failure_count", 0)
-            page.status.setText(f"歌单操作完成：成功 {success}，跳过 {skipped}，失败 {failed}")
+            if getattr(result, "action", "") == "retarget":
+                if failed:
+                    page.status.setText(
+                        f"歌单快捷方式仍有 {failed} 项未修复；恢复记录已保留，下次启动会自动重试。"
+                    )
+                else:
+                    page.status.setText(
+                        f"歌单快捷方式修复完成：成功 {success}，已收敛 {skipped}。"
+                    )
+            else:
+                page.status.setText(f"歌单操作完成：成功 {success}，跳过 {skipped}，失败 {failed}")
         QTimer.singleShot(0, self._start_next_playlist_add)
+
+    def _playlist_warning(self, message: str) -> None:
+        page = self.pages.get("所有音乐")
+        if page is not None:
+            page.status.setText(f"歌单警告：{message}")
+        if self._rename_dialog is not None:
+            self._rename_dialog.show_warning(f"歌单快捷方式：{message}")
 
     def _playlist_cancelled(self, result: object) -> None:
         self._playlist_add_queue.clear()
@@ -1604,6 +1665,7 @@ class MainWindow(QMainWindow):
         if self._has_running_background_task():
             first_request = not self._close_pending
             self._close_pending = True
+            self._playlist_retarget_recovery_queued = False
             self._pending_refresh_roots.clear()
             self._playlist_add_queue.clear()
             self._pending_playlist_navigation = None
@@ -1625,6 +1687,7 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self._close_pending = True
+        self._playlist_retarget_recovery_queued = False
         self._pending_refresh_roots.clear()
         self._playlist_add_queue.clear()
         self._pending_playlist_navigation = None

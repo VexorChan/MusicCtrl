@@ -15,14 +15,16 @@ from database import DatabaseConfig
 from repositories import IndexBatchItem, LibraryRepository
 import services.playlist_controller as playlist_module
 from services.playlist_controller import (
+    PENDING_RETARGET_KEY,
     PLAYLIST_HISTORY_KEY,
+    PLAYLIST_ROOT_KEY,
     PlaylistAudioInput,
     PlaylistController,
     PlaylistRemovalInput,
     PlaylistRetargetInput,
     PlaylistSnapshot,
 )
-from services.windows_shortcuts import create_playlist_directory, create_shortcut
+from services.windows_shortcuts import create_playlist_directory, create_shortcut, read_shortcut
 from ui.main_window import MainWindow
 
 
@@ -55,12 +57,40 @@ class PlaylistControllerTests(unittest.TestCase):
         self.controller.set_root(self.playlist_root)
         self.controller.create_playlist("通勤")
 
-    def _wait(self) -> None:
+    def _wait(self, controller: PlaylistController | None = None) -> None:
+        active = self.controller if controller is None else controller
         deadline = time.monotonic() + 5
-        while self.controller.running and time.monotonic() < deadline:
+        while active.running and time.monotonic() < deadline:
             self.app.processEvents()
         self.app.processEvents()
-        self.assertFalse(self.controller.running, "playlist worker did not finish")
+        self.assertFalse(active.running, "playlist worker did not finish")
+
+    def _setting_value(self, key: str) -> object | None:
+        with LibraryRepository(self.config) as repository:
+            setting = repository.get_setting(key)
+        return None if setting is None else setting.value
+
+    def _install_retarget_fixture(
+        self, suffix: str = "新版"
+    ) -> tuple[Path, Path, Path, Path, PlaylistRetargetInput]:
+        old_audio = self.audio
+        old_shortcut = self.playlist_root / "通勤" / f"{old_audio.name}.lnk"
+        create_shortcut(
+            target_path=old_audio,
+            audio_root=self.audio_root,
+            shortcut_path=old_shortcut,
+            playlist_root=self.playlist_root,
+        )
+        new_audio = self.audio_root / f"晴天{suffix}-周杰伦.mp3"
+        os.rename(old_audio, new_audio)
+        new_shortcut = self.playlist_root / "通勤" / f"{new_audio.name}.lnk"
+        return (
+            old_audio,
+            new_audio,
+            old_shortcut,
+            new_shortcut,
+            PlaylistRetargetInput(old_audio, new_audio, self.audio_root),
+        )
 
     def test_add_load_and_remove_shortcut_preserve_audio(self) -> None:
         snapshot = (self.audio.read_bytes(), self.audio.stat().st_mtime_ns)
@@ -189,6 +219,202 @@ class PlaylistControllerTests(unittest.TestCase):
         self.assertEqual(results[-1].failure_count, 1)
         self.assertTrue(old_again.exists())
         self.assertEqual(target_again.read_bytes(), b"not-a-shortcut")
+
+    def test_retarget_failure_persists_journal_before_shortcut_write(self) -> None:
+        old_audio, new_audio, old_shortcut, new_shortcut, item = (
+            self._install_retarget_fixture("失败")
+        )
+        pending_seen: list[object | None] = []
+
+        def fail_after_journal(**_kwargs) -> None:
+            pending_seen.append(self._setting_value(PENDING_RETARGET_KEY))
+            raise RuntimeError("确定性快捷方式写入失败")
+
+        with patch.object(
+            playlist_module, "create_shortcut", side_effect=fail_after_journal
+        ):
+            self.controller.start_retarget((item,))
+            self._wait()
+
+        self.assertEqual(len(pending_seen), 1)
+        self.assertIsInstance(pending_seen[0], dict)
+        pending = self._setting_value(PENDING_RETARGET_KEY)
+        self.assertEqual(pending, pending_seen[0])
+        self.assertEqual(pending["playlist_root"], str(self.playlist_root))
+        self.assertEqual(
+            pending["items"],
+            [
+                {
+                    "source_path": str(old_audio),
+                    "target_path": str(new_audio),
+                    "audio_root": str(self.audio_root),
+                }
+            ],
+        )
+        self.assertTrue(old_shortcut.exists())
+        self.assertFalse(new_shortcut.exists())
+        self.assertEqual(read_shortcut(old_shortcut, playlist_root=self.playlist_root).target_path, old_audio)
+        latest = self.controller.list_history()[0]
+        self.assertEqual(latest.action, "retarget")
+        self.assertEqual(latest.failure_count, 1)
+
+    def test_pending_retarget_recovers_after_restart_and_finalizes_once(self) -> None:
+        _old_audio, new_audio, old_shortcut, new_shortcut, item = (
+            self._install_retarget_fixture("恢复")
+        )
+        with patch.object(
+            playlist_module,
+            "create_shortcut",
+            side_effect=RuntimeError("首次写入失败"),
+        ):
+            self.controller.start_retarget((item,))
+            self._wait()
+
+        pending = self._setting_value(PENDING_RETARGET_KEY)
+        self.assertIsInstance(pending, dict)
+        batch_id = pending["batch_id"]
+        reopened = PlaylistController(self.config)
+        completed: list[object] = []
+        failed: list[str] = []
+        reopened.completed.connect(completed.append)
+        reopened.failed.connect(failed.append)
+        reopened.start_pending_retarget_recovery()
+        self._wait(reopened)
+
+        self.assertEqual(failed, [])
+        self.assertEqual(len(completed), 1)
+        self.assertFalse(old_shortcut.exists())
+        self.assertTrue(new_shortcut.exists())
+        self.assertEqual(
+            read_shortcut(new_shortcut, playlist_root=self.playlist_root).target_path,
+            new_audio,
+        )
+        self.assertIsNone(self._setting_value(PENDING_RETARGET_KEY))
+        raw_history = self._setting_value(PLAYLIST_HISTORY_KEY)
+        self.assertIsInstance(raw_history, list)
+        matching = [entry for entry in raw_history if entry.get("id") == batch_id]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0]["action"], "retarget")
+        self.assertEqual(matching[0]["failure_count"], 0)
+
+    def test_pending_retarget_root_mismatch_fails_closed_and_retains_journal(self) -> None:
+        _old_audio, _new_audio, old_shortcut, new_shortcut, item = (
+            self._install_retarget_fixture("根不匹配")
+        )
+        with patch.object(
+            playlist_module,
+            "create_shortcut",
+            side_effect=RuntimeError("先保留恢复日志"),
+        ):
+            self.controller.start_retarget((item,))
+            self._wait()
+        pending_before = self._setting_value(PENDING_RETARGET_KEY)
+
+        other_root = self.root / "other-playlists"
+        other_root.mkdir()
+        self.controller.set_root(other_root)
+        failed: list[str] = []
+        self.controller.failed.connect(failed.append)
+        with (
+            patch.object(playlist_module, "create_shortcut") as create_spy,
+            patch.object(playlist_module, "remove_shortcut") as remove_spy,
+        ):
+            self.controller.start_pending_retarget_recovery()
+            self._wait()
+
+        self.assertEqual(len(failed), 1)
+        self.assertIn("歌单根", failed[0])
+        self.assertEqual(self._setting_value(PENDING_RETARGET_KEY), pending_before)
+        self.assertTrue(old_shortcut.exists())
+        self.assertFalse(new_shortcut.exists())
+        create_spy.assert_not_called()
+        remove_spy.assert_not_called()
+
+    def test_pending_retarget_rejects_replaced_playlist_root_identity(self) -> None:
+        _old_audio, _new_audio, old_shortcut, _new_shortcut, item = (
+            self._install_retarget_fixture("目录被替换")
+        )
+        with patch.object(
+            playlist_module,
+            "create_shortcut",
+            side_effect=RuntimeError("先保留恢复日志"),
+        ):
+            self.controller.start_retarget((item,))
+            self._wait()
+        pending_before = self._setting_value(PENDING_RETARGET_KEY)
+
+        parked_root = self.root / "parked-playlists"
+        os.rename(self.playlist_root, parked_root)
+        self.playlist_root.mkdir()
+        failed: list[str] = []
+        completed: list[object] = []
+        self.controller.failed.connect(failed.append)
+        self.controller.completed.connect(completed.append)
+
+        self.controller.start_pending_retarget_recovery()
+        self._wait()
+
+        self.assertEqual(completed, [])
+        self.assertEqual(len(failed), 1)
+        self.assertIn("已被替换", failed[0])
+        self.assertEqual(self._setting_value(PENDING_RETARGET_KEY), pending_before)
+        self.assertTrue((parked_root / old_shortcut.relative_to(self.playlist_root)).exists())
+        with self.assertRaisesRegex(RuntimeError, "尚未完成"):
+            self.controller.start_retarget((item,))
+        self.assertFalse(self.controller.running)
+        self.assertEqual(self._setting_value(PENDING_RETARGET_KEY), pending_before)
+
+    def test_pending_retarget_no_journal_is_silent(self) -> None:
+        history_before = self._setting_value(PLAYLIST_HISTORY_KEY)
+        completed: list[object] = []
+        cancelled: list[object] = []
+        failed: list[str] = []
+        warnings: list[str] = []
+        running: list[bool] = []
+        self.controller.completed.connect(completed.append)
+        self.controller.cancelled.connect(cancelled.append)
+        self.controller.failed.connect(failed.append)
+        self.controller.warning.connect(warnings.append)
+        self.controller.running_changed.connect(running.append)
+
+        self.controller.start_pending_retarget_recovery()
+        self._wait()
+
+        self.assertEqual(running, [True, False])
+        self.assertEqual(completed, [])
+        self.assertEqual(cancelled, [])
+        self.assertEqual(failed, [])
+        self.assertEqual(warnings, [])
+        self.assertEqual(self._setting_value(PLAYLIST_HISTORY_KEY), history_before)
+
+    def test_existing_pending_retarget_blocks_overwrite(self) -> None:
+        _old_audio, _new_audio, _old_shortcut, _new_shortcut, item = (
+            self._install_retarget_fixture("已有日志")
+        )
+        with patch.object(
+            playlist_module,
+            "create_shortcut",
+            side_effect=RuntimeError("保留首个恢复日志"),
+        ):
+            self.controller.start_retarget((item,))
+            self._wait()
+        pending_before = self._setting_value(PENDING_RETARGET_KEY)
+
+        another_source = self.audio_root / "另一首-歌手.mp3"
+        another_source.write_bytes(b"another")
+        another_target = self.audio_root / "另一首新版-歌手.mp3"
+        another_item = PlaylistRetargetInput(
+            another_source, another_target, self.audio_root
+        )
+        with (
+            patch.object(playlist_module, "create_shortcut") as create_spy,
+            self.assertRaisesRegex(RuntimeError, "尚未完成"),
+        ):
+            self.controller.start_retarget((another_item,))
+
+        self.assertFalse(self.controller.running)
+        self.assertEqual(self._setting_value(PENDING_RETARGET_KEY), pending_before)
+        create_spy.assert_not_called()
 
     def test_refresh_worker_is_read_only_off_thread_and_publishes_complete_snapshot(self) -> None:
         item = PlaylistAudioInput(self.asset.id, self.audio, self.audio_root, "active")
