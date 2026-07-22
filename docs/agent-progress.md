@@ -17,28 +17,30 @@
 - `7099d16 fix: recover interrupted imports on startup` 已原子提交：启动后后台检测 pending journal，仅在需要恢复或检测失败时显示窗口，恢复期间与其他后台任务互斥。
 - `817eed4 docs: record startup recovery completion` 及此前接管提交均已推送；`HEAD == origin/main`。
 - `b281b15 fix: recover managed playlist shortcuts after rename` 已通过独立复核、原子提交并推送；失败联动会保留持久化恢复记录，启动时按安全边界自动重试。
+- `9629cb8 feat: remember successful import directories` 已通过独立复核、原子提交并推送；音乐与歌词导入仅在成功移动后分别记忆源目录和目标目录，不会自动执行。
+- `8724120 feat: preview managed playlist impact before rename` 已通过独立复核、原子提交并推送；重命名前在线程外只读统计并展示受影响快捷方式数量，失败或取消时不启动重命名。
 - 最终验证结果：
   - `python -m unittest tests.test_library_repository tests.test_safe_import -q`：75/75 PASS。
-  - `python -m unittest discover -q`：385/385 PASS（对应已提交的快捷方式恢复包）。
+  - `python -m unittest discover`：392/392 PASS（对应已提交的快捷方式影响统计包）。
   - `python -m compileall -q .`：PASS。
   - `python smoke_test.py`：PASS。
   - `git diff --check`：PASS（仅 LF/CRLF 提示）。
 
 ## 正在执行
 
-- 文档一致性修复：以当前生产入口和 Git 事实同步安全移动导入、生产功能边界及最新版本交付状态。
-- 当前文档明确记录：P5 快捷方式失败恢复已经完成，但重命名确认前的受影响快捷方式数量统计尚未实现；当前 `HEAD` 的 EXE、安装目录和桌面快捷方式仍待重新构建与回读。
+- 文档一致性修复：同步安全导入目录记忆、P5 快捷方式影响统计和最新 Git 事实。
+- 当前 `HEAD` 的源码功能已通过回归；EXE、安装目录和桌面快捷方式仍需从最终文档提交后的 `HEAD` 重新构建与回读。
 
 ## 待完成
 
 1. 完成本文档一致性包的复核、原子提交与推送回读。
-2. 补齐重命名确认前的受影响快捷方式数量统计；在此之前不得宣称 P5 同计划预览完整完成。
-3. 最终全量回归，并从当前 `HEAD` 重新构建、安装和验证 EXE/桌面快捷方式。
+2. 从最终 `HEAD` 重新构建、安装和验证 EXE/桌面快捷方式。
+3. 完成最终功能清单与交付回读；不再开启新的非阻塞功能包。
 
 ## 已知问题与风险
 
-- GitHub 网络此前多次出现 443 连接重置；当前已恢复并回读 `HEAD == origin/main == b281b15`。
-- 重命名确认弹窗当前只显示待修改文件数和标签同步说明，不预先统计受影响快捷方式；快捷方式联动失败恢复已完成，但不能替代该预览需求。
+- GitHub 网络此前多次出现 443 连接重置；当前已恢复并回读 `HEAD == origin/main == 8724120`。
+- `start_retarget()` 的既有旧引用预检仍会在调用线程同步枚举受管快捷方式；重命名前的新增影响统计已经异步化，该项只作为后续性能维护记录，不影响当前正确性。
 - 当前源码与隔离构建口径统一为 Python 3.13.5；最终构建必须记录实际解释器与依赖版本。
 - 共享 Anaconda 环境的 `pip check` 存在项目外既有依赖冲突；最终交付应使用隔离构建环境。
 - 安全导入恢复不自动删除目标文件；候选仅在 Windows 同一受锁句柄完成身份/内容校验后删除。非 Windows 平台会失败关闭并保留恢复记录。
@@ -47,4 +49,4 @@
 ## 下一步
 
 - 文档一致性包通过后原子提交并推送，回读 ahead/behind 为 `0 0`。
-- 随后补齐快捷方式影响统计并完成最终全量回归，再从当前 `HEAD` 重新构建、安装和验证 EXE 与桌面快捷方式。
+- 从最终 `HEAD` 重新构建、安装和验证 EXE 与桌面快捷方式；完成后只做交付审计，不继续扩展非阻塞需求。
