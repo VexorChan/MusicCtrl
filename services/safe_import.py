@@ -26,6 +26,7 @@ SUPPORTED_AUDIO = {".mp3", ".flac", ".wav", ".m4a", ".ogg", ".aac"}
 _CANDIDATE_PREFIX = ".musicctrl-import-"
 IMPORT_HISTORY_KEY = "p6.import_history"
 PENDING_IMPORT_KEY = "p6.pending_import"
+IMPORT_PATHS_KEY = "p6.last_paths"
 _JOURNAL_VERSION = 1
 _JOURNAL_STATES = {
     "planned", "candidate_ready", "target_placed", "source_deleted", "done"
@@ -1475,6 +1476,48 @@ class SafeImportController(QObject):
     def current_plan(self) -> ImportPreviewPlan | None:
         return self._current_plan
 
+    def remembered_paths(self, mode: str) -> tuple[Path, Path] | None:
+        selected_mode = _validate_mode(mode)
+        try:
+            with self._repository_factory() as repository:
+                setting = repository.get_setting(IMPORT_PATHS_KEY)
+        except Exception as error:
+            self.warning.emit(f"无法读取上次导入目录：{error}")
+            return None
+        if setting is None:
+            return None
+        value = setting.value
+        if not isinstance(value, dict):
+            self.warning.emit("上次导入目录设置格式损坏，已忽略")
+            return None
+        entry = value.get(selected_mode)
+        if entry is None:
+            return None
+        if not isinstance(entry, dict) or set(entry) != {"source_root", "target_root"}:
+            self.warning.emit("上次导入目录设置字段损坏，已忽略")
+            return None
+        source = Path(str(entry.get("source_root", "")))
+        target = Path(str(entry.get("target_root", "")))
+        if not source.is_absolute() or not target.is_absolute():
+            self.warning.emit("上次导入目录不是绝对路径，已忽略")
+            return None
+        return source, target
+
+    def _remember_successful_paths(self, result: ImportRunResult) -> None:
+        if result.success_count <= 0 or result.mode not in {"audio", "lyrics"}:
+            return
+        with self._repository_factory() as repository:
+            setting = repository.get_setting(IMPORT_PATHS_KEY)
+            value = {} if setting is None else setting.value
+            if not isinstance(value, dict):
+                raise SafeImportError("上次导入目录设置格式损坏，拒绝覆盖")
+            updated = dict(value)
+            updated[result.mode] = {
+                "source_root": str(result.source_root),
+                "target_root": str(result.target_root),
+            }
+            repository.set_setting(IMPORT_PATHS_KEY, updated)
+
     def start(self, source_root: Path, target_root: Path, mode: str) -> None:
         self.start_preview(source_root, target_root, mode)
 
@@ -1575,6 +1618,16 @@ class SafeImportController(QObject):
         phase = self._phase
         if phase == "preview" and kind == "completed" and isinstance(value, ImportPreviewPlan):
             self._current_plan = value
+        if (
+            phase == "execute"
+            and kind == "completed"
+            and isinstance(value, ImportRunResult)
+            and value.success_count > 0
+        ):
+            try:
+                self._remember_successful_paths(value)
+            except Exception as error:
+                self.warning.emit(f"导入已完成，但保存目录记忆失败：{error}")
         self._worker = None
         self._terminal = None
         self._phase = "idle"

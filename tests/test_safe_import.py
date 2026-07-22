@@ -16,6 +16,7 @@ from repositories import LibraryRepository
 
 from services.safe_import import (
     IMPORT_HISTORY_KEY,
+    IMPORT_PATHS_KEY,
     PENDING_IMPORT_KEY,
     SafeImportError,
     SafeImportPreviewWorker,
@@ -136,6 +137,11 @@ class SafeImportTests(unittest.TestCase):
         self.assertEqual(len(completed), 1)
         self.assertEqual(failed, [])
         self.assertEqual(completed[0].success_count, 1)
+        self.assertEqual(
+            controller.remembered_paths("audio"),
+            (self.source, self.target),
+        )
+        self.assertIsNone(controller.remembered_paths("lyrics"))
 
     def test_planned_journal_write_failure_causes_zero_file_change(self) -> None:
         source = self.source / "journal.mp3"
@@ -164,6 +170,20 @@ class SafeImportTests(unittest.TestCase):
         self.assertTrue(failures)
         self.assertEqual(source.read_bytes(), payload)
         self.assertEqual(tuple(self.target.iterdir()), ())
+
+    def test_malformed_remembered_import_paths_fail_closed(self) -> None:
+        config = DatabaseConfig(self.root / "remembered.sqlite3")
+        malformed = {"audio": {"source_root": "relative", "target_root": str(self.target)}}
+        with LibraryRepository(config) as repository:
+            repository.set_setting(IMPORT_PATHS_KEY, malformed)
+        controller = SafeImportController(lambda: LibraryRepository(config))
+        warnings: list[str] = []
+        controller.warning.connect(warnings.append)
+
+        self.assertIsNone(controller.remembered_paths("audio"))
+        self.assertTrue(warnings)
+        with LibraryRepository(config) as repository:
+            self.assertEqual(repository.get_setting(IMPORT_PATHS_KEY).value, malformed)
 
     def test_recovery_rolls_forward_target_only_then_real_undo_succeeds(self) -> None:
         source = self.source / "recovery.mp3"

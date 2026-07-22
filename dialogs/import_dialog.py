@@ -35,6 +35,7 @@ class ImportDialog(PrototypeDialog):
         super().__init__("导入", (900, 620), parent)
         self.mode = "audio"
         self.live_mode = bool(live_mode)
+        self._remembered_paths: dict[str, tuple[Path, Path]] = {}
         self._running = False
         self._plan_id: str | None = None
         root = QVBoxLayout(self)
@@ -160,6 +161,13 @@ class ImportDialog(PrototypeDialog):
         if self.live_mode:
             if changed:
                 self._invalidate_preview()
+                remembered = self._remembered_paths.get(mode)
+                if remembered is None:
+                    self.scan_path.clear()
+                    self.target_path.clear()
+                else:
+                    self.scan_path.setText(str(remembered[0]))
+                    self.target_path.setText(str(remembered[1]))
             self.table.setRowCount(0)
             self.summary.setText("请选择源目录和目标目录，然后开始安全导入。")
             return
@@ -178,6 +186,16 @@ class ImportDialog(PrototypeDialog):
             self.summary.setText("已选择 12 项    ·    可移动 9 项    ·    冲突 2 项    ·    重复 1 项")
         else:
             self.summary.setText("已选择 6 项    ·    可移动 3 项    ·    冲突 2 项    ·    重复 1 项")
+
+    def set_remembered_paths(self, mode: str, source_root: Path, target_root: Path) -> None:
+        if mode not in {"audio", "lyrics"}:
+            raise ValueError("导入模式无效")
+        if not source_root.is_absolute() or not target_root.is_absolute():
+            raise ValueError("记忆的导入目录必须是绝对路径")
+        self._remembered_paths[mode] = (source_root, target_root)
+        if self.live_mode and self.mode == mode:
+            self.scan_path.setText(str(source_root))
+            self.target_path.setText(str(target_root))
 
     def _request_preview(self) -> None:
         source = Path(self.scan_path.text().strip())

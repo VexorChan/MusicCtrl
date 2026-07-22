@@ -129,6 +129,17 @@ class SafeImportUiTests(unittest.TestCase):
         self.assertEqual(dialog.table.columnCount(), 4)
         self.assertEqual(dialog.table.horizontalHeaderItem(1).text(), "源文件")
         self.assertEqual(dialog.table.horizontalHeaderItem(2).text(), "目标文件")
+        audio_source = self.root / "audio-source"
+        audio_target = self.root / "audio-target"
+        lyric_source = self.root / "lyric-source"
+        lyric_target = self.root / "lyric-target"
+        dialog.set_remembered_paths("audio", audio_source, audio_target)
+        dialog.set_remembered_paths("lyrics", lyric_source, lyric_target)
+        self.assertEqual(dialog.scan_path.text(), str(audio_source))
+        self.assertEqual(dialog.target_path.text(), str(audio_target))
+        dialog.set_mode("lyrics")
+        self.assertEqual(dialog.scan_path.text(), str(lyric_source))
+        self.assertEqual(dialog.target_path.text(), str(lyric_target))
 
     def test_main_window_preview_invalidation_and_confirmed_execution(self) -> None:
         source = self.source / "song.mp3"

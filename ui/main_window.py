@@ -380,6 +380,11 @@ class MainWindow(QMainWindow):
             dialog.discard_preview_requested.connect(self._discard_safe_import_preview)
             dialog.scan_existing_requested.connect(self.open_read_only_scan)
             dialog.cancel_requested.connect(self._safe_import_controller.request_cancel)
+            if hasattr(self._safe_import_controller, "remembered_paths"):
+                for mode in ("audio", "lyrics"):
+                    remembered = self._safe_import_controller.remembered_paths(mode)
+                    if remembered is not None:
+                        dialog.set_remembered_paths(mode, *remembered)
             dialog.set_running(
                 self._safe_import_controller.running,
                 getattr(self._safe_import_controller, "phase", "execute"),
