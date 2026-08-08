@@ -304,6 +304,8 @@ class PlaylistControllerTests(unittest.TestCase):
         self.assertIsInstance(pending_seen[0], dict)
         pending = self._setting_value(PENDING_RETARGET_KEY)
         self.assertEqual(pending, pending_seen[0])
+        self.assertEqual(pending["version"], 2)
+        self.assertEqual(pending["phase"], "apply")
         self.assertEqual(pending["playlist_root"], str(self.playlist_root))
         self.assertEqual(
             pending["items"],
@@ -360,6 +362,38 @@ class PlaylistControllerTests(unittest.TestCase):
         self.assertEqual(len(matching), 1)
         self.assertEqual(matching[0]["action"], "retarget")
         self.assertEqual(matching[0]["failure_count"], 0)
+
+    def test_pending_retarget_v1_journal_remains_recoverable(self) -> None:
+        _old_audio, new_audio, old_shortcut, new_shortcut, item = (
+            self._install_retarget_fixture("旧版日志")
+        )
+        with patch.object(
+            playlist_module,
+            "create_shortcut",
+            side_effect=RuntimeError("保留执行日志"),
+        ):
+            self.controller.start_retarget((item,))
+            self._wait()
+
+        pending = self._setting_value(PENDING_RETARGET_KEY)
+        self.assertIsInstance(pending, dict)
+        legacy = dict(pending)
+        legacy["version"] = 1
+        legacy.pop("phase")
+        with LibraryRepository(self.config) as repository:
+            repository.set_setting(PENDING_RETARGET_KEY, legacy)
+
+        reopened = PlaylistController(self.config)
+        reopened.start_pending_retarget_recovery()
+        self._wait(reopened)
+
+        self.assertFalse(old_shortcut.exists())
+        self.assertTrue(new_shortcut.exists())
+        self.assertEqual(
+            read_shortcut(new_shortcut, playlist_root=self.playlist_root).target_path,
+            new_audio,
+        )
+        self.assertIsNone(self._setting_value(PENDING_RETARGET_KEY))
 
     def test_pending_retarget_root_mismatch_fails_closed_and_retains_journal(self) -> None:
         _old_audio, _new_audio, old_shortcut, new_shortcut, item = (
@@ -485,7 +519,7 @@ class PlaylistControllerTests(unittest.TestCase):
         self.assertEqual(self._setting_value(PENDING_RETARGET_KEY), pending_before)
         create_spy.assert_not_called()
 
-    def test_retarget_preparation_enumerates_off_owner_thread_without_journal_for_no_match(
+    def test_retarget_preparation_enumerates_off_owner_thread_and_finalizes_no_match(
         self,
     ) -> None:
         entered = threading.Event()
@@ -524,7 +558,7 @@ class PlaylistControllerTests(unittest.TestCase):
         self.assertEqual(latest.items[0].result, "skipped")
         self.assertIn("未发现引用", latest.items[0].message)
 
-    def test_retarget_preparation_failure_is_visible_and_writes_nothing(self) -> None:
+    def test_retarget_preparation_failure_retains_discover_journal(self) -> None:
         _old_audio, _new_audio, old_shortcut, new_shortcut, item = (
             self._install_retarget_fixture("准备失败")
         )
@@ -546,13 +580,23 @@ class PlaylistControllerTests(unittest.TestCase):
         self.assertEqual(len(failures), 1)
         self.assertIn("联动准备失败", failures[0])
         self.assertIn("拒绝读取快捷方式", failures[0])
-        self.assertIsNone(self._setting_value(PENDING_RETARGET_KEY))
+        pending = self._setting_value(PENDING_RETARGET_KEY)
+        self.assertIsInstance(pending, dict)
+        self.assertEqual(pending["version"], 2)
+        self.assertEqual(pending["phase"], "discover")
         self.assertTrue(old_shortcut.exists())
         self.assertFalse(new_shortcut.exists())
         create_spy.assert_not_called()
         remove_spy.assert_not_called()
 
-    def test_retarget_preparation_cancel_writes_no_journal_or_shortcut(self) -> None:
+        reopened = PlaylistController(self.config)
+        reopened.start_pending_retarget_recovery()
+        self._wait(reopened)
+        self.assertFalse(old_shortcut.exists())
+        self.assertTrue(new_shortcut.exists())
+        self.assertIsNone(self._setting_value(PENDING_RETARGET_KEY))
+
+    def test_retarget_preparation_cancel_retains_discover_journal(self) -> None:
         _old_audio, _new_audio, old_shortcut, new_shortcut, item = (
             self._install_retarget_fixture("准备取消")
         )
@@ -564,7 +608,11 @@ class PlaylistControllerTests(unittest.TestCase):
         def slow_prepare(_root, _items, cancel):
             entered.set()
             release.wait(timeout=5)
-            return None if cancel.is_set() else ()
+            return (
+                None
+                if cancel.is_set()
+                else playlist_module._PlaylistRetargetDiscovery((), ())
+            )
 
         with (
             patch.object(
@@ -582,13 +630,15 @@ class PlaylistControllerTests(unittest.TestCase):
             self._wait()
 
         self.assertEqual(cancelled, [None])
-        self.assertIsNone(self._setting_value(PENDING_RETARGET_KEY))
+        pending = self._setting_value(PENDING_RETARGET_KEY)
+        self.assertIsInstance(pending, dict)
+        self.assertEqual(pending["phase"], "discover")
         self.assertTrue(old_shortcut.exists())
         self.assertFalse(new_shortcut.exists())
         create_spy.assert_not_called()
         remove_spy.assert_not_called()
 
-    def test_retarget_preparation_rejects_root_replacement_before_journal(self) -> None:
+    def test_retarget_preparation_root_replacement_retains_discover_journal(self) -> None:
         _old_audio, _new_audio, old_shortcut, new_shortcut, item = (
             self._install_retarget_fixture("准备换根")
         )
@@ -617,7 +667,9 @@ class PlaylistControllerTests(unittest.TestCase):
 
         self.assertEqual(len(failures), 1)
         self.assertIn("发生变化", failures[0])
-        self.assertIsNone(self._setting_value(PENDING_RETARGET_KEY))
+        pending = self._setting_value(PENDING_RETARGET_KEY)
+        self.assertIsInstance(pending, dict)
+        self.assertEqual(pending["phase"], "discover")
         self.assertTrue((parked_root / old_shortcut.relative_to(self.playlist_root)).exists())
         self.assertFalse(new_shortcut.exists())
         create_spy.assert_not_called()

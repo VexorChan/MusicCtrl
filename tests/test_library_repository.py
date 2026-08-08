@@ -989,6 +989,38 @@ class LibraryRepositoryTests(unittest.TestCase):
             )
         self.assertEqual(repository.get_setting("p6.pending_import").value, first)
 
+    def test_import_journal_transition_requires_exact_expected_value(self) -> None:
+        repository = self.create_repository()
+        pending_key = "p5.pending_retarget"
+        discover = {"batch_id": "batch-1", "version": 2, "phase": "discover"}
+        apply = {"batch_id": "batch-1", "version": 2, "phase": "apply"}
+        repository.create_import_journal(
+            pending_key=pending_key,
+            batch_id="batch-1",
+            journal=discover,
+        )
+
+        repository.transition_import_journal(
+            pending_key=pending_key,
+            batch_id="batch-1",
+            expected_journal=discover,
+            replacement_journal=apply,
+        )
+        self.assertEqual(repository.get_setting(pending_key).value, apply)
+
+        with self.assertRaises(RepositoryDataError):
+            repository.transition_import_journal(
+                pending_key=pending_key,
+                batch_id="batch-1",
+                expected_journal=discover,
+                replacement_journal={
+                    "batch_id": "batch-1",
+                    "version": 2,
+                    "phase": "damaged",
+                },
+            )
+        self.assertEqual(repository.get_setting(pending_key).value, apply)
+
     def test_import_journal_finalize_uses_type_strict_json_equality(self) -> None:
         repository = self.create_repository()
         pending = {"batch_id": "typed", "version": 1}

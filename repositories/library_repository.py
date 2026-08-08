@@ -1763,6 +1763,43 @@ class LibraryRepository:
         except sqlite3.IntegrityError as error:
             raise RepositoryDataError("存在尚未处理的安全导入恢复日志") from error
 
+    def transition_import_journal(
+        self,
+        *,
+        pending_key: str,
+        batch_id: str,
+        expected_journal: dict[str, object],
+        replacement_journal: dict[str, object],
+    ) -> None:
+        """Conditionally replace one durable journal without losing concurrent work."""
+
+        self._require_open_in_owner_thread()
+        if (
+            not isinstance(pending_key, str)
+            or not pending_key.strip()
+            or not isinstance(batch_id, str)
+            or not batch_id.strip()
+            or not isinstance(expected_journal, dict)
+            or expected_journal.get("batch_id") != batch_id
+            or not isinstance(replacement_journal, dict)
+            or replacement_journal.get("batch_id") != batch_id
+        ):
+            raise RepositoryDataError("待恢复日志转换参数损坏")
+        encoded_expected = self._encode_setting_value(expected_journal)
+        encoded_replacement = self._encode_setting_value(replacement_journal)
+        with self._transaction(operation_id=batch_id, item_id=pending_key):
+            row = self._connection.execute(
+                "SELECT value_json FROM settings WHERE key = ?", (pending_key,)
+            ).fetchone()
+            if row is None or row["value_json"] != encoded_expected:
+                raise RepositoryDataError("待恢复日志已变化，拒绝覆盖")
+            cursor = self._connection.execute(
+                "UPDATE settings SET value_json = ?, updated_at = ? WHERE key = ? AND value_json = ?",
+                (encoded_replacement, _utc_now(), pending_key, encoded_expected),
+            )
+            if cursor.rowcount != 1:
+                raise RepositoryDataError("待恢复日志并发变化，拒绝覆盖")
+
     def read_import_finalize_state(
         self,
         *,
