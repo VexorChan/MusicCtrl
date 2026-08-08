@@ -4,7 +4,7 @@
 
 - 需求范围内完全未实现功能：**0 项**。
 - M1～P8 产品能力均有真实 UI/controller/repository 或受管文件实现，并有自动化验证。
-- 本轮确认的 6 项缺陷已完成代码修复或规则统一；最终 EXE 重建与安装回读仍属于本轮 P8 交付门禁，完成后写入交付记录。
+- 本轮确认的 6 项缺陷已完成代码修复或规则统一；最终 EXE 重建、安装、清单和快捷方式回读也已通过，证据见 `delivery-record-2026-08-09.md`。
 
 ## 功能矩阵
 
@@ -18,7 +18,7 @@
 | P5 | 受管歌单创建/移除/刷新、重命名联动和启动恢复 | `playlist_controller.py`、`windows_shortcuts.py` | playlist controller/shortcut tests | 已实现 |
 | P6 | 预览、大小与 SHA-256 校验、安全移动、恢复与最近完整导入撤销 | `safe_import.py` | safe import、recovery、UI tests | 已实现 |
 | P7 | 引用检查、备份、恢复、保留期清理与组恢复 | `backup_manager.py` | backup manager、history/settings tests | 已实现 |
-| P8 | 隔离构建、项目外启动、安装目录与快捷方式回读 | `MusicCtrl.spec`、构建/清单脚本和交付文档 | compile、smoke、manifest、EXE probes | 已实现；本轮重建待门禁 |
+| P8 | 隔离构建、项目外启动、安装目录与快捷方式回读 | `MusicCtrl.spec`、构建/清单脚本和交付文档 | compile、smoke、manifest、EXE probes | 已实现；本轮重建通过 |
 
 ## 本轮缺陷处理
 
