@@ -13,7 +13,7 @@
 
 ## 技术栈
 
-- 使用 Python 3.12、PySide6 和 SQLite。
+- 使用 Python 3.13.5、PySide6 和 SQLite。
 - 中文界面使用 Microsoft YaHei UI，英文和数字可使用 Segoe UI。
 - UI 优先使用 PySide6 自带组件和统一 QSS，不引入大型第三方 UI 框架。
 - 正式数据表格使用 Qt Model/View；原型中的简单模拟表格可以使用 `QTableWidget`。

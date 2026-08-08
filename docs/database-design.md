@@ -7,7 +7,7 @@
 - 标记为“P1 v1 已部署”的表、字段、约束、索引和事务已经存在于当前 migration。
 - 标记为“P2-B1 v2 已部署”的重命名审计表和 repository 状态机已经存在于当前 migration；v2 本身不执行文件重命名。
 - P2-C 已复用 v2 rename operation 的 `after_json.metadata_sync` 保存原始/写入标签快照和实际新指纹，没有新增 schema；P4 v3 只新增最小 `lyrics_matches`。
-- P5 使用 `p5.playlist_root`、`p5.operation_history`、`p5.pending_retargets`；P6 使用 `p6.import_history`、`p6.pending_import`、`p6.last_paths`；P7 使用 `p7.backup_entries`、`p7.retention_days`、`p7.operation_history`、`p7.pending_cleanup`、`p7.pending_linked_backup`。
+- P5 使用 `p5.playlist_root`、`p5.operation_history`、`p5.pending_retargets`；其中 pending retarget v2 区分 `discover` 与 `apply`，v1 按 `apply` 兼容读取，阶段转换以 batch ID、旧值完整 JSON 的条件更新防止并发覆盖。P6 使用 `p6.import_history`、`p6.pending_import`、`p6.last_paths`；P7 使用 `p7.backup_entries`、`p7.retention_days`、`p7.operation_history`、`p7.pending_cleanup`、`p7.pending_linked_backup`。
 - 这些值全部通过 repository 严格 JSON 读写和校验；未来的规范化表仅是可选演进方向，不代表当前功能未完成。
 - 后续新增正式字段或表时，必须先更新设计、增加连续 migration，并完成升级、回滚和数据保留测试。
 
@@ -46,11 +46,10 @@ assets ── lyrics_matches（audio / external lyric）
 ### 2.2 当前 P5～P7 逻辑关系（非独立数据表）
 
 ```text
-assets
-├── audio_tracks
-│   ├── lyrics_files
-│   └── playlist_items ── playlists
-└── backup_entries
+assets + lyrics_matches + operations
+├── settings JSON：歌单根、操作历史、discover/apply 恢复日志
+├── settings JSON：导入历史、导入恢复日志、最近目录
+└── settings JSON + 文件 journal：备份清单、清理与组备份恢复
 ```
 
 以上是运行时逻辑关系，不是当前 v3 的外键表图。P5～P7 已通过经过校验的 settings JSON、受管快捷方式和备份目录实现；P4 v3 直接使用 `assets(kind='audio'/'lyric')` 建立最小歌词匹配历史。只有未来出现明确查询、容量或完整性收益时，才新增连续 migration 将这些记录规范化，不能把可选草案当作当前完成门槛。
