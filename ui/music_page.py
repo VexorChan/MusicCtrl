@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
 
 from mock.data import PLAYLISTS
 from ui.components import make_status_badge
-from ui.tables import DataTable, ModelDataTable
+from ui.tables import DataTable, ModelDataTable, StatusBadgeDelegate
 
 
 def _normalize(text: str) -> str:
@@ -332,6 +332,10 @@ class LibraryPage(QWidget):
             self.table = ModelDataTable(checkable_header=True)
             self._table_model = LibraryTableModel(kind=self.kind, parent=self.table)
             self.table.setModel(self._table_model)
+            self.table.setItemDelegateForColumn(
+                len(self._table_model.columns()) - 1,
+                StatusBadgeDelegate(self.table),
+            )
             self._table_model.check_state_changed.connect(self._update_selection_state)
         else:
             self.table = DataTable(checkable_header=True)

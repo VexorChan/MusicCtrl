@@ -14,10 +14,10 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
-    QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
 )
+from ui.tables import ModelDataTable
 
 
 class ReadOnlyScanDialog(QDialog):
@@ -57,11 +57,13 @@ class ReadOnlyScanDialog(QDialog):
         path_row.addWidget(self.choose_button)
         root.addLayout(path_row)
 
-        self.table = QTableWidget(0, 3)
+        self.table = ModelDataTable()
+        self.table.setColumnCount(3)
+        self.table.setRowCount(0)
         self.table.setHorizontalHeaderLabels(["No.", "名称", "状态"])
         self.table.horizontalHeader().setStretchLastSection(False)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setEditTriggers(self.table.EditTrigger.NoEditTriggers)
         root.addWidget(self.table, 1)
 
         self.summary = QLabel("尚未开始扫描。请选择目录后点击“开始扫描”。")

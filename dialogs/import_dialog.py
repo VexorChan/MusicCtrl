@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
 from dialogs.common import PrototypeDialog, dialog_header
 from mock.data import IMPORT_AUDIO, IMPORT_LYRICS
 from ui.components import make_status_badge
-from ui.tables import DataTable
+from ui.tables import DataTable, ModelDataTable, StatusBadgeDelegate
 
 
 class ImportDialog(PrototypeDialog):
@@ -89,7 +89,7 @@ class ImportDialog(PrototypeDialog):
         self.mode_hint.setObjectName("Hint")
         root.addWidget(self.mode_hint)
 
-        self.table = DataTable()
+        self.table = ModelDataTable() if live_mode else DataTable()
         self.table.setColumnCount(4 if live_mode else 3)
         self.table.setHorizontalHeaderLabels(
             ["No.", "源文件", "目标文件", "状态"] if live_mode else ["No.", "名称", "状态"]
@@ -100,6 +100,7 @@ class ImportDialog(PrototypeDialog):
         if live_mode:
             self.table.horizontalHeader().setSectionResizeMode(2, self.table.horizontalHeader().ResizeMode.Stretch)
             self.table.setColumnWidth(3, 140)
+            self.table.setItemDelegateForColumn(3, StatusBadgeDelegate(self.table))
         else:
             self.table.setColumnWidth(2, 180)
         root.addWidget(self.table, 1)
@@ -243,6 +244,7 @@ class ImportDialog(PrototypeDialog):
             self.table.setItem(row, 1, QTableWidgetItem(str(item.source_path)))
             self.table.setItem(row, 2, QTableWidgetItem(str(item.target_path)))
             status = QTableWidgetItem(labels.get(item.status, item.status))
+            status.setData(Qt.ItemDataRole.UserRole, labels.get(item.status, item.status))
             status.setToolTip(item.message)
             self.table.setItem(row, 3, status)
         self.move_button.setEnabled(getattr(plan, "ready_count", 0) > 0 and not self._running)
@@ -287,6 +289,7 @@ class ImportDialog(PrototypeDialog):
                 status_column = 3
             status = labels.get(item.status, item.status)
             status_item = QTableWidgetItem(status)
+            status_item.setData(Qt.ItemDataRole.UserRole, status)
             status_item.setToolTip(item.message)
             self.table.setItem(row, status_column, status_item)
         prefix = "已取消" if cancelled else "已完成"

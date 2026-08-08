@@ -18,7 +18,7 @@ from dialogs.common import PrototypeDialog, dialog_header
 from mock.data import HISTORY
 from services.history_service import HistoryDetail, HistoryRecord, HistoryService, HistorySnapshot
 from ui.components import make_status_badge
-from ui.tables import DataTable
+from ui.tables import DataTable, ModelDataTable, StatusBadgeDelegate
 
 
 _FILTERS = (
@@ -128,7 +128,7 @@ class HistoryDialog(PrototypeDialog):
         self.warning_label.setStyleSheet("color:#a55b00")
         root.addWidget(self.warning_label)
 
-        self.table = DataTable()
+        self.table = ModelDataTable() if self._live_mode else DataTable()
         self.table.setColumnCount(5)
         self.table.setHorizontalHeaderLabels(["时间", "操作类型", "成功数量", "失败数量", "状态"])
         self.table.setColumnWidth(0, 190)
@@ -136,13 +136,15 @@ class HistoryDialog(PrototypeDialog):
         self.table.setColumnWidth(2, 100)
         self.table.setColumnWidth(3, 100)
         self.table.setColumnWidth(4, 130)
+        if self._live_mode:
+            self.table.setItemDelegateForColumn(4, StatusBadgeDelegate(self.table))
         self.table.itemSelectionChanged.connect(self._selection_changed)
         root.addWidget(self.table, 2)
 
         detail_title = QLabel("操作明细")
         detail_title.setStyleSheet("font-weight:600")
         root.addWidget(detail_title)
-        self.detail_table = DataTable()
+        self.detail_table = ModelDataTable() if self._live_mode else DataTable()
         self.detail_table.setColumnCount(6)
         self.detail_table.setHorizontalHeaderLabels(["文件", "原路径", "目标路径", "结果", "原因", "时间"])
         self.detail_table.horizontalHeader().setSectionResizeMode(0, self.detail_table.horizontalHeader().ResizeMode.ResizeToContents)
@@ -217,7 +219,8 @@ class HistoryDialog(PrototypeDialog):
                     item.setData(Qt.ItemDataRole.UserRole, record.status)
                     item.setToolTip(str(value))
                 self.table.setItem(row, column, item)
-            self.table.setCellWidget(row, 4, make_status_badge(record.status))
+            if not self._live_mode:
+                self.table.setCellWidget(row, 4, make_status_badge(record.status))
         if self._visible_records:
             self.table.selectRow(0)
             self._selection_changed()

@@ -1476,6 +1476,18 @@ class SafeImportController(QObject):
     def current_plan(self) -> ImportPreviewPlan | None:
         return self._current_plan
 
+    def close(self) -> None:
+        """Release the controller-owned temporary repository when it is idle."""
+
+        if self.running:
+            raise RuntimeError("安全导入任务运行期间不能关闭 controller")
+        directory = self._ephemeral_repository_dir
+        if directory is None:
+            return
+        self._ephemeral_repository_dir = None
+        self._current_plan = None
+        directory.cleanup()
+
     def remembered_paths(self, mode: str) -> tuple[Path, Path] | None:
         selected_mode = _validate_mode(mode)
         try:

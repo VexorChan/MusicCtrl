@@ -66,7 +66,7 @@ class MainWindow(QMainWindow):
         self._playlist_controller = playlist_controller
         self._safe_import_controller = safe_import_controller
         self._backup_controller = backup_controller
-        self._use_model_view = bool(use_model_view)
+        self._use_model_view = bool(use_model_view or scan_controller is not None)
         self._scan_dialog: ReadOnlyScanDialog | None = None
         self._import_dialog: ImportDialog | None = None
         self._rename_dialog: RenamePreviewDialog | None = None
@@ -137,7 +137,14 @@ class MainWindow(QMainWindow):
         lyrics_count = 214 if lyrics_match_controller is None else 0
         self._add_page(
             "所有歌词",
-            LibraryPage("所有歌词", lyrics_data, kind="lyrics", display_count=lyrics_count),
+            LibraryPage(
+                "所有歌词",
+                lyrics_data,
+                kind="lyrics",
+                display_count=lyrics_count,
+                use_model_view=self._use_model_view,
+                live_mode=lyrics_match_controller is not None,
+            ),
         )
         display_counts = {"我喜欢的": 62, "粤语": 36, "通勤": 28, "怀旧": 41, "古巨基": 17}
         if playlist_controller is None:

@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 
 from dialogs.common import PrototypeDialog, dialog_header
 from ui.components import make_status_badge
+from ui.tables import ModelDataTable, StatusBadgeDelegate
 
 
 class LyricsMatchDialog(PrototypeDialog):
@@ -128,8 +129,10 @@ class LyricsMatchDialog(PrototypeDialog):
         root.addLayout(actions)
         self._update_live_actions()
 
-    def _live_results_table(self) -> QTableWidget:
-        table = QTableWidget(0, 6)
+    def _live_results_table(self) -> ModelDataTable:
+        table = ModelDataTable()
+        table.setColumnCount(6)
+        table.setRowCount(0)
         table.setHorizontalHeaderLabels(["选择", "音频", "歌词候选", "置信度", "状态", "说明"])
         table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
@@ -140,6 +143,7 @@ class LyricsMatchDialog(PrototypeDialog):
         table.setColumnWidth(2, 220)
         table.setColumnWidth(3, 72)
         table.setColumnWidth(4, 110)
+        table.setItemDelegateForColumn(4, StatusBadgeDelegate(table))
         table.itemSelectionChanged.connect(self._update_live_actions)
         table.itemChanged.connect(lambda _item: self._update_live_actions())
         return table
@@ -192,7 +196,7 @@ class LyricsMatchDialog(PrototypeDialog):
         )
         self._update_live_actions()
 
-    def _populate_live_table(self, table: QTableWidget, items: tuple[object, ...]) -> None:
+    def _populate_live_table(self, table: ModelDataTable, items: tuple[object, ...]) -> None:
         table.blockSignals(True)
         table.setRowCount(len(items))
         for row, item in enumerate(items):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import gc
 from dataclasses import replace
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ from tempfile import TemporaryDirectory
 import threading
 import time
 import unittest
+import warnings
 from unittest import mock
 
 from PySide6.QtWidgets import QApplication
@@ -119,6 +121,7 @@ class SafeImportTests(unittest.TestCase):
     def test_controller_runs_in_background_and_emits_single_terminal(self) -> None:
         (self.source / "a.mp3").write_bytes(b"audio")
         controller = SafeImportController()
+        self.addCleanup(controller.close)
         completed = []
         failed = []
         controller.completed.connect(completed.append)
@@ -142,6 +145,31 @@ class SafeImportTests(unittest.TestCase):
             (self.source, self.target),
         )
         self.assertIsNone(controller.remembered_paths("lyrics"))
+
+    def test_controller_close_is_idempotent_and_releases_temporary_repository(self) -> None:
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always", ResourceWarning)
+            controller = SafeImportController()
+            repository_root = Path(controller._ephemeral_repository_dir.name)
+            controller.close()
+            controller.close()
+            del controller
+            gc.collect()
+
+        self.assertFalse(repository_root.exists())
+        self.assertEqual(
+            [item for item in captured if issubclass(item.category, ResourceWarning)],
+            [],
+        )
+
+    def test_controller_close_rejects_running_task(self) -> None:
+        (self.source / "slow.mp3").write_bytes(b"audio")
+        controller = SafeImportController()
+        self.addCleanup(lambda: None if controller.running else controller.close())
+        controller.start_preview(self.source, self.target, "audio")
+        with self.assertRaisesRegex(RuntimeError, "运行期间"):
+            controller.close()
+        self._wait_for_controller(controller)
 
     def test_planned_journal_write_failure_causes_zero_file_change(self) -> None:
         source = self.source / "journal.mp3"
@@ -474,6 +502,7 @@ class SafeImportTests(unittest.TestCase):
             for path in self.root.rglob("*") if path.is_file()
         }
         controller = SafeImportController()
+        self.addCleanup(controller.close)
         controller.start_preview(self.source, self.target, "audio")
         self._wait_for_controller(controller)
         plan = controller.current_plan
@@ -491,6 +520,7 @@ class SafeImportTests(unittest.TestCase):
         planned = self.source / "planned.mp3"
         planned.write_bytes(b"planned")
         controller = SafeImportController()
+        self.addCleanup(controller.close)
         controller.start_preview(self.source, self.target, "audio")
         self._wait_for_controller(controller)
         plan = controller.current_plan
@@ -510,6 +540,7 @@ class SafeImportTests(unittest.TestCase):
         source = self.source / "race.mp3"
         source.write_bytes(b"source")
         controller = SafeImportController()
+        self.addCleanup(controller.close)
         completed: list[object] = []
         controller.completed.connect(completed.append)
         controller.start_preview(self.source, self.target, "audio")

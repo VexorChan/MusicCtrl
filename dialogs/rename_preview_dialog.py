@@ -11,7 +11,7 @@ from dialogs.common import PrototypeDialog, dialog_header, footer_buttons
 from mock.data import RENAME_ROWS
 from services.metadata_preview import MetadataPreviewResult
 from ui.components import make_status_badge
-from ui.tables import DataTable
+from ui.tables import DataTable, ModelDataTable, StatusBadgeDelegate
 
 
 _READ_ONLY_FLAGS = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
@@ -47,7 +47,7 @@ class RenamePreviewDialog(PrototypeDialog):
         )
         root.addWidget(dialog_header("重命名预览", subtitle))
 
-        self.table = DataTable()
+        self.table = ModelDataTable() if live_mode else DataTable()
         self.table.setEditTriggers(self.table.EditTrigger.DoubleClicked | self.table.EditTrigger.EditKeyPressed)
         root.addWidget(self.table, 1)
 
@@ -119,6 +119,7 @@ class RenamePreviewDialog(PrototypeDialog):
         self.table.setColumnWidth(3, 72)
         self.table.setColumnWidth(4, 100)
         self.table.setColumnWidth(5, 130)
+        self.table.setItemDelegateForColumn(5, StatusBadgeDelegate(self.table))
 
     def replace_results(self, results: Sequence[MetadataPreviewResult]) -> None:
         if not self.live_mode:
@@ -157,7 +158,6 @@ class RenamePreviewDialog(PrototypeDialog):
             status_item.setData(Qt.ItemDataRole.UserRole, result.status)
             status_item.setToolTip(result.message)
             self.table.setItem(row, 5, status_item)
-            self.table.setCellWidget(row, 5, make_status_badge(result.status))
         self.summary.setText(
             f"只读分析完成：{len(self._results)} 项。尚未修改文件；确认执行前可选择是否同步标签。"
             if self.execution_enabled

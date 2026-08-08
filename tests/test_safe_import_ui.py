@@ -145,6 +145,7 @@ class SafeImportUiTests(unittest.TestCase):
         source = self.source / "song.mp3"
         source.write_bytes(b"audio")
         controller = SafeImportController()
+        self.addCleanup(controller.close)
         window = MainWindow(safe_import_controller=controller)
         self.addCleanup(window.close)
         window.open_import()
@@ -201,6 +202,7 @@ class SafeImportUiTests(unittest.TestCase):
         source = self.source / "song.mp3"
         source.write_bytes(b"audio")
         controller = SafeImportController()
+        self.addCleanup(controller.close)
         window = MainWindow(safe_import_controller=controller)
         self.addCleanup(window.close)
         window.open_import()
@@ -228,6 +230,7 @@ class SafeImportUiTests(unittest.TestCase):
     def test_switching_to_read_only_scan_clears_controller_and_dialog_plan(self) -> None:
         (self.source / "song.mp3").write_bytes(b"audio")
         controller = SafeImportController()
+        self.addCleanup(controller.close)
         scan = _ScanController()
         window = MainWindow(scan, safe_import_controller=controller)
         self.addCleanup(window.close)
