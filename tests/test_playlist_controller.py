@@ -423,9 +423,12 @@ class PlaylistControllerTests(unittest.TestCase):
         self.assertIn("已被替换", failed[0])
         self.assertEqual(self._setting_value(PENDING_RETARGET_KEY), pending_before)
         self.assertTrue((parked_root / old_shortcut.relative_to(self.playlist_root)).exists())
-        with self.assertRaisesRegex(RuntimeError, "尚未完成"):
-            self.controller.start_retarget((item,))
+        failed.clear()
+        self.controller.start_retarget((item,))
+        self._wait()
         self.assertFalse(self.controller.running)
+        self.assertEqual(len(failed), 1)
+        self.assertIn("尚未完成", failed[0])
         self.assertEqual(self._setting_value(PENDING_RETARGET_KEY), pending_before)
 
     def test_pending_retarget_no_journal_is_silent(self) -> None:
@@ -470,15 +473,155 @@ class PlaylistControllerTests(unittest.TestCase):
         another_item = PlaylistRetargetInput(
             another_source, another_target, self.audio_root
         )
-        with (
-            patch.object(playlist_module, "create_shortcut") as create_spy,
-            self.assertRaisesRegex(RuntimeError, "尚未完成"),
-        ):
+        failed: list[str] = []
+        self.controller.failed.connect(failed.append)
+        with patch.object(playlist_module, "create_shortcut") as create_spy:
             self.controller.start_retarget((another_item,))
+            self._wait()
 
         self.assertFalse(self.controller.running)
+        self.assertEqual(len(failed), 1)
+        self.assertIn("尚未完成", failed[0])
         self.assertEqual(self._setting_value(PENDING_RETARGET_KEY), pending_before)
         create_spy.assert_not_called()
+
+    def test_retarget_preparation_enumerates_off_owner_thread_without_journal_for_no_match(
+        self,
+    ) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        preparation_threads: list[int] = []
+        owner_thread = threading.get_ident()
+        real_prepare = playlist_module._retarget_items_with_old_references
+        target = self.audio_root / "没有引用的新名称-歌手.mp3"
+        item = PlaylistRetargetInput(self.audio, target, self.audio_root)
+
+        def slow_prepare(root, items, cancel):
+            preparation_threads.append(threading.get_ident())
+            entered.set()
+            release.wait(timeout=5)
+            return real_prepare(root, items, cancel)
+
+        started = time.monotonic()
+        with patch.object(
+            playlist_module,
+            "_retarget_items_with_old_references",
+            side_effect=slow_prepare,
+        ):
+            self.controller.start_retarget((item,))
+            elapsed = time.monotonic() - started
+            self.assertTrue(entered.wait(timeout=2))
+            self.assertTrue(self.controller.running)
+            self.assertLess(elapsed, 0.25)
+            release.set()
+            self._wait()
+
+        self.assertEqual(len(preparation_threads), 1)
+        self.assertNotEqual(preparation_threads[0], owner_thread)
+        self.assertIsNone(self._setting_value(PENDING_RETARGET_KEY))
+        latest = self.controller.list_history()[0]
+        self.assertEqual(latest.action, "retarget")
+        self.assertEqual(latest.items[0].result, "skipped")
+        self.assertIn("未发现引用", latest.items[0].message)
+
+    def test_retarget_preparation_failure_is_visible_and_writes_nothing(self) -> None:
+        _old_audio, _new_audio, old_shortcut, new_shortcut, item = (
+            self._install_retarget_fixture("准备失败")
+        )
+        failures: list[str] = []
+        self.controller.failed.connect(failures.append)
+
+        with (
+            patch.object(
+                playlist_module,
+                "_retarget_items_with_old_references",
+                side_effect=PermissionError("拒绝读取快捷方式"),
+            ),
+            patch.object(playlist_module, "create_shortcut") as create_spy,
+            patch.object(playlist_module, "remove_shortcut") as remove_spy,
+        ):
+            self.controller.start_retarget((item,))
+            self._wait()
+
+        self.assertEqual(len(failures), 1)
+        self.assertIn("联动准备失败", failures[0])
+        self.assertIn("拒绝读取快捷方式", failures[0])
+        self.assertIsNone(self._setting_value(PENDING_RETARGET_KEY))
+        self.assertTrue(old_shortcut.exists())
+        self.assertFalse(new_shortcut.exists())
+        create_spy.assert_not_called()
+        remove_spy.assert_not_called()
+
+    def test_retarget_preparation_cancel_writes_no_journal_or_shortcut(self) -> None:
+        _old_audio, _new_audio, old_shortcut, new_shortcut, item = (
+            self._install_retarget_fixture("准备取消")
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        cancelled: list[object] = []
+        self.controller.cancelled.connect(cancelled.append)
+
+        def slow_prepare(_root, _items, cancel):
+            entered.set()
+            release.wait(timeout=5)
+            return None if cancel.is_set() else ()
+
+        with (
+            patch.object(
+                playlist_module,
+                "_retarget_items_with_old_references",
+                side_effect=slow_prepare,
+            ),
+            patch.object(playlist_module, "create_shortcut") as create_spy,
+            patch.object(playlist_module, "remove_shortcut") as remove_spy,
+        ):
+            self.controller.start_retarget((item,))
+            self.assertTrue(entered.wait(timeout=2))
+            self.controller.request_cancel()
+            release.set()
+            self._wait()
+
+        self.assertEqual(cancelled, [None])
+        self.assertIsNone(self._setting_value(PENDING_RETARGET_KEY))
+        self.assertTrue(old_shortcut.exists())
+        self.assertFalse(new_shortcut.exists())
+        create_spy.assert_not_called()
+        remove_spy.assert_not_called()
+
+    def test_retarget_preparation_rejects_root_replacement_before_journal(self) -> None:
+        _old_audio, _new_audio, old_shortcut, new_shortcut, item = (
+            self._install_retarget_fixture("准备换根")
+        )
+        parked_root = self.root / "parked-during-prepare"
+        real_directories = playlist_module._safe_playlist_directories
+        failures: list[str] = []
+        self.controller.failed.connect(failures.append)
+
+        def replace_root(root):
+            directories = real_directories(root)
+            os.rename(root, parked_root)
+            root.mkdir()
+            return directories
+
+        with (
+            patch.object(
+                playlist_module,
+                "_safe_playlist_directories",
+                side_effect=replace_root,
+            ),
+            patch.object(playlist_module, "create_shortcut") as create_spy,
+            patch.object(playlist_module, "remove_shortcut") as remove_spy,
+        ):
+            self.controller.start_retarget((item,))
+            self._wait()
+
+        self.assertEqual(len(failures), 1)
+        self.assertIn("发生变化", failures[0])
+        self.assertIsNone(self._setting_value(PENDING_RETARGET_KEY))
+        self.assertTrue((parked_root / old_shortcut.relative_to(self.playlist_root)).exists())
+        self.assertFalse(new_shortcut.exists())
+        create_spy.assert_not_called()
+        remove_spy.assert_not_called()
 
     def test_refresh_worker_is_read_only_off_thread_and_publishes_complete_snapshot(self) -> None:
         item = PlaylistAudioInput(self.asset.id, self.audio, self.audio_root, "active")

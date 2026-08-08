@@ -1,52 +1,44 @@
-# Agent 接管与开发进度
+# 项目完成度与稳定交付记录
 
-## 接管信息
+## 当前状态
 
-- 接管时间：2026-07-22（Asia/Shanghai）
-- 当前分支：`main`
-- 接管时 HEAD：`80bf83683fad988bf9129b6e1ea9f44b0a5ac86d`
-- 接管时远端：`origin/main=dbbea1d34e7ed2493d18a1a50dac566c9a7c0e8d`
-- Git 状态：接管时本地领先 1 个提交并有 4 个安全导入恢复文件未提交。
-- 用户约束：电脑预计约 2 小时后关机；额度剩余约 10% 时停止新增工作并安全保存进度。用户已取消由 Codex 执行关机。
+- M1～P8 主体功能已完成，项目处于私人、本机、自用稳定维护阶段。
+- 当前分支为 `main`；最终交付要求 `HEAD == origin/main` 且 ahead/behind 为 `0/0`。
+- 自动化基线为 396 项单元测试，并同时执行 `compileall`、`smoke_test.py` 和 `git diff --check`。
+- 最终 EXE 从包含本文件的最终运行时提交构建；准确提交、解释器、PyInstaller 和依赖版本以安装目录中的 `BUILD-INFO.txt` 为准。
 
-## 已确认完成
+## 已完成
 
-- M1～P7 的功能提交及历史 P8 交付提交仍在 Git 历史中；历史 P8 产物不代表当前 `HEAD` 已交付。
-- `80bf836 fix: preserve lyric scan root provenance` 已提交并推送。
-- `20185c2 fix: recover interrupted safe imports safely` 已原子提交：持久化恢复日志、状态感知恢复、Windows 句柄级验证/候选删除、历史与日志原子收尾。
-- `7099d16 fix: recover interrupted imports on startup` 已原子提交：启动后后台检测 pending journal，仅在需要恢复或检测失败时显示窗口，恢复期间与其他后台任务互斥。
-- `817eed4 docs: record startup recovery completion` 及此前接管提交均已推送；`HEAD == origin/main`。
-- `b281b15 fix: recover managed playlist shortcuts after rename` 已通过独立复核、原子提交并推送；失败联动会保留持久化恢复记录，启动时按安全边界自动重试。
-- `9629cb8 feat: remember successful import directories` 已通过独立复核、原子提交并推送；音乐与歌词导入仅在成功移动后分别记忆源目录和目标目录，不会自动执行。
-- `8724120 feat: preview managed playlist impact before rename` 已通过独立复核、原子提交并推送；重命名前在线程外只读统计并展示受影响快捷方式数量，失败或取消时不启动重命名。
-- 最终验证结果：
-  - `python -m unittest tests.test_library_repository tests.test_safe_import -q`：75/75 PASS。
-  - `python -m unittest discover`：392/392 PASS（对应已提交的快捷方式影响统计包）。
-  - `python -m compileall -q .`：PASS。
-  - `python smoke_test.py`：PASS。
-  - `git diff --check`：PASS（仅 LF/CRLF 提示）。
+- P1 只读扫描、SQLite v1～v3 migration、差异同步和取消边界。
+- P2 标签/文件名识别、安全同目录重命名和 MP3、FLAC、M4A 候选副本元数据写入。
+- P3 Model/View 列表、歌名优先搜索、稳定排序和外部变化状态。
+- P4 LRC 扫描、编码安全读取、候选匹配、人工确认和一对一关系历史。
+- P5 受管歌单 `.lnk` 创建、移除、刷新、重命名影响预览、联动恢复和后台联动准备。
+- P6 经大小与 SHA-256 校验的安全移动导入、文件级结果、启动恢复和最近完整导入撤销。
+- P7 引用检查、备份、恢复、保留期清理、关联歌词组恢复和永久历史。
+- P8 隔离构建、项目外启动、安装目录验证、完整文件清单和桌面快捷方式回读。
 
-## 正在执行
+## 本轮修复的缺陷
 
-- 文档一致性修复：同步安全导入目录记忆、P5 快捷方式影响统计和最新 Git 事实。
-- 当前 `HEAD` 的源码功能已通过回归；EXE、安装目录和桌面快捷方式仍需从最终文档提交后的 `HEAD` 重新构建与回读。
+1. 重命名完成后的旧快捷方式引用枚举曾在 controller 所在线程同步运行，大歌单可能造成 UI 卡顿。现在由后台准备 worker 读取恢复日志、复核歌单根、枚举引用并在写 `.lnk` 前保存恢复日志。
+2. README、需求、实施和构建文档仍把已经完成的 P8 标为“待重新交付”，现已统一为实际状态。
+3. 数据库设计曾把 P5～P7 的可选规范化表草案描述成尚未实现功能，现已明确当前功能通过 SQLite `settings` 中的严格 JSON、现有审计表和应用数据目录中的备份文件完成持久化。
+4. 项目根历史 `dist/` 容易被误认为当前包；现已明确它不是权威产物且不自动删除。
 
-## 待完成
+## 交付证据
 
-1. 完成本文档一致性包的复核、原子提交与推送回读。
-2. 从最终 `HEAD` 重新构建、安装和验证 EXE/桌面快捷方式。
-3. 完成最终功能清单与交付回读；不再开启新的非阻塞功能包。
+- 2026-08-09 接管审计确认旧稳定基线 `3647af77ab437842945ebe18a50293b5e03db259` 已有对应安装包：EXE SHA-256 为 `9A16F1E69C81E4E6E501E9EB25D74714C92457F651079645DAE7E775BE8BDC51`，225 个清单文件全部通过，桌面快捷方式指向 `%LOCALAPPDATA%\Programs\MusicCtrl\MusicCtrl.exe`。
+- 本轮运行时代码修复会生成新的最终提交和新包；不得沿用上述旧哈希。新提交与哈希写入构建包、安装目录的 `BUILD-INFO.txt`、`SHA256SUMS.txt`，并在最终汇报中回读。
+- 生产数据库和备份位于 `%LOCALAPPDATA%\LocalMusicTools\乐库整理助手`，安装目录不得包含运行时数据库、日志或备份。
 
-## 已知问题与风险
+## 非阻塞 backlog
 
-- GitHub 网络此前多次出现 443 连接重置；当前已恢复并回读 `HEAD == origin/main == 8724120`。
-- `start_retarget()` 的既有旧引用预检仍会在调用线程同步枚举受管快捷方式；重命名前的新增影响统计已经异步化，该项只作为后续性能维护记录，不影响当前正确性。
-- 当前源码与隔离构建口径统一为 Python 3.13.5；最终构建必须记录实际解释器与依赖版本。
-- 共享 Anaconda 环境的 `pip check` 存在项目外既有依赖冲突；最终交付应使用隔离构建环境。
-- 安全导入恢复不自动删除目标文件；候选仅在 Windows 同一受锁句柄完成身份/内容校验后删除。非 Windows 平台会失败关闭并保留恢复记录。
-- 现有测试报告少量 `TemporaryDirectory` 隐式清理警告；暂未发现产品线程或文件句柄泄漏，但后续需继续观察。
+- 轻微视觉和非关键文案只在后续明确需求时处理，不主动扩大产品范围。
+- 全量测试仍会报告少量 `TemporaryDirectory` 隐式清理 `ResourceWarning`，来源是安全导入 controller 的测试生命周期；当前未发现产品文件句柄或线程泄漏，不阻塞交付，但后续修改该 controller 时应一并显式收尾测试夹具。
+- 项目仍使用 SQLite v3 最小 schema；若未来确有复杂跨实体查询需求，再评估将 P5～P7 的严格 JSON 设置迁移为规范化表，不能为了形式一致性无收益迁移。
+- 当前 EXE 只供私人本机自用，不上传或分享；对外分发前必须重新完成许可证兼容和源码材料门禁。
 
-## 下一步
+## 环境说明
 
-- 文档一致性包通过后原子提交并推送，回读 ahead/behind 为 `0 0`。
-- 从最终 `HEAD` 重新构建、安装和验证 EXE 与桌面快捷方式；完成后只做交付审计，不继续扩展非阻塞需求。
+- 全局规则要求的 `~/.codex/memories/PROFILE.md` 与 `ACTIVE.md` 在本轮开始时不存在；该问题不属于项目仓库，未在项目内创建替代文件。
+- 项目文本继续统一使用 UTF-8。

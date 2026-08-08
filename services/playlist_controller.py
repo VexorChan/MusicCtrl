@@ -56,6 +56,14 @@ class PlaylistRetargetInput:
 
 
 @dataclass(frozen=True, slots=True)
+class _PlaylistRetargetPreparation:
+    playlist_root: Path
+    items: tuple[PlaylistRetargetInput, ...]
+    batch_id: str | None = None
+    root_identity: tuple[int, int] | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class PlaylistItemResult:
     source_path: Path | None
     target_path: Path | None
@@ -415,16 +423,18 @@ def _safe_playlist_directories(root: Path) -> tuple[Path, ...]:
 def _retarget_items_with_old_references(
     playlist_root: Path,
     items: tuple[PlaylistRetargetInput, ...],
-) -> tuple[PlaylistRetargetInput, ...]:
+    cancel: threading.Event | None = None,
+) -> tuple[PlaylistRetargetInput, ...] | None:
     root_identity = _directory_identity(playlist_root)
     by_source = {_path_key(item.source_path): item for item in items}
     matched: set[str] = set()
     for playlist in _safe_playlist_directories(playlist_root):
+        if cancel is not None and cancel.is_set():
+            return None
         for shortcut_path in sorted(playlist.glob("*.lnk")):
-            try:
-                info = read_shortcut(shortcut_path, playlist_root=playlist_root)
-            except Exception:
-                continue
+            if cancel is not None and cancel.is_set():
+                return None
+            info = read_shortcut(shortcut_path, playlist_root=playlist_root)
             key = _path_key(info.target_path)
             if key in by_source:
                 matched.add(key)
@@ -749,6 +759,128 @@ class PlaylistRetargetImpactWorker(QThread):
                 self.cancelled.emit()
                 return
             self.completed.emit(count)
+        except Exception as error:
+            self.failed.emit(str(error).strip() or error.__class__.__name__)
+
+
+class PlaylistRetargetPrepareWorker(QThread):
+    """Prepare a durable retarget operation without blocking the UI thread."""
+
+    completed = Signal(object)
+    cancelled = Signal()
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        *,
+        database_config: DatabaseConfig,
+        items: tuple[PlaylistRetargetInput, ...],
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._database_config = database_config
+        self._items = items
+        self._cancel = threading.Event()
+
+    def request_cancel(self) -> None:
+        self._cancel.set()
+        self.requestInterruption()
+
+    def _emit_cancelled_if_requested(self) -> bool:
+        if not self._cancel.is_set():
+            return False
+        self.cancelled.emit()
+        return True
+
+    def run(self) -> None:
+        try:
+            if self._emit_cancelled_if_requested():
+                return
+            with LibraryRepository(self._database_config) as repository:
+                root_setting = repository.get_setting(PLAYLIST_ROOT_KEY)
+                pending = repository.get_setting(PENDING_RETARGET_KEY)
+            if root_setting is None or not isinstance(root_setting.value, str):
+                raise ValueError("请先选择歌单根目录")
+            playlist_root = Path(root_setting.value)
+            if not playlist_root.is_absolute():
+                raise ValueError("歌单目录设置不是绝对路径")
+            if self._emit_cancelled_if_requested():
+                return
+
+            if pending is not None:
+                pending_batch_id, pending_root, pending_root_identity, pending_items = (
+                    _retarget_items_from_journal(pending.value)
+                )
+                pending_plan = _retarget_journal(
+                    batch_id=pending_batch_id,
+                    playlist_root=pending_root,
+                    items=pending_items,
+                    playlist_root_identity=pending_root_identity,
+                )
+                current_identity = _directory_identity(playlist_root)
+                requested_plan = _retarget_journal(
+                    batch_id=pending_batch_id,
+                    playlist_root=playlist_root,
+                    items=self._items,
+                    playlist_root_identity=current_identity,
+                )
+                if (
+                    _path_key(pending_root) != _path_key(playlist_root)
+                    or pending_root_identity != current_identity
+                    or pending_plan["items"] != requested_plan["items"]
+                ):
+                    raise RuntimeError("存在尚未完成的快捷方式修复，请先重试或重启应用恢复")
+                if self._emit_cancelled_if_requested():
+                    return
+                self.completed.emit(
+                    _PlaylistRetargetPreparation(
+                        pending_root,
+                        pending_items,
+                        pending_batch_id,
+                        pending_root_identity,
+                    )
+                )
+                return
+
+            actionable = _retarget_items_with_old_references(
+                playlist_root,
+                self._items,
+                self._cancel,
+            )
+            if actionable is None:
+                self.cancelled.emit()
+                return
+            if self._emit_cancelled_if_requested():
+                return
+            if not actionable:
+                self.completed.emit(_PlaylistRetargetPreparation(playlist_root, self._items))
+                return
+
+            batch_id = str(uuid4())
+            journal = _retarget_journal(
+                batch_id=batch_id,
+                playlist_root=playlist_root,
+                items=actionable,
+            )
+            if self._emit_cancelled_if_requested():
+                return
+            with LibraryRepository(self._database_config) as repository:
+                repository.create_import_journal(
+                    pending_key=PENDING_RETARGET_KEY,
+                    batch_id=batch_id,
+                    journal=journal,
+                )
+            # Once the journal exists, always hand the operation to the shortcut
+            # worker. A concurrent close can cancel that worker safely, while a
+            # process exit leaves a startup-recoverable journal.
+            self.completed.emit(
+                _PlaylistRetargetPreparation(
+                    playlist_root,
+                    actionable,
+                    batch_id,
+                    tuple(journal["playlist_root_identity"]),
+                )
+            )
         except Exception as error:
             self.failed.emit(str(error).strip() or error.__class__.__name__)
 
@@ -1176,68 +1308,18 @@ class PlaylistController(QObject):
         payload = tuple(items)
         if not payload:
             raise ValueError("至少选择一个歌单项")
-        playlist_root = self._require_root()
-        with LibraryRepository(self._database_config) as repository:
-            pending = repository.get_setting(PENDING_RETARGET_KEY)
-            if pending is not None:
-                pending_batch_id, pending_root, pending_root_identity, pending_items = (
-                    _retarget_items_from_journal(pending.value)
-                )
-                pending_plan = _retarget_journal(
-                    batch_id=pending_batch_id,
-                    playlist_root=pending_root,
-                    items=pending_items,
-                    playlist_root_identity=pending_root_identity,
-                )
-                current_identity = _directory_identity(playlist_root)
-                requested_plan = _retarget_journal(
-                    batch_id=pending_batch_id,
-                    playlist_root=playlist_root,
-                    items=payload,
-                    playlist_root_identity=current_identity,
-                )
-                if (
-                    _path_key(pending_root) != _path_key(playlist_root)
-                    or pending_root_identity != current_identity
-                    or pending_plan["items"] != requested_plan["items"]
-                ):
-                    raise RuntimeError("存在尚未完成的快捷方式修复，请先重试或重启应用恢复")
-                self._launch_shortcut_worker(
-                    "受管歌单",
-                    playlist_root=playlist_root,
-                    retarget_batch_id=pending_batch_id,
-                    expected_root_identity=pending_root_identity,
-                    retarget_items=pending_items,
-                )
-                return
-
-        actionable = _retarget_items_with_old_references(playlist_root, payload)
-        if not actionable:
-            self._launch_shortcut_worker(
-                "受管歌单",
-                playlist_root=playlist_root,
-                retarget_items=payload,
-            )
-            return
-        batch_id = str(uuid4())
-        journal = _retarget_journal(
-            batch_id=batch_id,
-            playlist_root=playlist_root,
-            items=actionable,
+        worker = PlaylistRetargetPrepareWorker(
+            database_config=self._database_config,
+            items=payload,
         )
-        with LibraryRepository(self._database_config) as repository:
-            repository.create_import_journal(
-                pending_key=PENDING_RETARGET_KEY,
-                batch_id=batch_id,
-                journal=journal,
-            )
-        self._launch_shortcut_worker(
-            "受管歌单",
-            playlist_root=playlist_root,
-            retarget_batch_id=batch_id,
-            expected_root_identity=tuple(journal["playlist_root_identity"]),
-            retarget_items=actionable,
-        )
+        worker.completed.connect(lambda prepared: self._cache("prepare_completed", prepared))
+        worker.cancelled.connect(lambda: self._cache("prepare_cancelled", None))
+        worker.failed.connect(lambda message: self._cache("prepare_failed", message))
+        worker.finished.connect(self._finished)
+        self._worker = worker
+        self._terminal = None
+        self.running_changed.emit(True)
+        worker.start()
 
     def start_retarget_impact(self, items: tuple[PlaylistRetargetInput, ...]) -> None:
         if self.running:
@@ -1351,6 +1433,9 @@ class PlaylistController(QObject):
         if isinstance(worker, PlaylistRetargetRecoveryLoader):
             self._finish_retarget_recovery_loader(worker)
             return
+        if isinstance(worker, PlaylistRetargetPrepareWorker):
+            self._finish_retarget_prepare(worker)
+            return
         if isinstance(worker, PlaylistRetargetImpactWorker):
             kind, payload = self._terminal or (
                 "impact_failed",
@@ -1448,6 +1533,31 @@ class PlaylistController(QObject):
         self._active_items = ()
         self._active_retarget_batch_id = None
         worker.deleteLater()
+        self.running_changed.emit(False)
+
+    def _finish_retarget_prepare(self, worker: PlaylistRetargetPrepareWorker) -> None:
+        self._last_terminal_kind = "retarget_prepare"
+        kind, payload = self._terminal or (
+            "prepare_failed",
+            "快捷方式联动准备线程结束但没有终态",
+        )
+        self._worker = None
+        self._terminal = None
+        worker.deleteLater()
+        if kind == "prepare_completed" and isinstance(payload, _PlaylistRetargetPreparation):
+            self._launch_shortcut_worker(
+                "受管歌单",
+                playlist_root=payload.playlist_root,
+                retarget_batch_id=payload.batch_id,
+                expected_root_identity=payload.root_identity,
+                emit_running=False,
+                retarget_items=payload.items,
+            )
+            return
+        if kind == "prepare_cancelled":
+            self.cancelled.emit(None)
+        else:
+            self.failed.emit(f"音乐已重命名，但歌单快捷方式联动准备失败：{payload}")
         self.running_changed.emit(False)
 
     def _finish_retarget_recovery_loader(

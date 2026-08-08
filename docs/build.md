@@ -21,7 +21,9 @@ python -m venv .venv-build
 本机安装目录为 `%LOCALAPPDATA%\Programs\MusicCtrl`；应用数据库和备份位于
 `%LOCALAPPDATA%\LocalMusicTools\乐库整理助手`，不得写入安装目录。
 
-仓库当前 `HEAD` 晚于 `dist` 和本机安装目录中的既有 EXE；这些旧产物只能作为历史构建证据，不能作为当前源码的最终交付。完成本次维护后必须重新执行：全量测试、隔离构建、项目外启动探针、安装目录更新、桌面快捷方式目标与工作目录回读，以及最终 EXE 的 SHA-256 记录。
+当前本机交付已经从最终运行时提交重新执行：全量测试、隔离构建、项目外启动探针、安装目录替换、桌面快捷方式目标与工作目录回读，以及最终 EXE 的 SHA-256 记录。安装目录中的 `BUILD-INFO.txt` 必须记录对应 Git HEAD，`SHA256SUMS.txt` 必须覆盖完整安装文件集。
+
+项目根目录的 `build/`、`dist/` 是被 `.gitignore` 排除的历史本地产物，不作为当前交付来源，也不自动删除。每次正式构建使用 `work/p8-final-<short-head>-<timestamp>` 作为独立工作目录；验证通过后，将其完整 `dist/MusicCtrl` 安装到 `%LOCALAPPDATA%\Programs\MusicCtrl`。
 
 文档和最终报告必须以实际执行构建的解释器版本为准。当前已验证口径为 Python 3.13.5，不得用未参与本次构建的其他版本冒充已验证环境。
 
