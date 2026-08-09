@@ -38,7 +38,7 @@ PLAYLIST_HISTORY_KEY = "p5.operation_history"
 PLAYLIST_PINNED_KEY = "p5.pinned_playlists"
 PENDING_RETARGET_KEY = "p5.pending_retargets"
 PLAYLIST_RELATIONSHIP_RECOVERY_KEY = "p5.relationship_recovery"
-_RETARGET_JOURNAL_VERSION = 2
+_RETARGET_JOURNAL_VERSION = 3
 _PLAYLIST_HISTORY_LIMIT = 200
 _PLAYLIST_ACTIONS = {"create", "add", "remove", "retarget", "rename", "delete"}
 _PLAYLIST_TERMINALS = {"completed", "cancelled", "failed"}
@@ -64,6 +64,7 @@ class PlaylistRetargetInput:
     source_path: Path
     target_path: Path
     audio_root: Path
+    asset_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -405,12 +406,14 @@ def _retarget_journal(
     playlist_root_identity: tuple[int, int] | None = None,
     phase: str = "apply",
     created_at: str | None = None,
+    version: int = _RETARGET_JOURNAL_VERSION,
 ) -> dict[str, object]:
     if (
         not batch_id
         or not playlist_root.is_absolute()
         or not items
         or phase not in {"discover", "apply"}
+        or version not in {1, 2, _RETARGET_JOURNAL_VERSION}
     ):
         raise ValueError("快捷方式修复计划无效")
     normalized_playlist_root = Path(
@@ -423,7 +426,7 @@ def _retarget_journal(
     )
     seen_source: set[str] = set()
     seen_target: set[str] = set()
-    payload: list[dict[str, str]] = []
+    payload: list[dict[str, object]] = []
     for item in items:
         source_path = Path(os.path.abspath(os.path.normpath(os.fspath(item.source_path))))
         target_path = Path(os.path.abspath(os.path.normpath(os.fspath(item.target_path))))
@@ -438,6 +441,10 @@ def _retarget_journal(
             or _path_key(source_path) == _path_key(target_path)
         ):
             raise ValueError("快捷方式修复计划包含越界或无效路径")
+        if item.asset_id is not None and (
+            not isinstance(item.asset_id, str) or not item.asset_id.strip()
+        ):
+            raise ValueError("快捷方式修复计划包含无效资产标识")
         source_key = _path_key(source_path)
         target_key = _path_key(target_path)
         if (
@@ -449,13 +456,16 @@ def _retarget_journal(
             raise ValueError("快捷方式修复计划包含重复或相互依赖的路径")
         seen_source.add(source_key)
         seen_target.add(target_key)
-        payload.append({
+        raw_item: dict[str, str | None] = {
             "source_path": str(source_path),
             "target_path": str(target_path),
             "audio_root": str(audio_root),
-        })
+        }
+        if version >= 3:
+            raw_item["asset_id"] = item.asset_id
+        payload.append(raw_item)
     return {
-        "version": _RETARGET_JOURNAL_VERSION,
+        "version": version,
         "batch_id": batch_id,
         "phase": phase,
         "playlist_root": str(normalized_playlist_root),
@@ -482,8 +492,8 @@ def _retarget_items_from_journal(
     current_keys = legacy_keys | {"phase"}
     if (
         (version == 1 and set(value) != legacy_keys)
-        or (version == _RETARGET_JOURNAL_VERSION and set(value) != current_keys)
-        or version not in {1, _RETARGET_JOURNAL_VERSION}
+        or (version in {2, _RETARGET_JOURNAL_VERSION} and set(value) != current_keys)
+        or version not in {1, 2, _RETARGET_JOURNAL_VERSION}
     ):
         raise ValueError("待修复快捷方式日志版本或格式损坏")
     phase = "apply" if version == 1 else value.get("phase")
@@ -522,14 +532,25 @@ def _retarget_items_from_journal(
         raise ValueError("待修复歌单根不是绝对路径")
     items: list[PlaylistRetargetInput] = []
     for raw in raw_items:
-        if not isinstance(raw, dict) or set(raw) != {
-            "source_path", "target_path", "audio_root"
-        }:
+        expected_item_keys = {"source_path", "target_path", "audio_root"}
+        if version == _RETARGET_JOURNAL_VERSION:
+            expected_item_keys.add("asset_id")
+        if not isinstance(raw, dict) or set(raw) != expected_item_keys:
             raise ValueError("待修复快捷方式项目损坏")
         values = tuple(raw[key] for key in ("source_path", "target_path", "audio_root"))
         if not all(isinstance(item, str) for item in values):
             raise ValueError("待修复快捷方式路径损坏")
-        items.append(PlaylistRetargetInput(*(Path(item) for item in values)))
+        asset_id = raw.get("asset_id")
+        if asset_id is not None and (
+            not isinstance(asset_id, str) or not asset_id.strip()
+        ):
+            raise ValueError("待修复快捷方式资产标识损坏")
+        items.append(
+            PlaylistRetargetInput(
+                *(Path(item) for item in values),
+                asset_id=asset_id,
+            )
+        )
     validated = _retarget_journal(
         batch_id=batch_id,
         playlist_root=playlist_root,
@@ -537,6 +558,7 @@ def _retarget_items_from_journal(
         playlist_root_identity=root_identity,
         phase=phase,
         created_at=created_at,
+        version=version,
     )
     if (
         validated["playlist_root"] != playlist_root_value
@@ -591,6 +613,170 @@ def _retarget_items_with_old_references(
         tuple(item for item in items if _path_key(item.source_path) in matched_sources),
         tuple(item for item in items if _path_key(item.target_path) in matched_targets),
     )
+
+
+def _relationships_for_retarget(
+    database_config: DatabaseConfig,
+    item: PlaylistRetargetInput,
+    playlist_root: Path,
+) -> tuple[PlaylistItemRecord, ...]:
+    if item.asset_id is None:
+        return ()
+    with LibraryRepository(database_config) as repository:
+        relationships = repository.list_current_playlist_items_for_assets((item.asset_id,))
+    for relationship in relationships:
+        if relationship.audio_asset_id != item.asset_id:
+            raise ValueError("歌单关系资产标识不一致")
+        if relationship.expected_target_path is None:
+            raise ValueError("受管歌单关系缺少预期目标")
+        if not _within_root(relationship.shortcut_path, playlist_root):
+            raise ValueError("受管快捷方式超出歌单根")
+        if relationship.shortcut_path.suffix.casefold() != ".lnk":
+            raise ValueError("受管歌单关系不是快捷方式")
+    return relationships
+
+
+def _inspect_relationship_retarget(
+    relationship: PlaylistItemRecord,
+    item: PlaylistRetargetInput,
+    playlist_root: Path,
+) -> str:
+    expected = relationship.expected_target_path
+    assert expected is not None
+    if _path_key(expected) == _path_key(item.source_path):
+        try:
+            info = read_shortcut(relationship.shortcut_path, playlist_root=playlist_root)
+        except Exception as old_error:
+            destination = relationship.shortcut_path.parent / f"{item.target_path.name}.lnk"
+            try:
+                target_info = read_shortcut(destination, playlist_root=playlist_root)
+            except Exception:
+                raise ValueError(
+                    f"受管快捷方式缺失或损坏：{relationship.shortcut_path}"
+                ) from old_error
+            if _path_key(target_info.target_path) != _path_key(item.target_path):
+                raise ValueError(f"目标快捷方式已被外部修改：{destination}")
+            return "converged_files"
+        if _path_key(info.target_path) != _path_key(item.source_path):
+            raise ValueError(f"受管快捷方式目标已被外部修改：{relationship.shortcut_path}")
+        return "actionable"
+    if _path_key(expected) == _path_key(item.target_path):
+        info = read_shortcut(relationship.shortcut_path, playlist_root=playlist_root)
+        if _path_key(info.target_path) != _path_key(item.target_path):
+            raise ValueError(f"已更新快捷方式目标异常：{relationship.shortcut_path}")
+        return "converged"
+    raise ValueError(f"歌单关系路径已变化：{relationship.shortcut_path}")
+
+
+def _retarget_items_with_relationships(
+    database_config: DatabaseConfig,
+    playlist_root: Path,
+    items: tuple[PlaylistRetargetInput, ...],
+    cancel: threading.Event | None = None,
+) -> _PlaylistRetargetDiscovery | None:
+    actionable: list[PlaylistRetargetInput] = []
+    converged: list[PlaylistRetargetInput] = []
+    for item in items:
+        if cancel is not None and cancel.is_set():
+            return None
+        if item.asset_id is None:
+            legacy = _retarget_items_with_old_references(playlist_root, (item,), cancel)
+            if legacy is None:
+                return None
+            actionable.extend(legacy.actionable)
+            converged.extend(legacy.converged)
+            continue
+        relationships = _relationships_for_retarget(database_config, item, playlist_root)
+        states = tuple(
+            _inspect_relationship_retarget(relationship, item, playlist_root)
+            for relationship in relationships
+        )
+        if any(state in {"actionable", "converged_files"} for state in states):
+            actionable.append(item)
+        elif states and all(state == "converged" for state in states):
+            converged.append(item)
+    return _PlaylistRetargetDiscovery(tuple(actionable), tuple(converged))
+
+
+def _retarget_managed_relationships(
+    database_config: DatabaseConfig,
+    playlist_root: Path,
+    item: PlaylistRetargetInput,
+    cancel: threading.Event,
+) -> tuple[int, int, set[str]]:
+    relationships = _relationships_for_retarget(database_config, item, playlist_root)
+    updated = 0
+    converged = 0
+    affected: set[str] = set()
+    for relationship in relationships:
+        if cancel.is_set():
+            raise InterruptedError("操作已取消")
+        state = _inspect_relationship_retarget(relationship, item, playlist_root)
+        destination = relationship.shortcut_path.parent / f"{item.target_path.name}.lnk"
+        if state == "converged":
+            converged += 1
+            continue
+        if state == "converged_files":
+            with LibraryRepository(database_config) as repository:
+                repository.retarget_playlist_item(
+                    item_id=relationship.id,
+                    expected_source_path=item.source_path,
+                    expected_shortcut_path=relationship.shortcut_path,
+                    target_path=item.target_path,
+                    target_shortcut_path=destination,
+                )
+            updated += 1
+            affected.add(relationship.playlist_name)
+            continue
+
+        created_destination = False
+        if destination.exists():
+            destination_info = read_shortcut(destination, playlist_root=playlist_root)
+            if _path_key(destination_info.target_path) != _path_key(item.target_path):
+                raise ValueError(
+                    f"目标快捷方式指向其他文件，已保留原快捷方式：{destination.name}"
+                )
+        else:
+            create_shortcut(
+                target_path=item.target_path,
+                audio_root=item.audio_root,
+                shortcut_path=destination,
+                playlist_root=playlist_root,
+            )
+            created_destination = True
+            destination_info = read_shortcut(destination, playlist_root=playlist_root)
+            if _path_key(destination_info.target_path) != _path_key(item.target_path):
+                raise ValueError(f"新快捷方式回读目标不一致：{destination}")
+        try:
+            remove_shortcut(
+                shortcut_path=relationship.shortcut_path,
+                playlist_root=playlist_root,
+                expected_target=item.source_path,
+            )
+        except Exception:
+            if created_destination:
+                remove_shortcut(
+                    shortcut_path=destination,
+                    playlist_root=playlist_root,
+                    expected_target=item.target_path,
+                )
+            raise
+        try:
+            with LibraryRepository(database_config) as repository:
+                repository.retarget_playlist_item(
+                    item_id=relationship.id,
+                    expected_source_path=item.source_path,
+                    expected_shortcut_path=relationship.shortcut_path,
+                    target_path=item.target_path,
+                    target_shortcut_path=destination,
+                )
+        except Exception as error:
+            raise RuntimeError(
+                "快捷方式已更新但歌单关系提交失败，已保留恢复日志"
+            ) from error
+        updated += 1
+        affected.add(relationship.playlist_name)
+    return updated, converged, affected
 
 
 def _human_size(size_bytes: int) -> str:
@@ -715,6 +901,40 @@ class PlaylistShortcutWorker(QThread):
                             messages.append(message)
                             details.append(
                                 PlaylistItemResult(source_path, target_path, "skipped", message)
+                            )
+                            continue
+                        if item.asset_id is not None:
+                            updated, converged, relationship_playlists = (
+                                _retarget_managed_relationships(
+                                    self._database_config,
+                                    self._playlist_root,
+                                    item,
+                                    self._cancel,
+                                )
+                            )
+                            affected.update(relationship_playlists)
+                            if updated == 0:
+                                skipped += 1
+                                message = (
+                                    f"快捷方式已收敛：{item.target_path.name}"
+                                    if converged
+                                    else f"未发现引用：{item.source_path.name}"
+                                )
+                                messages.append(message)
+                                details.append(
+                                    PlaylistItemResult(
+                                        source_path, target_path, "skipped", message
+                                    )
+                                )
+                                continue
+                            success += 1
+                            details.append(
+                                PlaylistItemResult(
+                                    source_path,
+                                    target_path,
+                                    "success",
+                                    f"已更新 {updated} 个受管快捷方式",
+                                )
                             )
                             continue
                         updated = 0
@@ -1195,11 +1415,13 @@ class PlaylistRetargetImpactWorker(QThread):
     def __init__(
         self,
         *,
+        database_config: DatabaseConfig,
         playlist_root: Path,
         items: tuple[PlaylistRetargetInput, ...],
         parent=None,
     ) -> None:
         super().__init__(parent)
+        self._database_config = database_config
         self._playlist_root = playlist_root
         self._items = items
         self._cancel = threading.Event()
@@ -1217,22 +1439,36 @@ class PlaylistRetargetImpactWorker(QThread):
                 items=self._items,
                 playlist_root_identity=root_identity,
             )
-            source_keys = {_path_key(item.source_path) for item in self._items}
             count = 0
-            for playlist in _safe_playlist_directories(self._playlist_root):
+            legacy_items: list[PlaylistRetargetInput] = []
+            for item in self._items:
                 if self._cancel.is_set():
                     self.cancelled.emit()
                     return
-                for shortcut_path in sorted(playlist.glob("*.lnk")):
+                if item.asset_id is None:
+                    legacy_items.append(item)
+                    continue
+                for relationship in _relationships_for_retarget(
+                    self._database_config, item, self._playlist_root
+                ):
                     if self._cancel.is_set():
                         self.cancelled.emit()
                         return
-                    info = read_shortcut(
-                        shortcut_path,
-                        playlist_root=self._playlist_root,
+                    state = _inspect_relationship_retarget(
+                        relationship, item, self._playlist_root
                     )
-                    if _path_key(info.target_path) in source_keys:
+                    if state == "actionable":
                         count += 1
+            if legacy_items:
+                source_keys = {_path_key(item.source_path) for item in legacy_items}
+                for playlist in _safe_playlist_directories(self._playlist_root):
+                    for shortcut_path in sorted(playlist.glob("*.lnk")):
+                        if self._cancel.is_set():
+                            self.cancelled.emit()
+                            return
+                        info = read_shortcut(shortcut_path, playlist_root=self._playlist_root)
+                        if _path_key(info.target_path) in source_keys:
+                            count += 1
             if _directory_identity(self._playlist_root) != root_identity:
                 raise ValueError("歌单根在影响统计期间发生变化")
             if self._cancel.is_set():
@@ -1343,7 +1579,8 @@ class PlaylistRetargetPrepareWorker(QThread):
                     )
                 state = _retarget_items_from_journal(discovery_journal)
 
-            discovery = _retarget_items_with_old_references(
+            discovery = _retarget_items_with_relationships(
+                self._database_config,
                 playlist_root,
                 state.items,
                 self._cancel,
@@ -2003,6 +2240,7 @@ class PlaylistController(QObject):
         if not payload:
             raise ValueError("至少选择一个重命名项")
         worker = PlaylistRetargetImpactWorker(
+            database_config=self._database_config,
             playlist_root=self._require_root(),
             items=payload,
         )

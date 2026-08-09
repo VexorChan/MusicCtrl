@@ -142,7 +142,19 @@ class P4IntegrationTests(unittest.TestCase):
         self.assertEqual(dialog.conflict_results.selectionMode().name, "ExtendedSelection")
         self.assertEqual((dialog.unmatched_results.rowCount(), dialog.conflict_results.rowCount()), (1, 2))
         dialog.unmatched_results.selectRow(0)
-        dialog.conflict_results.item(0, 0).setCheckState(Qt.CheckState.Checked)
+        dialog.conflict_results.model().setData(
+            dialog.conflict_results.model().index(0, 0),
+            Qt.CheckState.Checked,
+            Qt.ItemDataRole.CheckStateRole,
+        )
+        self.assertEqual(
+            [index.row() for index in dialog.unmatched_results.selectionModel().selectedRows()],
+            [0],
+        )
+        self.assertEqual(
+            [index.row() for index in dialog.conflict_results.selectionModel().selectedRows()],
+            [0],
+        )
         emitted: list[tuple[str, ...]] = []
         dialog.candidates_requested.connect(emitted.append)
         dialog._use_selected()
@@ -150,7 +162,12 @@ class P4IntegrationTests(unittest.TestCase):
 
         dialog.unmatched_results.clearSelection()
         dialog.conflict_results.clearSelection()
-        dialog.conflict_results.item(0, 0).setCheckState(Qt.CheckState.Unchecked)
+        self.assertEqual(
+            dialog.unmatched_results.item(0, 0).checkState(), Qt.CheckState.Unchecked
+        )
+        self.assertEqual(
+            dialog.conflict_results.item(0, 0).checkState(), Qt.CheckState.Unchecked
+        )
         dialog.unmatched_results.selectRow(0)
         dialog._update_live_actions()
         self.assertFalse(dialog.cancel_match_button.isEnabled())

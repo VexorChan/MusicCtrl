@@ -11,7 +11,12 @@ from dialogs.common import PrototypeDialog, dialog_header, footer_buttons
 from mock.data import RENAME_ROWS
 from services.metadata_preview import MetadataPreviewResult
 from ui.components import make_status_badge
-from ui.tables import DataTable, ModelDataTable, StatusBadgeDelegate
+from ui.tables import (
+    CheckSelectionSynchronizer,
+    DataTable,
+    ModelDataTable,
+    StatusBadgeDelegate,
+)
 
 
 _READ_ONLY_FLAGS = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
@@ -34,6 +39,8 @@ class RenamePreviewDialog(PrototypeDialog):
         self._running = False
         self._close_pending = False
         self._results: tuple[MetadataPreviewResult, ...] = ()
+        self._updating_rows = False
+        self._selection_sync: CheckSelectionSynchronizer | None = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(22, 18, 22, 18)
@@ -120,55 +127,146 @@ class RenamePreviewDialog(PrototypeDialog):
         self.table.setColumnWidth(4, 100)
         self.table.setColumnWidth(5, 130)
         self.table.setItemDelegateForColumn(5, StatusBadgeDelegate(self.table))
+        self.table.itemChanged.connect(self._table_item_changed)
+        self._selection_sync = CheckSelectionSynchronizer(self.table, self)
+        self._selection_sync.changed.connect(self._update_primary_state)
+
+    @staticmethod
+    def _windows_leaf_key(value: str) -> str:
+        return value.rstrip(" .").casefold()
+
+    def _row_for_item(self, item: QTableWidgetItem) -> int | None:
+        for row in range(self.table.rowCount()):
+            if any(self.table.item(row, column) is item for column in range(self.table.columnCount())):
+                return row
+        return None
+
+    def _row_target_is_unchanged(self, row: int) -> bool:
+        result = self._results[row]
+        suggestion = self.table.item(row, 2)
+        stem = "" if suggestion is None else suggestion.text()
+        return self._windows_leaf_key(stem + result.extension) == self._windows_leaf_key(
+            result.original_name
+        )
+
+    def _refresh_row_execution_state(self, row: int) -> None:
+        result = self._results[row]
+        check = self.table.item(row, 0)
+        status_item = self.table.item(row, 5)
+        if check is None or status_item is None:
+            return
+        base_executable = result.suggested_stem is not None and result.status in {
+            "可预览",
+            "待手动确认",
+            "外部变化",
+        }
+        suggestion = self.table.item(row, 2)
+        stem = "" if suggestion is None else suggestion.text()
+        valid_edit = self._validate_stem(stem) is None
+        unchanged = valid_edit and self._row_target_is_unchanged(row)
+        executable = base_executable and valid_edit and not unchanged
+        check.setFlags(
+            Qt.ItemFlag.ItemIsEnabled
+            | (Qt.ItemFlag.ItemIsUserCheckable if executable else Qt.ItemFlag.NoItemFlags)
+        )
+        if not executable:
+            check.setCheckState(Qt.CheckState.Unchecked)
+        status_item.setData(
+            Qt.ItemDataRole.UserRole,
+            "无需更改" if base_executable and unchanged else result.status,
+        )
+        status_item.setToolTip(
+            "建议名称与原文件名相同；编辑为有效新名称后才能执行。"
+            if base_executable and unchanged
+            else result.message
+        )
+        model = self.table.model()
+        if model is not None:
+            model.dataChanged.emit(
+                model.index(row, 0),
+                model.index(row, 5),
+                [
+                    Qt.ItemDataRole.CheckStateRole,
+                    Qt.ItemDataRole.UserRole,
+                    Qt.ItemDataRole.ToolTipRole,
+                ],
+            )
+
+    def _table_item_changed(self, item: QTableWidgetItem) -> None:
+        if self._updating_rows or not self.live_mode:
+            return
+        row = self._row_for_item(item)
+        if row is None:
+            return
+        self._updating_rows = True
+        try:
+            if item is self.table.item(row, 2):
+                self._refresh_row_execution_state(row)
+        finally:
+            self._updating_rows = False
+        if self._selection_sync is not None:
+            self._selection_sync.refresh_from_checks()
+        self._update_primary_state()
+
+    def _update_primary_state(self) -> None:
+        if not self.execution_enabled:
+            return
+        checked = () if self._selection_sync is None else self._selection_sync.checked_rows()
+        self.primary_button.setEnabled(not self._running and bool(checked))
 
     def replace_results(self, results: Sequence[MetadataPreviewResult]) -> None:
         if not self.live_mode:
             raise RuntimeError("模拟预览窗口不能注入真实分析结果")
         self._results = tuple(results)
-        self.table.setRowCount(len(self._results))
-        for row, result in enumerate(self._results):
-            check = QTableWidgetItem()
-            executable = result.suggested_stem is not None and result.status in {
-                "可预览",
-                "待手动确认",
-                "外部变化",
-            }
-            check.setFlags(
-                Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable
-                if executable
-                else _READ_ONLY_FLAGS
-            )
-            check.setCheckState(
-                Qt.CheckState.Checked
-                if result.status == "可预览" and not result.requires_confirmation
-                else Qt.CheckState.Unchecked
-            )
-            self.table.setItem(row, 0, check)
-            source_item = self._read_only_item(str(result.canonical_path))
-            source_item.setToolTip(str(result.canonical_path))
-            self.table.setItem(row, 1, source_item)
-            suggestion = QTableWidgetItem(result.suggested_stem or "—")
-            if result.suggested_stem is None:
-                suggestion.setFlags(_READ_ONLY_FLAGS)
-            suggestion.setToolTip("只能编辑建议名称；父目录和扩展名保持不变。")
-            self.table.setItem(row, 2, suggestion)
-            self.table.setItem(row, 3, self._read_only_item(result.extension))
-            self.table.setItem(row, 4, self._read_only_item(result.source))
-            status_item = self._read_only_item("")
-            status_item.setData(Qt.ItemDataRole.UserRole, result.status)
-            status_item.setToolTip(result.message)
-            self.table.setItem(row, 5, status_item)
+        self._updating_rows = True
+        self.table.blockSignals(True)
+        try:
+            self.table.setRowCount(len(self._results))
+            for row, result in enumerate(self._results):
+                check = QTableWidgetItem()
+                executable = result.suggested_stem is not None and result.status in {
+                    "可预览",
+                    "待手动确认",
+                    "外部变化",
+                }
+                check.setFlags(
+                    Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable
+                    if executable
+                    else _READ_ONLY_FLAGS
+                )
+                check.setCheckState(
+                    Qt.CheckState.Checked
+                    if result.status == "可预览" and not result.requires_confirmation
+                    else Qt.CheckState.Unchecked
+                )
+                self.table.setItem(row, 0, check)
+                source_item = self._read_only_item(str(result.canonical_path))
+                source_item.setToolTip(str(result.canonical_path))
+                self.table.setItem(row, 1, source_item)
+                suggestion = QTableWidgetItem(result.suggested_stem or "—")
+                if result.suggested_stem is None:
+                    suggestion.setFlags(_READ_ONLY_FLAGS)
+                suggestion.setToolTip("只能编辑建议名称；父目录和扩展名保持不变。")
+                self.table.setItem(row, 2, suggestion)
+                self.table.setItem(row, 3, self._read_only_item(result.extension))
+                self.table.setItem(row, 4, self._read_only_item(result.source))
+                status_item = self._read_only_item("")
+                status_item.setData(Qt.ItemDataRole.UserRole, result.status)
+                status_item.setToolTip(result.message)
+                self.table.setItem(row, 5, status_item)
+            for row in range(len(self._results)):
+                self._refresh_row_execution_state(row)
+        finally:
+            self.table.blockSignals(False)
+            self._updating_rows = False
+        if self._selection_sync is not None:
+            self._selection_sync.refresh_from_checks()
         self.summary.setText(
             f"只读分析完成：{len(self._results)} 项。尚未修改文件；确认执行前可选择是否同步标签。"
             if self.execution_enabled
             else f"只读分析完成：{len(self._results)} 项。仅预览，未修改任何文件或标签。"
         )
-        if self.execution_enabled:
-            self.primary_button.setEnabled(any(
-                self.table.item(row, 0) is not None
-                and bool(self.table.item(row, 0).flags() & Qt.ItemFlag.ItemIsUserCheckable)
-                for row in range(self.table.rowCount())
-            ))
+        self._update_primary_state()
 
     @staticmethod
     def _validate_stem(stem: str) -> str | None:
@@ -202,6 +300,8 @@ class RenamePreviewDialog(PrototypeDialog):
             error = self._validate_stem(stem)
             if error is not None:
                 raise ValueError(f"{result.original_name}：{error}")
+            if self._row_target_is_unchanged(row):
+                raise ValueError(f"{result.original_name}：建议名称没有变化")
             target_key = (
                 str(result.canonical_path.parent).casefold(),
                 (stem + result.extension).rstrip(" .").casefold(),
@@ -239,7 +339,7 @@ class RenamePreviewDialog(PrototypeDialog):
 
     def set_running(self, running: bool) -> None:
         self._running = running
-        self.primary_button.setEnabled(not running)
+        self._update_primary_state()
         if running:
             self.summary.setText(
                 "正在后台安全重命名；已开始的文件项会完成提交或补偿…"

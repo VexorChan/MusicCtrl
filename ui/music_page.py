@@ -21,7 +21,12 @@ from PySide6.QtWidgets import (
 
 from mock.data import PLAYLISTS
 from ui.components import make_status_badge
-from ui.tables import DataTable, ModelDataTable, StatusBadgeDelegate
+from ui.tables import (
+    CheckSelectionSynchronizer,
+    DataTable,
+    ModelDataTable,
+    StatusBadgeDelegate,
+)
 
 
 def _normalize(text: str) -> str:
@@ -290,7 +295,6 @@ class LibraryPage(QWidget):
         self.sort_key: str | None = None
         self.sort_descending = False
         self.playlist_note: QLabel | None = None
-        self._syncing_selection_checks = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 20, 24, 12)
@@ -369,13 +373,15 @@ class LibraryPage(QWidget):
                     column,
                     StatusBadgeDelegate(self.table),
                 )
-            self._table_model.check_state_changed.connect(self._check_state_changed)
         else:
             self.table = DataTable(checkable_header=True)
         self.checkable_header = self.table.require_checkable_header()
-        self.table.selectionModel().selectionChanged.connect(self._selection_changed)
-        if not self.use_model_view:
-            self.table.itemChanged.connect(self._check_state_changed)
+        self._selection_sync = CheckSelectionSynchronizer(self.table, self)
+        if self._table_model is not None:
+            self._table_model.check_state_changed.connect(
+                self._selection_sync.refresh_from_checks
+            )
+        self._selection_sync.changed.connect(self._update_selection_state)
         self.checkable_header.toggle_requested.connect(self._toggle_select_all)
         self.table.horizontalHeader().sectionClicked.connect(self._header_clicked)
         self.table.customContextMenuRequested.connect(self._context_menu)
@@ -520,6 +526,7 @@ class LibraryPage(QWidget):
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.table.blockSignals(False)
+        self._selection_sync.refresh_from_checks()
         self.content_stack.setCurrentIndex(0 if self.visible_data else 1)
         if not self.visible_data:
             self.empty_title.setText("没有找到匹配的歌词" if self.kind == "lyrics" else "没有找到匹配的音乐")
@@ -558,14 +565,7 @@ class LibraryPage(QWidget):
         self._apply_search()
 
     def _checked_rows(self) -> list[int]:
-        if self._table_model is not None:
-            return list(self._table_model.checked_rows())
-        rows: list[int] = []
-        for row in range(self.table.rowCount()):
-            item = self.table.item(row, 0)
-            if item and item.checkState() == Qt.CheckState.Checked:
-                rows.append(row)
-        return rows
+        return list(self._selection_sync.checked_rows())
 
     def _selected_rows(self) -> list[int]:
         return self._checked_rows()
@@ -599,50 +599,6 @@ class LibraryPage(QWidget):
         suffix = "索引来自用户选择目录" if self.live_mode else "仅演示界面，不操作真实文件"
         self.status.setText(f"已选择 {count} 项    ·    当前显示 {shown} 项    ·    {suffix}")
 
-    def _selection_changed(self, _selected, _deselected) -> None:
-        if self._syncing_selection_checks:
-            return
-        rows = sorted(index.row() for index in self.table.selectionModel().selectedRows())
-        self._syncing_selection_checks = True
-        try:
-            if self._table_model is not None:
-                self._table_model.set_checked_rows(rows)
-            else:
-                self.table.blockSignals(True)
-                try:
-                    selected_rows = set(rows)
-                    for row in range(self.table.rowCount()):
-                        item = self.table.item(row, 0)
-                        if item is not None:
-                            item.setCheckState(
-                                Qt.CheckState.Checked
-                                if row in selected_rows
-                                else Qt.CheckState.Unchecked
-                            )
-                finally:
-                    self.table.blockSignals(False)
-        finally:
-            self._syncing_selection_checks = False
-        self._update_selection_state()
-
-    def _check_state_changed(self, *_args) -> None:
-        if self._syncing_selection_checks:
-            return
-        checked = set(self._checked_rows())
-        selection_model = self.table.selectionModel()
-        self._syncing_selection_checks = True
-        try:
-            selection_model.clearSelection()
-            for row in sorted(checked):
-                selection_model.select(
-                    self.table.model().index(row, 0),
-                    selection_model.SelectionFlag.Select
-                    | selection_model.SelectionFlag.Rows,
-                )
-        finally:
-            self._syncing_selection_checks = False
-        self._update_selection_state()
-
     def _header_clicked(self, column: int) -> None:
         if column == 0:
             self._toggle_select_all()
@@ -663,7 +619,7 @@ class LibraryPage(QWidget):
         for row in range(self.table.rowCount()):
             self.table.item(row, 0).setCheckState(Qt.CheckState.Unchecked if all_checked else Qt.CheckState.Checked)
         self.table.blockSignals(False)
-        self._update_selection_state()
+        self._selection_sync.refresh_from_checks()
 
     def _sort_records(self, key: str, descending: bool) -> None:
         self.sort_key = key

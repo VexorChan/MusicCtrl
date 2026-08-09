@@ -344,6 +344,125 @@ class PlaylistControllerTests(unittest.TestCase):
         self.assertEqual(ready, [])
         self.assertEqual(failures, ["拒绝访问快捷方式"])
 
+    def test_asset_relationship_retarget_updates_only_managed_shortcuts(self) -> None:
+        self.controller.create_playlist("夜晚")
+        audio_input = PlaylistAudioInput(
+            self.asset.id, self.audio, self.audio_root, "active"
+        )
+        for playlist_name in ("通勤", "夜晚"):
+            self.controller.start_add(playlist_name, (audio_input,))
+            self._wait()
+        with LibraryRepository(self.config) as repository:
+            before = repository.list_current_playlist_items_for_assets((self.asset.id,))
+        self.assertEqual(len(before), 2)
+        before_ids = {item.id for item in before}
+
+        unrelated_folder = create_playlist_directory(
+            playlist_root=self.playlist_root, name="无关"
+        )
+        unrelated = unrelated_folder / "损坏.lnk"
+        unrelated.write_bytes(b"not a shortcut")
+        renamed = self.audio_root / "晴天新版-周杰伦.mp3"
+        item = PlaylistRetargetInput(
+            self.audio, renamed, self.audio_root, self.asset.id
+        )
+        impacts: list[int] = []
+        failures: list[str] = []
+        self.controller.retarget_impact_ready.connect(impacts.append)
+        self.controller.retarget_impact_failed.connect(failures.append)
+        self.controller.start_retarget_impact((item,))
+        self._wait()
+        self.assertEqual(impacts, [2])
+        self.assertEqual(failures, [])
+
+        os.rename(self.audio, renamed)
+        self.controller.start_retarget((item,))
+        self._wait()
+
+        with LibraryRepository(self.config) as repository:
+            after = repository.list_current_playlist_items_for_assets((self.asset.id,))
+        self.assertEqual({entry.id for entry in after}, before_ids)
+        self.assertEqual({entry.expected_target_path for entry in after}, {renamed})
+        for entry in after:
+            self.assertTrue(entry.shortcut_path.is_file())
+            self.assertEqual(
+                read_shortcut(entry.shortcut_path, playlist_root=self.playlist_root).target_path,
+                renamed,
+            )
+        self.assertEqual(unrelated.read_bytes(), b"not a shortcut")
+
+    def test_asset_relationship_failure_keeps_v3_journal_and_recovers_database(self) -> None:
+        self.controller.start_add(
+            "通勤",
+            (PlaylistAudioInput(self.asset.id, self.audio, self.audio_root, "active"),),
+        )
+        self._wait()
+        renamed = self.audio_root / "恢复新版-周杰伦.mp3"
+        item = PlaylistRetargetInput(
+            self.audio, renamed, self.audio_root, self.asset.id
+        )
+        os.rename(self.audio, renamed)
+
+        with patch.object(
+            LibraryRepository,
+            "retarget_playlist_item",
+            side_effect=RuntimeError("模拟关系提交失败"),
+        ):
+            self.controller.start_retarget((item,))
+            self._wait()
+        pending = self._setting_value(PENDING_RETARGET_KEY)
+        self.assertIsInstance(pending, dict)
+        self.assertEqual(pending["version"], 3)
+        self.assertEqual(pending["phase"], "apply")
+        self.assertEqual(pending["items"][0]["asset_id"], self.asset.id)
+
+        reopened = PlaylistController(self.config)
+        reopened.start_pending_retarget_recovery()
+        self._wait(reopened)
+        self.assertIsNone(self._setting_value(PENDING_RETARGET_KEY))
+        with LibraryRepository(self.config) as repository:
+            relationship = repository.list_current_playlist_items_for_assets(
+                (self.asset.id,)
+            )[0]
+        self.assertEqual(relationship.expected_target_path, renamed)
+        self.assertEqual(
+            read_shortcut(
+                relationship.shortcut_path, playlist_root=self.playlist_root
+            ).target_path,
+            renamed,
+        )
+
+    def test_asset_impact_fails_closed_for_missing_managed_shortcut(self) -> None:
+        self.controller.start_add(
+            "通勤",
+            (PlaylistAudioInput(self.asset.id, self.audio, self.audio_root, "active"),),
+        )
+        self._wait()
+        with LibraryRepository(self.config) as repository:
+            relationship = repository.list_current_playlist_items_for_assets(
+                (self.asset.id,)
+            )[0]
+        relationship.shortcut_path.unlink()
+        failures: list[str] = []
+        impacts: list[int] = []
+        self.controller.retarget_impact_failed.connect(failures.append)
+        self.controller.retarget_impact_ready.connect(impacts.append)
+        self.controller.start_retarget_impact(
+            (
+                PlaylistRetargetInput(
+                    self.audio,
+                    self.audio_root / "缺失新版-周杰伦.mp3",
+                    self.audio_root,
+                    self.asset.id,
+                ),
+            )
+        )
+        self._wait()
+        self.assertEqual(impacts, [])
+        self.assertEqual(len(failures), 1)
+        self.assertIn("缺失或损坏", failures[0])
+        self.assertTrue(self.audio.is_file())
+
     def test_retarget_converges_existing_new_link_and_rejects_wrong_target(self) -> None:
         item = PlaylistAudioInput(self.asset.id, self.audio, self.audio_root, "active")
         self.controller.start_add("通勤", (item,))
@@ -435,7 +554,7 @@ class PlaylistControllerTests(unittest.TestCase):
         self.assertIsInstance(pending_seen[0], dict)
         pending = self._setting_value(PENDING_RETARGET_KEY)
         self.assertEqual(pending, pending_seen[0])
-        self.assertEqual(pending["version"], 2)
+        self.assertEqual(pending["version"], 3)
         self.assertEqual(pending["phase"], "apply")
         self.assertEqual(pending["playlist_root"], str(self.playlist_root))
         self.assertEqual(
@@ -445,6 +564,7 @@ class PlaylistControllerTests(unittest.TestCase):
                     "source_path": str(old_audio),
                     "target_path": str(new_audio),
                     "audio_root": str(self.audio_root),
+                    "asset_id": None,
                 }
             ],
         )
@@ -511,6 +631,10 @@ class PlaylistControllerTests(unittest.TestCase):
         legacy = dict(pending)
         legacy["version"] = 1
         legacy.pop("phase")
+        legacy["items"] = [
+            {key: value for key, value in item.items() if key != "asset_id"}
+            for item in legacy["items"]
+        ]
         with LibraryRepository(self.config) as repository:
             repository.set_setting(PENDING_RETARGET_KEY, legacy)
 
@@ -713,7 +837,7 @@ class PlaylistControllerTests(unittest.TestCase):
         self.assertIn("拒绝读取快捷方式", failures[0])
         pending = self._setting_value(PENDING_RETARGET_KEY)
         self.assertIsInstance(pending, dict)
-        self.assertEqual(pending["version"], 2)
+        self.assertEqual(pending["version"], 3)
         self.assertEqual(pending["phase"], "discover")
         self.assertTrue(old_shortcut.exists())
         self.assertFalse(new_shortcut.exists())

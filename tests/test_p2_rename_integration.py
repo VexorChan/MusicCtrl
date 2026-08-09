@@ -276,6 +276,51 @@ class P2RenameIntegrationTests(unittest.TestCase):
         finally:
             self._dispose(window)
 
+    def test_unchanged_preview_is_disabled_until_edited_and_selection_stays_synced(self) -> None:
+        source = self.music / "same.mp3"
+        record = self._record(source)
+        window, _scan, metadata, _safe = self._live_window((record,))
+        try:
+            dialog = self._select_first_row_and_open(window, metadata)
+            metadata.publish((self._preview(source, stem="same"),))
+            check = dialog.table.item(0, 0)
+            status = dialog.table.item(0, 5)
+            selection = dialog.table.selectionModel()
+            self.assertEqual(check.checkState(), Qt.CheckState.Unchecked)
+            self.assertFalse(bool(check.flags() & Qt.ItemFlag.ItemIsUserCheckable))
+            self.assertEqual(status.data(Qt.ItemDataRole.UserRole), "无需更改")
+            self.assertFalse(dialog.primary_button.isEnabled())
+
+            dialog.table.model().setData(
+                dialog.table.model().index(0, 2),
+                "changed",
+                Qt.ItemDataRole.EditRole,
+            )
+            self.assertTrue(bool(check.flags() & Qt.ItemFlag.ItemIsUserCheckable))
+            dialog.table.model().setData(
+                dialog.table.model().index(0, 0),
+                Qt.CheckState.Checked,
+                Qt.ItemDataRole.CheckStateRole,
+            )
+            self.assertEqual([index.row() for index in selection.selectedRows()], [0])
+            self.assertTrue(dialog.primary_button.isEnabled())
+
+            dialog.table.clearSelection()
+            self.assertEqual(check.checkState(), Qt.CheckState.Unchecked)
+            dialog.table.selectRow(0)
+            self.assertEqual(check.checkState(), Qt.CheckState.Checked)
+
+            dialog.table.model().setData(
+                dialog.table.model().index(0, 2),
+                "same",
+                Qt.ItemDataRole.EditRole,
+            )
+            self.assertEqual(check.checkState(), Qt.CheckState.Unchecked)
+            self.assertEqual(selection.selectedRows(), [])
+            self.assertFalse(dialog.primary_button.isEnabled())
+        finally:
+            self._dispose(window)
+
     def test_playlist_impact_is_async_and_confirmation_shows_count(self) -> None:
         source = self.music / "old.mp3"
         scan = _FakeScanController((self._record(source),))
@@ -297,6 +342,7 @@ class P2RenameIntegrationTests(unittest.TestCase):
             ) as question:
                 dialog.primary_button.click()
                 self.assertEqual(len(playlist.impact_starts), 1)
+                self.assertEqual(playlist.impact_starts[0][0].asset_id, "asset-1")
                 self.assertEqual(safe.starts, [])
                 self.assertFalse(question.called)
                 playlist.publish_impact(3)

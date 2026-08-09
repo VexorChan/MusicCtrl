@@ -1,6 +1,13 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSignalBlocker, Qt, Signal
+from PySide6.QtCore import (
+    QAbstractTableModel,
+    QModelIndex,
+    QObject,
+    QSignalBlocker,
+    Qt,
+    Signal,
+)
 from PySide6.QtGui import QColor, QMouseEvent, QPainter, QResizeEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -143,6 +150,110 @@ class ModelItemProxy(QTableWidgetItem):
     def data(self, role: int):
         return self._model.data(self._index, role)
 
+
+class CheckSelectionSynchronizer(QObject):
+    """Keep row highlighting and first-column checkboxes as one selection set."""
+
+    changed = Signal()
+
+    def __init__(self, table: QTableWidget | QTableView, parent=None) -> None:
+        super().__init__(parent or table)
+        self._table = table
+        self._syncing = False
+        selection_model = table.selectionModel()
+        if selection_model is None:
+            raise RuntimeError("表格尚未建立选择模型")
+        selection_model.selectionChanged.connect(self._selection_changed)
+        if isinstance(table, ModelDataTable):
+            table.itemChanged.connect(self._item_changed)
+        elif isinstance(table, QTableWidget):
+            table.itemChanged.connect(self._item_changed)
+
+    def _row_count(self) -> int:
+        model = self._table.model()
+        return 0 if model is None else model.rowCount()
+
+    def _check_item(self, row: int) -> QTableWidgetItem | None:
+        item_getter = getattr(self._table, "item", None)
+        return None if item_getter is None else item_getter(row, 0)
+
+    @staticmethod
+    def _is_checkable(item: QTableWidgetItem | None) -> bool:
+        return bool(
+            item is not None
+            and item.flags() & Qt.ItemFlag.ItemIsEnabled
+            and item.flags() & Qt.ItemFlag.ItemIsUserCheckable
+        )
+
+    def checked_rows(self) -> tuple[int, ...]:
+        return tuple(
+            row
+            for row in range(self._row_count())
+            if self._is_checkable(self._check_item(row))
+            and self._check_item(row).checkState() == Qt.CheckState.Checked  # type: ignore[union-attr]
+        )
+
+    def refresh_from_checks(self) -> None:
+        if self._syncing:
+            return
+        selection_model = self._table.selectionModel()
+        model = self._table.model()
+        if selection_model is None or model is None:
+            return
+        self._syncing = True
+        try:
+            blocker = QSignalBlocker(selection_model)
+            selection_model.clearSelection()
+            for row in self.checked_rows():
+                selection_model.select(
+                    model.index(row, 0),
+                    selection_model.SelectionFlag.Select
+                    | selection_model.SelectionFlag.Rows,
+                )
+            del blocker
+        finally:
+            self._syncing = False
+        self.changed.emit()
+
+    def _selection_changed(self, _selected, _deselected) -> None:
+        if self._syncing:
+            return
+        selection_model = self._table.selectionModel()
+        if selection_model is None:
+            return
+        selected_rows = {index.row() for index in selection_model.selectedRows()}
+        self._syncing = True
+        try:
+            blocker = QSignalBlocker(self._table)
+            changed_rows: list[int] = []
+            for row in range(self._row_count()):
+                item = self._check_item(row)
+                if item is None:
+                    continue
+                desired = (
+                    Qt.CheckState.Checked
+                    if row in selected_rows and self._is_checkable(item)
+                    else Qt.CheckState.Unchecked
+                )
+                if item.checkState() != desired:
+                    item.setCheckState(desired)
+                    changed_rows.append(row)
+            del blocker
+            model = self._table.model()
+            if isinstance(model, ItemTableModel):
+                for row in changed_rows:
+                    index = model.index(row, 0)
+                    model.dataChanged.emit(
+                        index, index, [Qt.ItemDataRole.CheckStateRole]
+                    )
+        finally:
+            self._syncing = False
+        self.changed.emit()
+
+    def _item_changed(self, _item) -> None:
+        if not self._syncing:
+            self.refresh_from_checks()
+
 class CheckableHeaderView(QHeaderView):
     """在第一列表头绘制并管理与行复选框一致的原生三态控件。"""
 
@@ -223,6 +334,7 @@ class StatusBadgeDelegate(QStyledItemDelegate):
             "原文件异常": ("#fff1d6", "#8a4b08"),
             "快捷方式异常": ("#fff1d6", "#8a4b08"),
             "已忽略": ("#eeeeee", "#555555"),
+            "无需更改": ("#eeeeee", "#555555"),
             "未匹配": ("#fff1d6", "#8a4b08"),
         }
         background, foreground = colors.get(status, ("#e7f5ec", "#176b3a"))

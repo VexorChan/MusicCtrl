@@ -1983,6 +1983,36 @@ class LibraryRepository:
         ).fetchall()
         return tuple(self._playlist_item_from_row(row) for row in rows)
 
+    def list_current_playlist_items_for_assets(
+        self,
+        asset_ids: Iterable[str],
+    ) -> tuple[PlaylistItemRecord, ...]:
+        """Return stable current playlist relationships for selected audio assets."""
+
+        self._require_open_in_owner_thread()
+        frozen = tuple(dict.fromkeys(asset_ids))
+        if not frozen:
+            return ()
+        if any(not isinstance(asset_id, str) or not asset_id.strip() for asset_id in frozen):
+            raise RepositoryDataError("asset_id 必须是非空字符串")
+        placeholders = ",".join("?" for _ in frozen)
+        rows = self._connection.execute(
+            f"""
+            SELECT i.*, p.name AS playlist_name,
+                   a.canonical_path AS asset_path, a.file_state AS asset_state,
+                   a.size_bytes AS asset_size_bytes, a.mtime_ns AS asset_mtime_ns
+            FROM playlist_items AS i
+            JOIN playlists AS p ON p.id = i.playlist_id
+            LEFT JOIN assets AS a ON a.id = i.audio_asset_id
+            WHERE i.audio_asset_id IN ({placeholders})
+              AND i.lifecycle_state = 'current'
+              AND p.state != 'deleted'
+            ORDER BY i.audio_asset_id, i.normalized_shortcut_path
+            """,
+            frozen,
+        ).fetchall()
+        return tuple(self._playlist_item_from_row(row) for row in rows)
+
     def mark_playlist_item_removed(self, shortcut_path: Path) -> None:
         self._require_open_in_owner_thread()
         _shortcut, shortcut_key = _windows_path_key(shortcut_path, field_name="shortcut_path")
@@ -2173,6 +2203,88 @@ class LibraryRepository:
                     (str(target), target_key, str(shortcut), shortcut_key, now, row["id"]),
                 )
         return len(rows)
+
+    def retarget_playlist_item(
+        self,
+        *,
+        item_id: str,
+        expected_source_path: Path,
+        expected_shortcut_path: Path,
+        target_path: Path,
+        target_shortcut_path: Path,
+    ) -> PlaylistItemRecord:
+        """Commit one verified shortcut retarget without touching unrelated rows."""
+
+        self._require_open_in_owner_thread()
+        if not isinstance(item_id, str) or not item_id.strip():
+            raise RepositoryDataError("playlist item id 不能为空")
+        _source, source_key = _canonicalize_path(
+            expected_source_path, field_name="expected_source_path"
+        )
+        target, target_key = _canonicalize_path(target_path, field_name="target_path")
+        _old_shortcut, old_shortcut_key = _windows_path_key(
+            expected_shortcut_path, field_name="expected_shortcut_path"
+        )
+        new_shortcut, new_shortcut_key = _windows_path_key(
+            target_shortcut_path, field_name="target_shortcut_path"
+        )
+        row = self._connection.execute(
+            """
+            SELECT i.*, p.folder_path
+            FROM playlist_items AS i JOIN playlists AS p ON p.id = i.playlist_id
+            WHERE i.id = ? AND i.lifecycle_state = 'current' AND p.state != 'deleted'
+            """,
+            (item_id,),
+        ).fetchone()
+        if row is None:
+            raise RecordNotFoundError("待更新的当前歌单关系不存在")
+        _folder, folder_key = _windows_path_key(
+            Path(row["folder_path"]), field_name="folder_path"
+        )
+        _require_path_within_root(
+            new_shortcut_key, folder_key, field_name="target_shortcut_path"
+        )
+        if new_shortcut.parent != Path(row["folder_path"]) or new_shortcut.suffix.casefold() != ".lnk":
+            raise RepositoryPathError("新快捷方式必须直接位于原歌单目录")
+        if (
+            row["normalized_target_path"] != source_key
+            or row["normalized_shortcut_path"] != old_shortcut_key
+        ):
+            raise RepositoryDataError("歌单关系已变化，拒绝提交过期重定向")
+        now = _utc_now()
+        with self._transaction():
+            cursor = self._connection.execute(
+                """
+                UPDATE playlist_items SET expected_target_path = ?,
+                    normalized_target_path = ?, shortcut_path = ?,
+                    normalized_shortcut_path = ?, shortcut_state = 'active',
+                    source_state = 'active', diagnostic = '应用内安全重定向已完成',
+                    updated_at = ?
+                WHERE id = ? AND lifecycle_state = 'current'
+                  AND normalized_target_path = ? AND normalized_shortcut_path = ?
+                """,
+                (
+                    str(target), target_key, str(new_shortcut), new_shortcut_key,
+                    now, item_id, source_key, old_shortcut_key,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RepositoryDataError("歌单关系提交期间发生变化")
+        refreshed = self._connection.execute(
+            """
+            SELECT i.*, p.name AS playlist_name,
+                   a.canonical_path AS asset_path, a.file_state AS asset_state,
+                   a.size_bytes AS asset_size_bytes, a.mtime_ns AS asset_mtime_ns
+            FROM playlist_items AS i
+            JOIN playlists AS p ON p.id = i.playlist_id
+            LEFT JOIN assets AS a ON a.id = i.audio_asset_id
+            WHERE i.id = ?
+            """,
+            (item_id,),
+        ).fetchone()
+        if refreshed is None:
+            raise RepositoryDataError("歌单关系提交后无法回读")
+        return self._playlist_item_from_row(refreshed)
 
     def mark_playlist_deleted(self, folder: Path) -> None:
         self._require_open_in_owner_thread()

@@ -947,6 +947,7 @@ class MainWindow(QMainWindow):
                     source_path=item.source_path,
                     target_path=item.target_path,
                     audio_root=item.allowed_root,
+                    asset_id=item.asset_id,
                 )
                 for item in frozen_items
             )
@@ -1026,6 +1027,7 @@ class MainWindow(QMainWindow):
                         source_path=item.source_path,
                         target_path=item.target_path,
                         audio_root=self._metadata_inputs_by_asset[item.asset_id].allowed_root,
+                        asset_id=item.asset_id,
                     )
                     for item in getattr(result, "items", ())
                     if getattr(item, "result", None) == "success"

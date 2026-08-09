@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
 
 from dialogs.common import PrototypeDialog, dialog_header
 from ui.components import make_status_badge
-from ui.tables import ModelDataTable, StatusBadgeDelegate
+from ui.tables import CheckSelectionSynchronizer, ModelDataTable, StatusBadgeDelegate
 
 
 class LyricsMatchDialog(PrototypeDialog):
@@ -103,6 +103,11 @@ class LyricsMatchDialog(PrototypeDialog):
         self.unmatched_results = self._live_results_table()
         self.conflict_results = self._live_results_table()
         self._tables = (self.unmatched_results, self.conflict_results)
+        self._selection_syncs = tuple(
+            CheckSelectionSynchronizer(table, self) for table in self._tables
+        )
+        for synchronizer in self._selection_syncs:
+            synchronizer.changed.connect(self._update_live_actions)
         self.results = self.unmatched_results  # 兼容既有只读集成探针
         self.result_tabs.addTab(self.unmatched_results, "未匹配  0")
         self.result_tabs.addTab(self.conflict_results, "重复与冲突  0")
@@ -231,6 +236,10 @@ class LyricsMatchDialog(PrototypeDialog):
                     cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 table.setItem(row, column, cell)
         table.blockSignals(False)
+        for candidate, synchronizer in zip(self._tables, self._selection_syncs):
+            if candidate is table:
+                synchronizer.refresh_from_checks()
+                break
 
     def show_warning(self, message: str) -> None:
         if self.live_mode:
@@ -242,11 +251,10 @@ class LyricsMatchDialog(PrototypeDialog):
         cells: list[QTableWidgetItem] = []
         seen: set[tuple[int, int]] = set()
         for table_index, table in enumerate(self._tables):
-            rows = {index.row() for index in table.selectionModel().selectedRows()}
-            rows.update(
+            rows = {
                 row for row in range(table.rowCount())
                 if table.item(row, 0).checkState() == Qt.CheckState.Checked
-            )
+            }
             for row in sorted(rows):
                 key = (table_index, row)
                 if key not in seen:
