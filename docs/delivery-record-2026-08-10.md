@@ -1,5 +1,17 @@
 # 2026-08-10 本机稳定交付记录
 
+## 2026-08-10 00:34 旧扫描来源文件状态刷新修复交付
+
+- `RUNTIME_HEAD=72eef30fcd033d919a778b38eefc903a1ef8bdf2`，构建时与 `origin/main` 完全一致。
+- 正式测试目录 `pytest` 417 项通过；隔离构建环境执行 `python -W error::ResourceWarning -m unittest discover -q` 亦为 417 项通过，`compileall`、`smoke_test.py`、`git diff --check` 和 `pip check` 全部通过。
+- 独立构建工作树：`work/p8-final-72eef30-20260810-003129`；Python 3.13.5、PyInstaller 6.21.0、PySide6 6.9.2、Mutagen 1.48.1、pywin32 308。
+- `MusicCtrl.exe` SHA-256：`3D8AD59275045B6FA88D9143DCCEEB24BD2C9ECE9CD526B2EDE7E5CF518D19EE`。
+- `SHA256SUMS.txt` 共 225 个条目并全部回读；含清单自身的构建包与安装目录均为 226 个文件。
+- 构建 EXE 从项目目录外启动并保持 5 秒，临时工作目录未产生文件；桌面快捷方式安装 EXE 亦启动并保持 5 秒。
+- 安装目录内数据库和日志文件为 0；旧安装恢复副本为 `%LOCALAPPDATA%\Programs\MusicCtrl-backup-20260810-003420`，未删除。
+- 桌面快捷方式目标及工作目录已回读为最终安装目录。
+- 本节之后的提交只更新交付记录，不改变已构建运行时。
+
 ## 2026-08-10 00:18 文件状态列交付
 
 - `RUNTIME_HEAD=6b3a163126aaf13a09801b62e30884ff7bf65b46`，构建时与 `origin/main` 完全一致。
