@@ -145,7 +145,10 @@ class UiRefreshTests(unittest.TestCase):
                 items=(),
             )
         )
-        self.assertEqual(audio.started, [target])
+        self.assertEqual(audio.started, [source])
+        audio.finish()
+        self._events()
+        self.assertEqual(audio.started, [source, target])
         audio.finish()
         self._events()
         window._safe_import_completed(
@@ -158,7 +161,10 @@ class UiRefreshTests(unittest.TestCase):
                 items=(),
             )
         )
-        self.assertEqual(audio.started, [target, source])
+        self.assertEqual(audio.started, [source, target, target])
+        audio.finish()
+        self._events()
+        self.assertEqual(audio.started, [source, target, target, source])
         audio.finish()
         self._events()
 
@@ -172,7 +178,10 @@ class UiRefreshTests(unittest.TestCase):
                 items=(),
             )
         )
-        self.assertEqual(lyric.started, [target])
+        self.assertEqual(lyric.started, [source])
+        lyric.finish()
+        self._events()
+        self.assertEqual(lyric.started, [source, target])
         lyric.finish()
         self._events()
         window._safe_import_completed(
@@ -185,7 +194,47 @@ class UiRefreshTests(unittest.TestCase):
                 items=(),
             )
         )
-        self.assertEqual(lyric.started, [target, source])
+        self.assertEqual(lyric.started, [source, target, target])
+        lyric.finish()
+        self._events()
+        self.assertEqual(lyric.started, [source, target, target, source])
+
+    def test_main_refresh_rechecks_marked_record_roots_before_remembered_roots(self) -> None:
+        audio = FakeLibraryController()
+        window = self._window(audio=audio)
+        page = window.pages["所有音乐"]
+        marked_root = self.root / "old-library"
+        remembered_root = self.root / "current-library"
+        marked_root.mkdir()
+        remembered_root.mkdir()
+        page.replace_data(
+            (
+                {
+                    "title": "待复核",
+                    "artist": "文件",
+                    "_file_state": "missing",
+                    "_allowed_root": marked_root,
+                },
+                {
+                    "title": "重复根",
+                    "artist": "文件",
+                    "_file_state": "external_changed",
+                    "_allowed_root": marked_root,
+                },
+            )
+        )
+        with patch.object(
+            window,
+            "_remembered_settings_paths",
+            return_value={"audio": remembered_root, "lyrics": None, "playlist": None},
+        ):
+            window._rescan_remembered_libraries(page=page)
+
+        self.assertEqual(audio.started, [marked_root])
+        self.assertIn("已标记文件所在目录", page.status.text())
+        audio.finish()
+        self._events()
+        self.assertEqual(audio.started, [marked_root, remembered_root])
 
     def test_backup_restore_roots_refresh_sequentially_and_cleanup_never_refreshes(self) -> None:
         first = self.root / "first"

@@ -594,15 +594,22 @@ class MainWindow(QMainWindow):
         if getattr(result, "success_count", 0):
             action = getattr(result, "action", "import")
             mode = getattr(result, "mode", "audio")
-            root = getattr(
-                result,
-                "source_root" if action == "undo" else "target_root",
-                None,
-            )
-            if isinstance(root, Path) and mode in {"audio", "lyrics"}:
-                self._queue_library_refresh(
-                    (("audio" if mode == "audio" else "lyric", root),)
+            source_root = getattr(result, "source_root", None)
+            target_root = getattr(result, "target_root", None)
+            if (
+                isinstance(source_root, Path)
+                and isinstance(target_root, Path)
+                and mode in {"audio", "lyrics"}
+            ):
+                kind = "audio" if mode == "audio" else "lyric"
+                # 先刷新文件移出的目录，再刷新文件最终所在目录。这样旧索引会被
+                # 标记为 missing，且最后记住的仍是用户当前实际使用的目录。
+                roots = (
+                    ((kind, target_root), (kind, source_root))
+                    if action == "undo"
+                    else ((kind, source_root), (kind, target_root))
                 )
+                self._queue_library_refresh(roots)
             elif self._import_dialog is not None:
                 self._import_dialog.show_failed("文件操作已完成，但刷新信息无效，请手动重新扫描。")
 
@@ -1389,7 +1396,7 @@ class MainWindow(QMainWindow):
             show("已有后台任务运行，请完成后再刷新。")
             return
         paths = self._remembered_settings_paths()
-        roots = tuple(
+        remembered_roots = tuple(
             (kind, path)
             for kind, path in (
                 ("audio", paths["audio"]),
@@ -1398,10 +1405,28 @@ class MainWindow(QMainWindow):
             )
             if path is not None
         )
+        marked_roots: tuple[tuple[str, Path], ...] = ()
+        if page is not None and page.kind in {"music", "lyrics"}:
+            kind = "audio" if page.kind == "music" else "lyric"
+            marked_roots = tuple(
+                dict.fromkeys(
+                    (kind, root)
+                    for record in page.all_data
+                    if record.get("_file_state") in {"missing", "external_changed"}
+                    and isinstance((root := record.get("_allowed_root")), Path)
+                    and root.is_absolute()
+                )
+            )
+        # 先检查已标记记录所在的旧目录，再检查已记住目录。后者放在最后可避免
+        # 维护刷新意外改变用户当前记住的目录。
+        roots = tuple(dict.fromkeys(marked_roots + remembered_roots))
         if not roots:
             show("尚未记住音乐、歌词或歌单目录，请先明确选择并完成扫描。")
             return
-        show(f"正在刷新 {len(roots)} 个已记住目录…")
+        if marked_roots:
+            show(f"正在刷新 {len(roots)} 个目录（含已标记文件所在目录）…")
+        else:
+            show(f"正在刷新 {len(roots)} 个已记住目录…")
         self._queue_library_refresh(roots)
 
     def _choose_playlist_root(self, dialog: SettingsDialog) -> None:
