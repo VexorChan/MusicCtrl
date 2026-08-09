@@ -1,5 +1,17 @@
 # 2026-08-10 本机稳定交付记录
 
+## 2026-08-10 02:19 歌单选择、元数据与一致性修复交付
+
+- `RUNTIME_HEAD=4a7f36f6cc10989b02ab26aa08ccf32c3ff4045c`，构建前已推送并通过 `git ls-remote` 回读，与 `origin/main` 完全一致。
+- 主工作区与独立构建 worktree 均为 432 项测试通过；隔离环境同时通过 `pip check`、`compileall`、`smoke_test.py` 和 `git diff --check`。
+- 独立构建 worktree：`work/p8-final-4a7f36f-20260810-021429`；Python 3.13.5、PyInstaller 6.21.0、PySide6 6.9.2、Mutagen 1.48.1、pywin32 308。
+- `MusicCtrl.exe` SHA-256：`4FE3C8FE57B43E9EA821706CA69E0AABC5EFD5A5EE6EE8E65F3B2D642FF42D66`。
+- `SHA256SUMS.txt` 共 225 个条目并全部回读；含清单自身的构建包与安装目录均为 226 个文件，逐文件 SHA-256 一致。
+- 构建 EXE、安装 EXE及桌面快捷方式均在隔离 `LOCALAPPDATA` 与项目外工作目录启动并保持 5 秒，工作目录零写入；安装目录内数据库、日志和备份文件为 0。
+- 首次替换因旧版进程占用被 Windows 拒绝；关闭旧版后将原目录及失败复制副本整体保留为 `%LOCALAPPDATA%\Programs\MusicCtrl-backup-20260810-021833`，未删除，再完成全新安装。
+- 桌面快捷方式目标、工作目录和图标均回读为最终安装 EXE。
+- 本节之后的提交只更新交付记录，不改变已构建运行时。
+
 ## 2026-08-10 01:13 多选与歌单管理修复交付
 
 - `RUNTIME_HEAD=305f3d868555e91ee8c1aa0a0acaab93a0295e0b`；GitHub 443 当前不可达，连续四次推送均因连接超时或重置失败，因此构建包如实记录 `ORIGIN_MAIN_AT_BUILD=UNVERIFIED_NETWORK`，远端一致性门禁待网络恢复后补验。
