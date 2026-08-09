@@ -178,7 +178,7 @@ def _playlist_file_status(source_state: str, shortcut_state: str) -> str:
 
 def _playlist_row(item: PlaylistItemRecord) -> PlaylistRowSnapshot:
     source_state = item.source_state
-    if item.asset_state in {"missing", "external_changed"}:
+    if item.asset_state in {"active", "missing", "external_changed"}:
         source_state = item.asset_state
     source_labels = {
         "active": "正常",

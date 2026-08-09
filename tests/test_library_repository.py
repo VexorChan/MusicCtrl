@@ -1184,6 +1184,19 @@ class LibraryRepositoryTests(unittest.TestCase):
         self.assertEqual(item.audio_asset_id, asset.id)
         self.assertEqual(item.expected_target_path, asset.canonical_path)
 
+        broken = PlaylistItemObservation(
+            shortcut, None, None, "broken", "unindexed",
+            "不可读", "待识别", None, "unknown", "快捷方式损坏",
+        )
+        repository.reconcile_playlists(
+            playlist_root=playlist_root, observed={"通勤": (broken,)}
+        )
+        preserved = repository.list_playlist_items(playlist.id)[0]
+        self.assertEqual(preserved.shortcut_state, "broken")
+        self.assertEqual(preserved.audio_asset_id, asset.id)
+        self.assertEqual(preserved.expected_target_path, asset.canonical_path)
+        self.assertEqual((preserved.title, preserved.artist), ("原歌", "歌手"))
+
 
 if __name__ == "__main__":
     unittest.main()

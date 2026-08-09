@@ -1858,12 +1858,19 @@ class LibraryRepository:
                             stored_key is not None and target_key is not None
                             and stored_key != target_key
                         )
+                        unreadable_shortcut = (
+                            item.target_path is None and item.shortcut_state == "broken"
+                        )
+                        preserve_expected = changed_target or unreadable_shortcut
                         shortcut_state = "external_changed" if changed_target else item.shortcut_state
                         diagnostic = (
                             "快捷方式目标已被外部修改"
                             if changed_target else item.diagnostic
                         )
-                        keep_snapshot = item.metadata_source in {"last_known", "unknown"}
+                        keep_snapshot = (
+                            preserve_expected
+                            or item.metadata_source in {"last_known", "unknown"}
+                        )
                         self._connection.execute(
                             """
                             UPDATE playlist_items SET playlist_id = ?, audio_asset_id = ?,
@@ -1876,13 +1883,14 @@ class LibraryRepository:
                             """,
                             (
                                 playlist_id,
-                                existing["audio_asset_id"] if changed_target else item.audio_asset_id,
+                                existing["audio_asset_id"] if preserve_expected else item.audio_asset_id,
                                 str(shortcut), shortcut_key,
-                                existing["expected_target_path"] if changed_target else (
+                                existing["expected_target_path"] if preserve_expected else (
                                     None if target is None else str(target)
                                 ),
-                                existing["normalized_target_path"] if changed_target else target_key,
-                                shortcut_state, item.source_state,
+                                existing["normalized_target_path"] if preserve_expected else target_key,
+                                shortcut_state,
+                                existing["source_state"] if unreadable_shortcut else item.source_state,
                                 existing["title"] if keep_snapshot else item.title,
                                 existing["artist"] if keep_snapshot else item.artist,
                                 existing["duration_ms"] if keep_snapshot else item.duration_ms,
