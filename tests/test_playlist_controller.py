@@ -24,6 +24,7 @@ from services.playlist_controller import (
     PlaylistRemovalInput,
     PlaylistRetargetInput,
     PlaylistSnapshot,
+    _playlist_file_status,
 )
 from services.windows_shortcuts import create_playlist_directory, create_shortcut, read_shortcut
 from ui.main_window import MainWindow
@@ -71,6 +72,14 @@ class PlaylistControllerTests(unittest.TestCase):
             setting = repository.get_setting(key)
         return None if setting is None else setting.value
 
+    def test_combined_playlist_file_status_contract(self) -> None:
+        self.assertEqual(_playlist_file_status("active", "active"), "正常")
+        self.assertEqual(_playlist_file_status("missing", "active"), "原文件缺失")
+        self.assertEqual(_playlist_file_status("external_changed", "active"), "原文件异常")
+        self.assertEqual(_playlist_file_status("unindexed", "active"), "原文件异常")
+        self.assertEqual(_playlist_file_status("active", "missing"), "快捷方式异常")
+        self.assertEqual(_playlist_file_status("missing", "broken"), "文件异常")
+
     def _install_retarget_fixture(
         self, suffix: str = "新版"
     ) -> tuple[Path, Path, Path, Path, PlaylistRetargetInput]:
@@ -104,8 +113,10 @@ class PlaylistControllerTests(unittest.TestCase):
         rows = self.controller.load_playlist("通勤")
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["title"], "晴天")
-        self.assertEqual(rows[0]["status"], "未检查")
         self.assertEqual(rows[0]["file_status"], "正常")
+        self.assertNotIn("status", rows[0])
+        self.assertNotIn("format", rows[0])
+        self.assertNotIn("size", rows[0])
         shortcut = rows[0]["_shortcut_path"]
         self.assertTrue(shortcut.is_file())
 
@@ -178,14 +189,14 @@ class PlaylistControllerTests(unittest.TestCase):
         warnings: list[str] = []
         self.controller.completed.connect(results.append)
         self.controller.warning.connect(warnings.append)
-        original_set = LibraryRepository.set_setting
+        original_set = LibraryRepository.set_playlist_pins
 
-        def fail_pinned(repository, key, value):
-            if key == PLAYLIST_PINNED_KEY:
+        def fail_pinned(repository, names, *, setting_key):
+            if setting_key == PLAYLIST_PINNED_KEY:
                 raise RuntimeError("deterministic pin failure")
-            return original_set(repository, key, value)
+            return original_set(repository, names, setting_key=setting_key)
 
-        with patch.object(LibraryRepository, "set_setting", new=fail_pinned):
+        with patch.object(LibraryRepository, "set_playlist_pins", new=fail_pinned):
             self.controller.start_rename_playlist("通勤", "夜晚")
             self._wait()
 
@@ -206,11 +217,13 @@ class PlaylistControllerTests(unittest.TestCase):
         broken = self.playlist_root / "通勤" / "损坏.lnk"
         broken.write_bytes(b"not-a-shortcut")
 
+        self.controller.start_refresh(self.playlist_root)
+        self._wait()
         rows = {row["title"]: row for row in self.controller.load_playlist("通勤")}
 
-        self.assertEqual(rows["未索引-歌手"]["file_status"], "目标未索引")
-        self.assertEqual(rows["损坏"]["file_status"], "快捷方式损坏")
-        self.assertIn("快捷方式损坏", rows["损坏"]["_file_status_detail"])
+        self.assertEqual(rows["未索引"]["file_status"], "原文件异常")
+        self.assertEqual(rows["损坏"]["file_status"], "文件异常")
+        self.assertIn("快捷方式：损坏", rows["损坏"]["_file_status_detail"])
 
     def test_duplicate_is_skipped_without_overwrite(self) -> None:
         results = []
@@ -246,6 +259,26 @@ class PlaylistControllerTests(unittest.TestCase):
         self.assertEqual(rows[0]["_target_path"], renamed)
         self.assertFalse(old_shortcut.exists())
         self.assertTrue(rows[0]["_shortcut_path"].is_file())
+
+    def test_later_retarget_does_not_rewrite_append_only_history_paths(self) -> None:
+        item = PlaylistAudioInput(self.asset.id, self.audio, self.audio_root, "active")
+        self.controller.start_add("通勤", (item,))
+        self._wait()
+        add_history = self.controller.list_history()[0]
+        original_history_source = add_history.items[0].source_path
+        renamed = self.audio_root / "新歌名-周杰伦.mp3"
+        os.rename(self.audio, renamed)
+
+        self.controller.start_retarget(
+            (PlaylistRetargetInput(self.audio, renamed, self.audio_root),)
+        )
+        self._wait()
+
+        persisted_add = next(
+            entry for entry in self.controller.list_history() if entry.action == "add"
+        )
+        self.assertEqual(persisted_add.items[0].source_path, original_history_source)
+        self.assertEqual(original_history_source, self.audio)
 
     def test_retarget_impact_counts_managed_shortcuts_read_only(self) -> None:
         self.controller.create_playlist("怀旧")

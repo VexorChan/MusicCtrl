@@ -14,6 +14,7 @@ from repositories.library_repository import (
     AssetUpsert,
     IndexBatchItem,
     LibraryRepository,
+    PlaylistItemObservation,
     RecordNotFoundError,
     RepositoryClosedError,
     RepositoryCommitOutcomeUnknown,
@@ -1113,6 +1114,75 @@ class LibraryRepositoryTests(unittest.TestCase):
             ),
             (None, entry),
         )
+
+    def test_playlist_reconcile_baselines_detects_missing_and_hides_app_removal(self) -> None:
+        repository = self.create_repository()
+        asset = repository.upsert_asset(
+            AssetUpsert(self.root / "music" / "歌名-歌手.mp3", 12, 34)
+        )
+        playlist_root = self.root / "playlists"
+        shortcut = playlist_root / "通勤" / "歌名-歌手.mp3.lnk"
+        observation = PlaylistItemObservation(
+            shortcut_path=shortcut,
+            target_path=asset.canonical_path,
+            audio_asset_id=asset.id,
+            shortcut_state="active",
+            source_state="active",
+            title="标签歌名",
+            artist="标签歌手",
+            duration_ms=123400,
+            metadata_source="tags",
+            diagnostic="已安全解析",
+        )
+
+        playlists = repository.reconcile_playlists(
+            playlist_root=playlist_root,
+            observed={"通勤": (observation,)},
+        )
+        self.assertEqual(len(playlists), 1)
+        items = repository.list_playlist_items(playlists[0].id)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].shortcut_state, "active")
+        self.assertEqual(items[0].duration_ms, 123400)
+
+        repository.reconcile_playlists(
+            playlist_root=playlist_root,
+            observed={"通勤": ()},
+        )
+        missing = repository.list_playlist_items(playlists[0].id)
+        self.assertEqual(missing[0].shortcut_state, "missing")
+        self.assertEqual(missing[0].title, "标签歌名")
+
+        repository.mark_playlist_item_removed(shortcut)
+        self.assertEqual(repository.list_playlist_items(playlists[0].id), ())
+
+    def test_playlist_reconcile_marks_changed_target_without_rebinding_asset(self) -> None:
+        repository = self.create_repository()
+        asset = repository.upsert_asset(
+            AssetUpsert(self.root / "music" / "原歌-歌手.mp3", 1, 2)
+        )
+        playlist_root = self.root / "playlists"
+        shortcut = playlist_root / "通勤" / "原歌-歌手.mp3.lnk"
+        original = PlaylistItemObservation(
+            shortcut, asset.canonical_path, asset.id, "active", "active",
+            "原歌", "歌手", 60000, "filename", "",
+        )
+        playlist = repository.reconcile_playlists(
+            playlist_root=playlist_root, observed={"通勤": (original,)}
+        )[0]
+        changed_target = self.root / "music" / "外部修改-歌手.mp3"
+        changed = PlaylistItemObservation(
+            shortcut, changed_target, None, "active", "unindexed",
+            "外部修改", "歌手", None, "filename", "",
+        )
+
+        repository.reconcile_playlists(
+            playlist_root=playlist_root, observed={"通勤": (changed,)}
+        )
+        item = repository.list_playlist_items(playlist.id)[0]
+        self.assertEqual(item.shortcut_state, "external_changed")
+        self.assertEqual(item.audio_asset_id, asset.id)
+        self.assertEqual(item.expected_target_path, asset.canonical_path)
 
 
 if __name__ == "__main__":

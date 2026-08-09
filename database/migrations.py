@@ -205,6 +205,63 @@ MIGRATIONS = (
             "CREATE INDEX idx_lyrics_matches_audio_history ON lyrics_matches(audio_asset_id, created_at)",
         ),
     ),
+    Migration(
+        version=4,
+        description="P5 durable playlist relationships and display snapshots",
+        statements=(
+            """
+            CREATE TABLE playlists (
+                id TEXT PRIMARY KEY NOT NULL,
+                name TEXT NOT NULL,
+                normalized_name TEXT NOT NULL UNIQUE,
+                folder_path TEXT NOT NULL,
+                normalized_folder_path TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL
+                    CHECK (state IN ('active', 'missing', 'external_changed', 'deleted')),
+                pin_rank INTEGER CHECK (pin_rank IS NULL OR pin_rank >= 0),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                deleted_at TEXT
+            )
+            """,
+            "CREATE INDEX idx_playlists_state_pin ON playlists(state, pin_rank)",
+            """
+            CREATE TABLE playlist_items (
+                id TEXT PRIMARY KEY NOT NULL,
+                playlist_id TEXT NOT NULL
+                    REFERENCES playlists(id) ON DELETE CASCADE,
+                audio_asset_id TEXT
+                    REFERENCES assets(id) ON DELETE RESTRICT,
+                expected_target_path TEXT,
+                normalized_target_path TEXT,
+                shortcut_path TEXT NOT NULL,
+                normalized_shortcut_path TEXT NOT NULL UNIQUE,
+                lifecycle_state TEXT NOT NULL
+                    CHECK (lifecycle_state IN ('current', 'removed')),
+                shortcut_state TEXT NOT NULL
+                    CHECK (shortcut_state IN ('active', 'missing', 'broken', 'external_changed')),
+                source_state TEXT NOT NULL
+                    CHECK (source_state IN ('active', 'missing', 'external_changed', 'unindexed')),
+                title TEXT NOT NULL,
+                artist TEXT NOT NULL,
+                duration_ms INTEGER CHECK (duration_ms IS NULL OR duration_ms >= 0),
+                metadata_source TEXT NOT NULL
+                    CHECK (metadata_source IN ('tags', 'filename', 'last_known', 'unknown')),
+                diagnostic TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                removed_at TEXT
+            )
+            """,
+            "CREATE INDEX idx_playlist_items_playlist_state ON playlist_items(playlist_id, lifecycle_state)",
+            "CREATE INDEX idx_playlist_items_asset_state ON playlist_items(audio_asset_id, lifecycle_state)",
+            """
+            CREATE UNIQUE INDEX uq_playlist_items_current_asset
+            ON playlist_items(playlist_id, audio_asset_id)
+            WHERE lifecycle_state = 'current' AND audio_asset_id IS NOT NULL
+            """,
+        ),
+    ),
 )
 
 

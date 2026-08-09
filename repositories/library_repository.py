@@ -41,6 +41,11 @@ RENAME_ITEM_OUTCOMES = RENAME_ITEM_STATES - {"planned", "running", "success"}
 RENAME_FAILURE_RESULTS = frozenset({"failed", "rolled_back", "rollback_failed"})
 LYRICS_MATCH_SOURCES = frozenset({"embedded", "external"})
 LYRICS_MATCH_METHODS = frozenset({"automatic", "manual"})
+PLAYLIST_STATES = frozenset({"active", "missing", "external_changed", "deleted"})
+PLAYLIST_ITEM_STATES = frozenset({"current", "removed"})
+SHORTCUT_STATES = frozenset({"active", "missing", "broken", "external_changed"})
+PLAYLIST_SOURCE_STATES = frozenset({"active", "missing", "external_changed", "unindexed"})
+METADATA_SOURCES = frozenset({"tags", "filename", "last_known", "unknown"})
 
 
 class RepositoryError(RuntimeError):
@@ -215,6 +220,53 @@ class LyricsMatchRecord:
     is_current: bool
     created_at: str
     updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class PlaylistItemObservation:
+    shortcut_path: Path
+    target_path: Path | None
+    audio_asset_id: str | None
+    shortcut_state: str
+    source_state: str
+    title: str
+    artist: str
+    duration_ms: int | None
+    metadata_source: str
+    diagnostic: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class PlaylistRecord:
+    id: str
+    name: str
+    folder_path: Path
+    state: str
+    pin_rank: int | None
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class PlaylistItemRecord:
+    id: str
+    playlist_id: str
+    playlist_name: str
+    audio_asset_id: str | None
+    expected_target_path: Path | None
+    shortcut_path: Path
+    lifecycle_state: str
+    shortcut_state: str
+    source_state: str
+    title: str
+    artist: str
+    duration_ms: int | None
+    metadata_source: str
+    diagnostic: str
+    asset_path: Path | None
+    asset_state: str | None
+    asset_size_bytes: int | None
+    asset_mtime_ns: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1661,6 +1713,507 @@ class LibraryRepository:
         if result is None:
             raise RepositoryDataError("取消歌词匹配后无法读取结果")
         return self._lyrics_match_from_row(result)
+
+    @staticmethod
+    def _playlist_from_row(row: sqlite3.Row) -> PlaylistRecord:
+        return PlaylistRecord(
+            id=row["id"],
+            name=row["name"],
+            folder_path=Path(row["folder_path"]),
+            state=row["state"],
+            pin_rank=row["pin_rank"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    @staticmethod
+    def _playlist_item_from_row(row: sqlite3.Row) -> PlaylistItemRecord:
+        return PlaylistItemRecord(
+            id=row["id"],
+            playlist_id=row["playlist_id"],
+            playlist_name=row["playlist_name"],
+            audio_asset_id=row["audio_asset_id"],
+            expected_target_path=(
+                None if row["expected_target_path"] is None
+                else Path(row["expected_target_path"])
+            ),
+            shortcut_path=Path(row["shortcut_path"]),
+            lifecycle_state=row["lifecycle_state"],
+            shortcut_state=row["shortcut_state"],
+            source_state=row["source_state"],
+            title=row["title"],
+            artist=row["artist"],
+            duration_ms=row["duration_ms"],
+            metadata_source=row["metadata_source"],
+            diagnostic=row["diagnostic"],
+            asset_path=(None if row["asset_path"] is None else Path(row["asset_path"])),
+            asset_state=row["asset_state"],
+            asset_size_bytes=row["asset_size_bytes"],
+            asset_mtime_ns=row["asset_mtime_ns"],
+        )
+
+    def reconcile_playlists(
+        self,
+        *,
+        playlist_root: Path,
+        observed: dict[str, tuple[PlaylistItemObservation, ...]],
+    ) -> tuple[PlaylistRecord, ...]:
+        """Reconcile one trusted root while retaining externally missing links."""
+
+        self._require_open_in_owner_thread()
+        root, root_key = _canonicalize_path(playlist_root, field_name="playlist_root")
+        now = _utc_now()
+        clean: dict[str, tuple[PlaylistItemObservation, ...]] = {}
+        for name, items in observed.items():
+            if not isinstance(name, str) or not name.strip():
+                raise RepositoryDataError("歌单名称不能为空")
+            folder, folder_key = _windows_path_key(root / name, field_name="folder_path")
+            _require_path_within_root(folder_key, root_key, field_name="folder_path")
+            if folder.name != name:
+                raise RepositoryDataError("歌单名称不能包含路径")
+            prepared: list[PlaylistItemObservation] = []
+            for item in items:
+                if not isinstance(item, PlaylistItemObservation):
+                    raise RepositoryDataError("歌单观察项类型错误")
+                _require_choice(item.shortcut_state, SHORTCUT_STATES, field_name="shortcut_state")
+                _require_choice(item.source_state, PLAYLIST_SOURCE_STATES, field_name="source_state")
+                _require_choice(item.metadata_source, METADATA_SOURCES, field_name="metadata_source")
+                _require_non_negative_integer(item.duration_ms, field_name="duration_ms", optional=True)
+                shortcut, shortcut_key = _windows_path_key(
+                    item.shortcut_path, field_name="shortcut_path"
+                )
+                _require_path_within_root(shortcut_key, folder_key, field_name="shortcut_path")
+                if shortcut.parent != folder:
+                    raise RepositoryPathError("快捷方式必须直接位于歌单目录")
+                if shortcut.suffix.casefold() != ".lnk":
+                    raise RepositoryDataError("歌单观察项必须是 .lnk")
+                if item.target_path is not None:
+                    _canonicalize_path(item.target_path, field_name="target_path")
+                prepared.append(item)
+            clean[name] = tuple(prepared)
+
+        with self._transaction():
+            active_rows = self._connection.execute(
+                "SELECT id, normalized_folder_path FROM playlists WHERE state != 'deleted'"
+            ).fetchall()
+            observed_folder_keys: set[str] = set()
+            for name, items in clean.items():
+                folder, folder_key = _windows_path_key(root / name, field_name="folder_path")
+                name_key = name.rstrip(" .").casefold()
+                observed_folder_keys.add(folder_key)
+                row = self._connection.execute(
+                    "SELECT id FROM playlists WHERE normalized_folder_path = ?",
+                    (folder_key,),
+                ).fetchone()
+                playlist_id = str(uuid4()) if row is None else row["id"]
+                if row is None:
+                    self._connection.execute(
+                        """
+                        INSERT INTO playlists(
+                            id, name, normalized_name, folder_path,
+                            normalized_folder_path, state, pin_rank,
+                            created_at, updated_at, deleted_at
+                        ) VALUES (?, ?, ?, ?, ?, 'active', NULL, ?, ?, NULL)
+                        """,
+                        (playlist_id, name, name_key, str(folder), folder_key, now, now),
+                    )
+                else:
+                    self._connection.execute(
+                        """
+                        UPDATE playlists SET name = ?, normalized_name = ?, folder_path = ?,
+                            state = 'active', updated_at = ?, deleted_at = NULL
+                        WHERE id = ?
+                        """,
+                        (name, name_key, str(folder), now, playlist_id),
+                    )
+
+                seen_shortcuts: set[str] = set()
+                for item in items:
+                    shortcut, shortcut_key = _windows_path_key(
+                        item.shortcut_path, field_name="shortcut_path"
+                    )
+                    seen_shortcuts.add(shortcut_key)
+                    existing = self._connection.execute(
+                        "SELECT * FROM playlist_items WHERE normalized_shortcut_path = ?",
+                        (shortcut_key,),
+                    ).fetchone()
+                    if existing is None and item.audio_asset_id is not None:
+                        existing = self._connection.execute(
+                            """
+                            SELECT * FROM playlist_items
+                            WHERE playlist_id = ? AND audio_asset_id = ?
+                              AND lifecycle_state = 'current'
+                            """,
+                            (playlist_id, item.audio_asset_id),
+                        ).fetchone()
+                    target = None
+                    target_key = None
+                    if item.target_path is not None:
+                        target, target_key = _canonicalize_path(
+                            item.target_path, field_name="target_path"
+                        )
+                    if existing is not None and existing["lifecycle_state"] == "current":
+                        stored_key = existing["normalized_target_path"]
+                        changed_target = (
+                            stored_key is not None and target_key is not None
+                            and stored_key != target_key
+                        )
+                        shortcut_state = "external_changed" if changed_target else item.shortcut_state
+                        diagnostic = (
+                            "快捷方式目标已被外部修改"
+                            if changed_target else item.diagnostic
+                        )
+                        keep_snapshot = item.metadata_source in {"last_known", "unknown"}
+                        self._connection.execute(
+                            """
+                            UPDATE playlist_items SET playlist_id = ?, audio_asset_id = ?,
+                                shortcut_path = ?, normalized_shortcut_path = ?,
+                                expected_target_path = ?, normalized_target_path = ?,
+                                lifecycle_state = 'current',
+                                shortcut_state = ?, source_state = ?, title = ?, artist = ?, duration_ms = ?,
+                                metadata_source = ?, diagnostic = ?, updated_at = ?, removed_at = NULL
+                            WHERE id = ?
+                            """,
+                            (
+                                playlist_id,
+                                existing["audio_asset_id"] if changed_target else item.audio_asset_id,
+                                str(shortcut), shortcut_key,
+                                existing["expected_target_path"] if changed_target else (
+                                    None if target is None else str(target)
+                                ),
+                                existing["normalized_target_path"] if changed_target else target_key,
+                                shortcut_state, item.source_state,
+                                existing["title"] if keep_snapshot else item.title,
+                                existing["artist"] if keep_snapshot else item.artist,
+                                existing["duration_ms"] if keep_snapshot else item.duration_ms,
+                                "last_known" if keep_snapshot else item.metadata_source,
+                                diagnostic, now, existing["id"],
+                            ),
+                        )
+                    else:
+                        self._connection.execute(
+                            """
+                            INSERT INTO playlist_items(
+                                id, playlist_id, audio_asset_id, expected_target_path,
+                                normalized_target_path, shortcut_path, normalized_shortcut_path,
+                                lifecycle_state, shortcut_state, source_state, title, artist, duration_ms,
+                                metadata_source, diagnostic, created_at, updated_at, removed_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'current', ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                            ON CONFLICT(normalized_shortcut_path) DO UPDATE SET
+                                playlist_id = excluded.playlist_id,
+                                audio_asset_id = excluded.audio_asset_id,
+                                expected_target_path = excluded.expected_target_path,
+                                normalized_target_path = excluded.normalized_target_path,
+                                shortcut_path = excluded.shortcut_path,
+                                lifecycle_state = 'current', shortcut_state = excluded.shortcut_state,
+                                source_state = excluded.source_state,
+                                title = excluded.title, artist = excluded.artist,
+                                duration_ms = excluded.duration_ms,
+                                metadata_source = excluded.metadata_source,
+                                diagnostic = excluded.diagnostic,
+                                updated_at = excluded.updated_at, removed_at = NULL
+                            """,
+                            (
+                                str(uuid4()), playlist_id, item.audio_asset_id,
+                                None if target is None else str(target), target_key,
+                                str(shortcut), shortcut_key, item.shortcut_state, item.source_state,
+                                item.title, item.artist, item.duration_ms,
+                                item.metadata_source, item.diagnostic, now, now,
+                            ),
+                        )
+                current_rows = self._connection.execute(
+                    """
+                    SELECT id, normalized_shortcut_path FROM playlist_items
+                    WHERE playlist_id = ? AND lifecycle_state = 'current'
+                    """,
+                    (playlist_id,),
+                ).fetchall()
+                for current in current_rows:
+                    if current["normalized_shortcut_path"] not in seen_shortcuts:
+                        self._connection.execute(
+                            """
+                            UPDATE playlist_items SET shortcut_state = 'missing',
+                                diagnostic = '数据库记录的快捷方式未在磁盘发现', updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (now, current["id"]),
+                        )
+
+            for row in active_rows:
+                if row["normalized_folder_path"] not in observed_folder_keys:
+                    self._connection.execute(
+                        "UPDATE playlists SET state = 'missing', updated_at = ? WHERE id = ?",
+                        (now, row["id"]),
+                    )
+
+        return self.list_playlists()
+
+    def list_playlists(self, *, include_deleted: bool = False) -> tuple[PlaylistRecord, ...]:
+        self._require_open_in_owner_thread()
+        where = "" if include_deleted else "WHERE state != 'deleted'"
+        rows = self._connection.execute(
+            f"SELECT * FROM playlists {where} ORDER BY COALESCE(pin_rank, 2147483647), normalized_name"
+        ).fetchall()
+        return tuple(self._playlist_from_row(row) for row in rows)
+
+    def list_playlist_items(self, playlist_id: str) -> tuple[PlaylistItemRecord, ...]:
+        self._require_open_in_owner_thread()
+        if not isinstance(playlist_id, str) or not playlist_id.strip():
+            raise RepositoryDataError("playlist_id 不能为空")
+        rows = self._connection.execute(
+            """
+            SELECT i.*, p.name AS playlist_name,
+                   a.canonical_path AS asset_path, a.file_state AS asset_state,
+                   a.size_bytes AS asset_size_bytes, a.mtime_ns AS asset_mtime_ns
+            FROM playlist_items AS i
+            JOIN playlists AS p ON p.id = i.playlist_id
+            LEFT JOIN assets AS a ON a.id = i.audio_asset_id
+            WHERE i.playlist_id = ? AND i.lifecycle_state = 'current'
+            ORDER BY i.normalized_shortcut_path
+            """,
+            (playlist_id,),
+        ).fetchall()
+        return tuple(self._playlist_item_from_row(row) for row in rows)
+
+    def mark_playlist_item_removed(self, shortcut_path: Path) -> None:
+        self._require_open_in_owner_thread()
+        _shortcut, shortcut_key = _windows_path_key(shortcut_path, field_name="shortcut_path")
+        with self._transaction():
+            cursor = self._connection.execute(
+                """
+                UPDATE playlist_items SET lifecycle_state = 'removed', removed_at = ?,
+                    updated_at = ? WHERE normalized_shortcut_path = ?
+                    AND lifecycle_state = 'current'
+                """,
+                (_utc_now(), _utc_now(), shortcut_key),
+            )
+            if cursor.rowcount != 1:
+                raise RecordNotFoundError("当前歌单关系不存在")
+
+    def record_playlist_item_added(
+        self,
+        *,
+        playlist_root: Path,
+        playlist_name: str,
+        shortcut_path: Path,
+        target_path: Path,
+        audio_asset_id: str,
+    ) -> None:
+        """Persist a successful shortcut creation before reporting success."""
+
+        self._require_open_in_owner_thread()
+        root, root_key = _canonicalize_path(playlist_root, field_name="playlist_root")
+        folder, folder_key = _windows_path_key(root / playlist_name, field_name="folder_path")
+        shortcut, shortcut_key = _windows_path_key(shortcut_path, field_name="shortcut_path")
+        target, target_key = _canonicalize_path(target_path, field_name="target_path")
+        _require_path_within_root(folder_key, root_key, field_name="folder_path")
+        _require_path_within_root(shortcut_key, folder_key, field_name="shortcut_path")
+        asset = self._connection.execute(
+            "SELECT id, file_state FROM assets WHERE id = ? AND kind = 'audio'",
+            (audio_asset_id,),
+        ).fetchone()
+        if asset is None:
+            raise RecordNotFoundError("添加到歌单的音频资产不存在")
+        stem = target.stem
+        title, artist = (stem.rsplit("-", 1) if "-" in stem else (stem, "待识别"))
+        now = _utc_now()
+        with self._transaction():
+            playlist = self._connection.execute(
+                "SELECT id FROM playlists WHERE normalized_folder_path = ?",
+                (folder_key,),
+            ).fetchone()
+            playlist_id = str(uuid4()) if playlist is None else playlist["id"]
+            if playlist is None:
+                self._connection.execute(
+                    """
+                    INSERT INTO playlists(
+                        id, name, normalized_name, folder_path, normalized_folder_path,
+                        state, pin_rank, created_at, updated_at, deleted_at
+                    ) VALUES (?, ?, ?, ?, ?, 'active', NULL, ?, ?, NULL)
+                    """,
+                    (
+                        playlist_id, playlist_name, playlist_name.rstrip(" .").casefold(),
+                        str(folder), folder_key, now, now,
+                    ),
+                )
+            self._connection.execute(
+                """
+                INSERT INTO playlist_items(
+                    id, playlist_id, audio_asset_id, expected_target_path,
+                    normalized_target_path, shortcut_path, normalized_shortcut_path,
+                    lifecycle_state, shortcut_state, source_state, title, artist,
+                    duration_ms, metadata_source, diagnostic, created_at, updated_at, removed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'current', 'active', ?, ?, ?, NULL,
+                          'filename', '等待刷新媒体信息', ?, ?, NULL)
+                ON CONFLICT(normalized_shortcut_path) DO UPDATE SET
+                    playlist_id = excluded.playlist_id, audio_asset_id = excluded.audio_asset_id,
+                    expected_target_path = excluded.expected_target_path,
+                    normalized_target_path = excluded.normalized_target_path,
+                    lifecycle_state = 'current', shortcut_state = 'active',
+                    source_state = excluded.source_state, title = excluded.title,
+                    artist = excluded.artist, metadata_source = 'filename',
+                    diagnostic = excluded.diagnostic, updated_at = excluded.updated_at,
+                    removed_at = NULL
+                """,
+                (
+                    str(uuid4()), playlist_id, audio_asset_id, str(target), target_key,
+                    str(shortcut), shortcut_key, asset["file_state"], title.strip(),
+                    artist.strip(), now, now,
+                ),
+            )
+
+    def ensure_playlist(self, *, playlist_root: Path, name: str) -> PlaylistRecord:
+        self._require_open_in_owner_thread()
+        root, root_key = _canonicalize_path(playlist_root, field_name="playlist_root")
+        folder, folder_key = _windows_path_key(root / name, field_name="folder_path")
+        _require_path_within_root(folder_key, root_key, field_name="folder_path")
+        now = _utc_now()
+        with self._transaction():
+            row = self._connection.execute(
+                "SELECT id FROM playlists WHERE normalized_folder_path = ?",
+                (folder_key,),
+            ).fetchone()
+            if row is None:
+                playlist_id = str(uuid4())
+                self._connection.execute(
+                    """
+                    INSERT INTO playlists(
+                        id, name, normalized_name, folder_path, normalized_folder_path,
+                        state, pin_rank, created_at, updated_at, deleted_at
+                    ) VALUES (?, ?, ?, ?, ?, 'active', NULL, ?, ?, NULL)
+                    """,
+                    (
+                        playlist_id, name, name.rstrip(" .").casefold(), str(folder),
+                        folder_key, now, now,
+                    ),
+                )
+            else:
+                playlist_id = row["id"]
+                self._connection.execute(
+                    "UPDATE playlists SET state = 'active', deleted_at = NULL, updated_at = ? WHERE id = ?",
+                    (now, playlist_id),
+                )
+        result = self._connection.execute(
+            "SELECT * FROM playlists WHERE id = ?", (playlist_id,)
+        ).fetchone()
+        if result is None:
+            raise RepositoryDataError("歌单关系写入后无法回读")
+        return self._playlist_from_row(result)
+
+    def rename_playlist(self, *, source_folder: Path, destination_folder: Path) -> None:
+        self._require_open_in_owner_thread()
+        source, source_key = _windows_path_key(source_folder, field_name="source_folder")
+        destination, destination_key = _windows_path_key(
+            destination_folder, field_name="destination_folder"
+        )
+        now = _utc_now()
+        with self._transaction():
+            row = self._connection.execute(
+                "SELECT id FROM playlists WHERE normalized_folder_path = ? AND state != 'deleted'",
+                (source_key,),
+            ).fetchone()
+            if row is None:
+                raise RecordNotFoundError("待重命名歌单关系不存在")
+            self._connection.execute(
+                """
+                UPDATE playlists SET name = ?, normalized_name = ?, folder_path = ?,
+                    normalized_folder_path = ?, state = 'active', updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    destination.name, destination.name.rstrip(" .").casefold(),
+                    str(destination), destination_key, now, row["id"],
+                ),
+            )
+            items = self._connection.execute(
+                "SELECT id, shortcut_path FROM playlist_items WHERE playlist_id = ?",
+                (row["id"],),
+            ).fetchall()
+            for item in items:
+                new_shortcut = destination / Path(item["shortcut_path"]).name
+                _, new_key = _windows_path_key(new_shortcut, field_name="shortcut_path")
+                self._connection.execute(
+                    "UPDATE playlist_items SET shortcut_path = ?, normalized_shortcut_path = ?, updated_at = ? WHERE id = ?",
+                    (str(new_shortcut), new_key, now, item["id"]),
+                )
+
+    def retarget_playlist_items(self, *, source_path: Path, target_path: Path) -> int:
+        self._require_open_in_owner_thread()
+        _source, source_key = _canonicalize_path(source_path, field_name="source_path")
+        target, target_key = _canonicalize_path(target_path, field_name="target_path")
+        rows = self._connection.execute(
+            """
+            SELECT i.id, i.shortcut_path, p.folder_path
+            FROM playlist_items AS i JOIN playlists AS p ON p.id = i.playlist_id
+            WHERE i.normalized_target_path = ? AND i.lifecycle_state = 'current'
+            """,
+            (source_key,),
+        ).fetchall()
+        now = _utc_now()
+        with self._transaction():
+            for row in rows:
+                shortcut = Path(row["folder_path"]) / f"{target.name}.lnk"
+                _, shortcut_key = _windows_path_key(shortcut, field_name="shortcut_path")
+                self._connection.execute(
+                    """
+                    UPDATE playlist_items SET expected_target_path = ?,
+                        normalized_target_path = ?, shortcut_path = ?,
+                        normalized_shortcut_path = ?, shortcut_state = 'active',
+                        diagnostic = '应用内安全重定向已完成', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (str(target), target_key, str(shortcut), shortcut_key, now, row["id"]),
+                )
+        return len(rows)
+
+    def mark_playlist_deleted(self, folder: Path) -> None:
+        self._require_open_in_owner_thread()
+        _folder, folder_key = _windows_path_key(folder, field_name="folder")
+        now = _utc_now()
+        with self._transaction():
+            row = self._connection.execute(
+                "SELECT id FROM playlists WHERE normalized_folder_path = ? AND state != 'deleted'",
+                (folder_key,),
+            ).fetchone()
+            if row is None:
+                raise RecordNotFoundError("待删除歌单关系不存在")
+            self._connection.execute(
+                "UPDATE playlist_items SET lifecycle_state = 'removed', removed_at = ?, updated_at = ? WHERE playlist_id = ? AND lifecycle_state = 'current'",
+                (now, now, row["id"]),
+            )
+            self._connection.execute(
+                "UPDATE playlists SET state = 'deleted', pin_rank = NULL, deleted_at = ?, updated_at = ? WHERE id = ?",
+                (now, now, row["id"]),
+            )
+
+    def set_playlist_pins(self, names: list[str], *, setting_key: str) -> None:
+        self._require_open_in_owner_thread()
+        if not isinstance(names, list) or not all(
+            isinstance(name, str) and name.strip() for name in names
+        ):
+            raise RepositoryDataError("置顶歌单必须是非空名称列表")
+        keys = [name.rstrip(" .").casefold() for name in names]
+        if len(keys) != len(set(keys)):
+            raise RepositoryDataError("置顶歌单包含 Windows 等价重复名称")
+        encoded = self._encode_setting_value(names)
+        now = _utc_now()
+        with self._transaction():
+            self._connection.execute("UPDATE playlists SET pin_rank = NULL, updated_at = ?", (now,))
+            for rank, key in enumerate(keys):
+                cursor = self._connection.execute(
+                    "UPDATE playlists SET pin_rank = ?, updated_at = ? WHERE normalized_name = ? AND state = 'active'",
+                    (rank, now, key),
+                )
+                if cursor.rowcount != 1:
+                    raise RecordNotFoundError("置顶歌单关系不存在或未处于 active 状态")
+            self._connection.execute(
+                """
+                INSERT INTO settings(key, value_json, updated_at) VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json,
+                    updated_at = excluded.updated_at
+                """,
+                (setting_key, encoded, now),
+            )
 
     def set_setting(self, key: str, value: object) -> SettingRecord:
         self._require_open_in_owner_thread()

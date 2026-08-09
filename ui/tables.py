@@ -215,9 +215,13 @@ class StatusBadgeDelegate(QStyledItemDelegate):
             "失败": ("#fde8e8", "#9b1c1c"),
             "文件缺失": ("#fde8e8", "#9b1c1c"),
             "快捷方式损坏": ("#fde8e8", "#9b1c1c"),
+            "原文件缺失": ("#fde8e8", "#9b1c1c"),
+            "文件异常": ("#fde8e8", "#9b1c1c"),
             "冲突": ("#fff1d6", "#8a4b08"),
             "外部变化": ("#fff1d6", "#8a4b08"),
             "目标未索引": ("#fff1d6", "#8a4b08"),
+            "原文件异常": ("#fff1d6", "#8a4b08"),
+            "快捷方式异常": ("#fff1d6", "#8a4b08"),
             "已忽略": ("#eeeeee", "#555555"),
             "未匹配": ("#fff1d6", "#8a4b08"),
         }
@@ -265,6 +269,26 @@ class DataTable(QTableWidget):
             raise RuntimeError("此表格未启用可勾选表头")
         return self._checkable_header
 
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        index = self.indexAt(event.position().toPoint())
+        selection_model = self.selectionModel()
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and event.modifiers() == Qt.KeyboardModifier.NoModifier
+            and index.isValid()
+            and index.column() != 0
+            and selection_model is not None
+            and selection_model.isRowSelected(index.row(), QModelIndex())
+        ):
+            selection_model.select(
+                index,
+                selection_model.SelectionFlag.Deselect
+                | selection_model.SelectionFlag.Rows,
+            )
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
 
 class ModelDataTable(QTableView):
     """Model/View table used by production pages and record dialogs."""
@@ -300,6 +324,34 @@ class ModelDataTable(QTableView):
             )
         if isinstance(model, ItemTableModel):
             model.item_changed.connect(self.itemChanged.emit)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        """Allow a plain second click to remove only the clicked row.
+
+        Qt's default extended-selection behavior keeps an already selected row
+        selected on a plain click.  The library contract treats that gesture as
+        a row toggle, while Ctrl and Shift continue to use Qt's native range and
+        disjoint-selection behavior.
+        """
+
+        index = self.indexAt(event.position().toPoint())
+        selection_model = self.selectionModel()
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and event.modifiers() == Qt.KeyboardModifier.NoModifier
+            and index.isValid()
+            and index.column() != 0
+            and selection_model is not None
+            and selection_model.isRowSelected(index.row(), QModelIndex())
+        ):
+            selection_model.select(
+                index,
+                selection_model.SelectionFlag.Deselect
+                | selection_model.SelectionFlag.Rows,
+            )
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
     def _item_model(self) -> ItemTableModel:
         model = self.model()

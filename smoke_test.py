@@ -190,9 +190,6 @@ def run() -> None:
     assert music.delete_button.isEnabled()
     assert checkable_header.check_state() == Qt.CheckState.PartiallyChecked
     music.table.clearSelection()
-    assert music.add_button.isEnabled()
-    assert music.delete_button.isEnabled()
-    music.table.item(0, 0).setCheckState(Qt.CheckState.Unchecked)
     assert not music.add_button.isEnabled()
     assert not music.delete_button.isEnabled()
 
@@ -337,8 +334,9 @@ def run() -> None:
     cantonese = window.pages["playlist:粤语"]
     assert cantonese.playlist_note is not None
     assert cantonese.playlist_note.text() == "从歌单移除只会删除快捷方式，不会删除音乐文件。"
-    assert [cantonese.table.horizontalHeaderItem(column).text() for column in range(8)] == [
-        "", "歌名", "歌手", "时长", "格式", "大小", "歌词状态", "文件状态"
+    assert cantonese.table.columnCount() == 5
+    assert [cantonese.table.horizontalHeaderItem(column).text() for column in range(5)] == [
+        "", "歌名", "歌手", "时长", "文件状态"
     ]
 
     music_delete_dialog = window._create_delete_dialog(music, [music.all_data[0]])

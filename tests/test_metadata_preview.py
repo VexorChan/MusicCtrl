@@ -26,6 +26,7 @@ from services.metadata_preview import (
     MetadataPreviewInput,
     MetadataPreviewWorker,
     build_metadata_previews,
+    read_audio_display_metadata,
 )
 
 
@@ -83,6 +84,38 @@ class MetadataPreviewTests(unittest.TestCase):
             stream.setframerate(8000)
             stream.writeframes(b"\x80" * 32)
         return path
+
+    def test_playlist_display_reads_complete_tags_and_rounded_duration(self) -> None:
+        path = self._file("旧名-旧歌手.mp3")
+        item = MetadataPreviewInput(
+            "asset-display", path, self.root, "active",
+            path.stat().st_size, path.stat().st_mtime_ns,
+        )
+        media = _TaggedMedia(title=["标签歌名"], artist=["歌手甲", "歌手乙"])
+        media.info = SimpleNamespace(length=125.6)
+
+        with patch("services.metadata_preview.MutagenFile", return_value=media):
+            result = read_audio_display_metadata(item)
+
+        self.assertEqual((result.title, result.artist), ("标签歌名", "歌手甲、歌手乙"))
+        self.assertEqual(result.duration_ms, 125600)
+        self.assertEqual(result.source, "tags")
+
+    def test_playlist_display_uses_whole_filename_fallback_for_half_tags(self) -> None:
+        path = self._file("文件歌名-文件歌手.flac")
+        item = MetadataPreviewInput(
+            "asset-fallback", path, self.root, "active",
+            path.stat().st_size, path.stat().st_mtime_ns,
+        )
+        media = _TaggedMedia(title=["只有标题"])
+        media.info = SimpleNamespace(length=59.49)
+
+        with patch("services.metadata_preview.MutagenFile", return_value=media):
+            result = read_audio_display_metadata(item)
+
+        self.assertEqual((result.title, result.artist), ("文件歌名", "文件歌手"))
+        self.assertEqual(result.duration_ms, 59490)
+        self.assertEqual(result.source, "filename")
 
     def _input(
         self,

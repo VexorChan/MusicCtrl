@@ -7,6 +7,7 @@ import unittest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QAbstractTableModel, Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QTableView
 
 from ui.music_page import LibraryPage
@@ -74,10 +75,10 @@ class LibraryModelTests(unittest.TestCase):
         page.table.clearSelection()
         self.assertEqual(
             [record["_asset_id"] for record in page.selected_records()],
-            ["asset-0", "asset-1"],
+            [],
         )
 
-    def test_new_row_selection_checks_shift_or_ctrl_selected_rows_without_unchecking_old(self) -> None:
+    def test_row_selection_and_checks_are_the_same_bidirectional_set(self) -> None:
         page = LibraryPage(
             "所有音乐",
             tuple(_record(index) for index in range(5)),
@@ -97,13 +98,49 @@ class LibraryModelTests(unittest.TestCase):
         self.assertEqual(page._checked_rows(), [1, 3])
 
         selection.clearSelection()
-        self.assertEqual(page._checked_rows(), [1, 3])
-        model.setData(model.index(1, 0), Qt.CheckState.Unchecked, Qt.ItemDataRole.CheckStateRole)
+        self.assertEqual(page._checked_rows(), [])
+        model.setData(model.index(3, 0), Qt.CheckState.Checked, Qt.ItemDataRole.CheckStateRole)
         self.assertEqual(
             [record["_asset_id"] for record in page.selected_records()],
             ["asset-3"],
         )
+        self.assertEqual([index.row() for index in selection.selectedRows()], [3])
         self.assertIn("已选择 1 项", page.status.text())
+
+    def test_playlist_page_uses_only_five_contract_columns(self) -> None:
+        page = LibraryPage(
+            "通勤",
+            (_record(0),),
+            kind="playlist",
+            playlist_name="通勤",
+            use_model_view=True,
+            live_mode=True,
+        )
+        model = page.table.model()
+        self.assertEqual(model.columnCount(), 5)
+        self.assertEqual(
+            [model.headerData(column, Qt.Orientation.Horizontal) for column in range(5)],
+            ["", "歌名", "歌手", "时长", "文件状态"],
+        )
+
+    def test_plain_second_click_cancels_only_the_clicked_row(self) -> None:
+        page = LibraryPage(
+            "所有音乐",
+            tuple(_record(index) for index in range(3)),
+            use_model_view=True,
+            live_mode=True,
+        )
+        self.addCleanup(page.close)
+        page.resize(900, 500)
+        page.show()
+        QApplication.processEvents()
+        index = page.table.model().index(1, 1)
+        point = page.table.visualRect(index).center()
+
+        QTest.mouseClick(page.table.viewport(), Qt.MouseButton.LeftButton, pos=point)
+        self.assertEqual(page._checked_rows(), [1])
+        QTest.mouseClick(page.table.viewport(), Qt.MouseButton.LeftButton, pos=point)
+        self.assertEqual(page._checked_rows(), [])
 
     def test_playlist_menu_click_immediately_emits_one_destination_with_checked_records(self) -> None:
         page = LibraryPage(

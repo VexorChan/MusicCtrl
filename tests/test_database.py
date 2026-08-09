@@ -343,7 +343,11 @@ class DatabaseTests(unittest.TestCase):
                 ),
             )
 
-        result = apply_migrations(connection, self.database_path)
+        result = apply_migrations(
+            connection,
+            self.database_path,
+            migrations=MIGRATIONS[:3],
+        )
 
         self.assertEqual(result.applied_versions, (3,))
         self.assertIsNotNone(result.backup_path)
@@ -355,6 +359,7 @@ class DatabaseTests(unittest.TestCase):
                 backup.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall(),
                 [(1,), (2,)],
             )
+
             self.assertIsNone(
                 backup.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lyrics_matches'"
@@ -427,7 +432,47 @@ class DatabaseTests(unittest.TestCase):
                 """,
                 (now, now),
             )
-        self.assertEqual(apply_migrations(connection, self.database_path).applied_versions, ())
+        self.assertEqual(
+            apply_migrations(
+                connection, self.database_path, migrations=MIGRATIONS[:3]
+            ).applied_versions,
+            (),
+        )
+
+    def test_v4_adds_durable_playlist_relationships_with_upgrade_backup(self) -> None:
+        connection = self.open()
+        self.assertEqual(
+            apply_migrations(connection, self.database_path, migrations=MIGRATIONS[:3]).applied_versions,
+            (1, 2, 3),
+        )
+
+        result = apply_migrations(connection, self.database_path)
+
+        self.assertEqual(result.applied_versions, (4,))
+        self.assertIsNotNone(result.backup_path)
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+        self.assertTrue({"playlists", "playlist_items"}.issubset(tables))
+        item_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(playlist_items)")
+        }
+        self.assertTrue(
+            {
+                "audio_asset_id", "expected_target_path", "shortcut_path",
+                "lifecycle_state", "shortcut_state", "source_state", "title", "artist",
+                "duration_ms", "metadata_source", "diagnostic",
+            }.issubset(item_columns)
+        )
+        foreign_keys = {
+            row[3]: (row[2], row[6])
+            for row in connection.execute("PRAGMA foreign_key_list(playlist_items)")
+        }
+        self.assertEqual(foreign_keys["playlist_id"], ("playlists", "CASCADE"))
+        self.assertEqual(foreign_keys["audio_asset_id"], ("assets", "RESTRICT"))
 
     def test_v2_database_is_rejected_by_older_v1_migration_set(self) -> None:
         connection = self.open()

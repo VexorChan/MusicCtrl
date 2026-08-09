@@ -2,12 +2,12 @@
 
 ## 1. 文档状态与设计原则
 
-本文记录当前已经部署的 P1 v1、P2-B1 v2、P4 v3 schema，以及 P2～P7 的实际运行时持久化契约。SQLite 正式 schema 仍为 v3；P5～P7 已完成，但采用 `settings` 表中的严格 JSON 记录、现有资产/审计表和应用数据目录中的受管文件，不依赖额外规范化表：
+本文记录当前已经部署的 P1 v1、P2-B1 v2、P4 v3 与 P5 v4 schema，以及 P2～P7 的实际运行时持久化契约。SQLite 正式 schema 为 v4：
 
 - 标记为“P1 v1 已部署”的表、字段、约束、索引和事务已经存在于当前 migration。
 - 标记为“P2-B1 v2 已部署”的重命名审计表和 repository 状态机已经存在于当前 migration；v2 本身不执行文件重命名。
 - P2-C 已复用 v2 rename operation 的 `after_json.metadata_sync` 保存原始/写入标签快照和实际新指纹，没有新增 schema；P4 v3 只新增最小 `lyrics_matches`。
-- P5 使用 `p5.playlist_root`、`p5.operation_history`、`p5.pending_retargets`；其中 pending retarget v2 区分 `discover` 与 `apply`，v1 按 `apply` 兼容读取，阶段转换以 batch ID、旧值完整 JSON 的条件更新防止并发覆盖。P6 使用 `p6.import_history`、`p6.pending_import`、`p6.last_paths`；P7 使用 `p7.backup_entries`、`p7.retention_days`、`p7.operation_history`、`p7.pending_cleanup`、`p7.pending_linked_backup` 和 `p7.hidden_asset_ids`。最后一项只保存用户已确认清理的 `missing` 或 `external_changed` 资产 ID，不删除 `assets`、审计记录或磁盘文件；索引批次再次发现对应资产时原子移除该 ID。
+- P5 v4 新增 `playlists` 与 `playlist_items` 保存当前关系、预期路径、两侧状态和最后有效显示快照；`p5.playlist_root`、追加式 `p5.operation_history` 与 `p5.pending_retargets` 继续保存根、不可改写历史和恢复流程。pending retarget v2 区分 `discover` 与 `apply`，v1 按 `apply` 兼容读取。P6 使用 `p6.import_history`、`p6.pending_import`、`p6.last_paths`；P7 使用 `p7.backup_entries`、`p7.retention_days`、`p7.operation_history`、`p7.pending_cleanup`、`p7.pending_linked_backup` 和 `p7.hidden_asset_ids`。
 - 这些值全部通过 repository 严格 JSON 读写和校验；未来的规范化表仅是可选演进方向，不代表当前功能未完成。
 - 后续新增正式字段或表时，必须先更新设计、增加连续 migration，并完成升级、回滚和数据保留测试。
 
@@ -43,7 +43,7 @@ assets ── lyrics_matches（audio / external lyric）
 - `operation_items.asset_id → assets.id`，使用 `ON DELETE RESTRICT` 保护审计引用。
 - `lyrics_matches.audio_asset_id → assets.id` 与可空的 `lyric_asset_id → assets.id` 均使用 `ON DELETE RESTRICT`，避免删除仍有匹配历史的资产。
 
-### 2.2 当前 P5～P7 逻辑关系（非独立数据表）
+### 2.2 当前 P5 v4 与 P6～P7 逻辑关系
 
 ```text
 assets + lyrics_matches + operations
@@ -52,7 +52,7 @@ assets + lyrics_matches + operations
 └── settings JSON + 文件 journal：备份清单、清理与组备份恢复、缺失记录显示状态
 ```
 
-以上是运行时逻辑关系，不是当前 v3 的外键表图。P5～P7 已通过经过校验的 settings JSON、受管快捷方式和备份目录实现；P4 v3 直接使用 `assets(kind='audio'/'lyric')` 建立最小歌词匹配历史。只有未来出现明确查询、容量或完整性收益时，才新增连续 migration 将这些记录规范化，不能把可选草案当作当前完成门槛。
+P5 的歌单当前态已由 v4 外键表实现；文件系统仍是事实来源，刷新将磁盘观察与数据库预期关系对账。P6～P7 继续使用经过校验的 settings JSON 和受管目录。
 
 ## 3. 当前已部署的 P1 v1 规范
 
@@ -290,9 +290,9 @@ v3 只保存当前歌词关系及其更换/取消历史；LRC 文件本身继续
 
 repository 只允许 active audio 作为音频端、active lyric 作为外部歌词端。automatic 方法只允许置信度至少 95 的结果；embedded 必须为 100 分且优先于 external。更换匹配时在同一事务内将旧记录设为非当前并插入新记录，取消时保留历史，不物理删除。
 
-## 9. P5～P7 当前持久化与可选规范化草案
+## 9. P5 v4 当前表与 P6～P7 可选规范化草案
 
-当前 P5～P7 的权威持久化键已在第 1 节列出，备份文件位于应用数据目录的 `backups`。以下结构均未存在于当前 v3 数据库，只是未来可能的规范化方案；字段、枚举、索引和外键必须在确有收益时重新审查，并通过连续 migration、升级、回滚和数据保留测试后才能使用。
+P5 的 `playlists` / `playlist_items` 已在 v4 部署；本节其他标为“可选”的结构仍未部署。P6～P7 的权威持久化键已在第 1 节列出，备份文件位于应用数据目录的 `backups`。
 
 ### 9.1 assets 可选扩展（未部署）
 
@@ -331,7 +331,7 @@ repository 只允许 active audio 作为音频端、active lyric 作为外部歌
 | match_state | TEXT | unchecked / matched / possible / unmatched / conflict |
 | checked_at | TEXT | 允许为空 |
 
-### 9.4 playlists（可选规范化草案，未部署）
+### 9.4 playlists（P5 v4 已部署）
 
 | 字段 | 类型 | 目标约束 |
 |---|---|---|
@@ -339,26 +339,35 @@ repository 只允许 active audio 作为音频端、active lyric 作为外部歌
 | name | TEXT | NOT NULL |
 | normalized_name | TEXT | NOT NULL，唯一 |
 | folder_path | TEXT | NOT NULL |
+| normalized_folder_path | TEXT | NOT NULL，唯一 |
 | state | TEXT | active / missing / external_changed / deleted |
+| pin_rank | INTEGER | 允许为空，越小越靠前 |
 | created_at | TEXT | NOT NULL |
 | updated_at | TEXT | NOT NULL |
 | deleted_at | TEXT | 允许为空 |
 
-### 9.5 playlist_items（可选规范化草案，未部署）
+### 9.5 playlist_items（P5 v4 已部署）
 
 | 字段 | 类型 | 目标约束 |
 |---|---|---|
 | id | TEXT | PRIMARY KEY |
 | playlist_id | TEXT | 引用 playlists.id |
-| audio_asset_id | TEXT | 引用 audio_tracks.asset_id |
+| audio_asset_id | TEXT | 允许为空，引用 assets.id |
+| expected_target_path / normalized_target_path | TEXT | 预期目标及规范键，允许为空 |
 | shortcut_path | TEXT | NOT NULL |
 | normalized_shortcut_path | TEXT | NOT NULL，唯一 |
-| position | INTEGER | 允许为空 |
-| state | TEXT | active / broken / external_changed / removed |
+| lifecycle_state | TEXT | current / removed |
+| shortcut_state | TEXT | active / missing / broken / external_changed |
+| source_state | TEXT | active / missing / external_changed / unindexed |
+| title / artist | TEXT | 最后一次有效显示快照 |
+| duration_ms | INTEGER | 允许为空，非负 |
+| metadata_source | TEXT | tags / filename / last_known / unknown |
+| diagnostic | TEXT | 两侧状态诊断 |
 | created_at | TEXT | NOT NULL |
 | updated_at | TEXT | NOT NULL |
+| removed_at | TEXT | 允许为空 |
 
-目标约束：`UNIQUE(playlist_id, audio_asset_id)`。
+当前关系约束：`UNIQUE(playlist_id, audio_asset_id) WHERE lifecycle_state='current' AND audio_asset_id IS NOT NULL`。应用移除改为 `removed`；刷新未观察到的 current 项改为 `shortcut_state='missing'`，从而保留外部缺失证据。
 
 ### 9.6 scan_sessions 与 scan_items 可选扩展（未部署）
 
@@ -412,8 +421,8 @@ repository 只允许 active audio 作为音频端、active lyric 作为外部歌
 
 ## 11. 当前验证基线
 
-- `tests/test_database.py`：v1 五表、v2 两张重命名审计表、v3 歌词关系表、字段约束、命名索引、外键、无 WAL、migration 幂等、升级备份和回滚。
+- `tests/test_database.py`：v1 五表、v2 两张重命名审计表、v3 歌词关系表、v4 歌单关系表、字段约束、命名索引、外键、无 WAL、migration 幂等、升级备份和回滚。
 - `tests/test_lyrics_repository.py`：外部 LRC 一对一、内嵌优先、自动匹配阈值、更换和取消历史、线程与关闭边界。
-- `tests/test_library_repository.py`：批次原子性、路径根边界、指纹状态、reconciliation 基线和事务回滚。
+- `tests/test_library_repository.py`：批次原子性、路径根边界、指纹状态、歌单基线/缺失/移除/目标变化 reconciliation 和事务回滚。
 - `tests/test_scan_worker.py`：成功、取消、失败、终态互斥、`committed_count` 及真实两轮 SQLite 重新校准。
 - `tests/test_rename_repository.py`：计划整批校验、状态机、成功原子提交、失败补偿记录、COMMIT 结果不明确与只读 readback。

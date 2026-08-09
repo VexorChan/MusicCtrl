@@ -118,7 +118,9 @@ class FullWorkflowTests(unittest.TestCase):
         self.wait(playlist)
         playlist_rows = playlist.load_playlist("通勤")
         self.assertEqual(len(playlist_rows), 1)
-        self.assertEqual(playlist_rows[0]["status"], "已匹配")
+        self.assertNotIn("status", playlist_rows[0])
+        self.assertNotIn("format", playlist_rows[0])
+        self.assertNotIn("size", playlist_rows[0])
         self.assertEqual(playlist_rows[0]["file_status"], "正常")
 
         incoming = import_source / "新歌-歌手.mp3"

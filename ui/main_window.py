@@ -157,7 +157,7 @@ class MainWindow(QMainWindow):
                 records = [SONGS[index] for index in indices]
                 self._add_page(
                     f"playlist:{name}",
-                    LibraryPage(name, records, display_count=display_counts.get(name, len(records)), playlist_name=name),
+                    LibraryPage(name, records, kind="playlist", display_count=display_counts.get(name, len(records)), playlist_name=name),
                 )
         self.navigate("所有音乐")
         if scan_controller is not None:
@@ -1604,6 +1604,7 @@ class MainWindow(QMainWindow):
                     LibraryPage(
                         name,
                         (),
+                        kind="playlist",
                         display_count=0,
                         playlist_name=name,
                         live_mode=True,

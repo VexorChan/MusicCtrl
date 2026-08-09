@@ -13,9 +13,14 @@ from uuid import uuid4
 from PySide6.QtCore import QObject, QThread, Signal
 
 from database import DatabaseConfig
-from repositories import LibraryRepository
+from repositories import LibraryRepository, PlaylistItemObservation, PlaylistItemRecord
 from services.file_safety import _is_reparse, _locked_directory_chain
 from services.library_scan_controller import file_status_text, lyrics_status_text
+from services.metadata_preview import (
+    MetadataPreviewError,
+    MetadataPreviewInput,
+    read_audio_display_metadata,
+)
 from services.windows_shortcuts import (
     ShortcutConflictError,
     create_playlist_directory,
@@ -32,6 +37,7 @@ PLAYLIST_ROOT_KEY = "p5.playlist_root"
 PLAYLIST_HISTORY_KEY = "p5.operation_history"
 PLAYLIST_PINNED_KEY = "p5.pinned_playlists"
 PENDING_RETARGET_KEY = "p5.pending_retargets"
+PLAYLIST_RELATIONSHIP_RECOVERY_KEY = "p5.relationship_recovery"
 _RETARGET_JOURNAL_VERSION = 2
 _PLAYLIST_HISTORY_LIMIT = 200
 _PLAYLIST_ACTIONS = {"create", "add", "remove", "retarget", "rename", "delete"}
@@ -113,9 +119,8 @@ class PlaylistRowSnapshot:
     title: str
     artist: str
     duration: str
-    format: str
-    size: str
-    status: str
+    file_status: str
+    detail: str
 
     def as_record(self) -> dict[str, object]:
         return {
@@ -124,9 +129,8 @@ class PlaylistRowSnapshot:
             "title": self.title,
             "artist": self.artist,
             "duration": self.duration,
-            "format": self.format,
-            "size": self.size,
-            "status": self.status,
+            "file_status": self.file_status,
+            "_file_status_detail": self.detail,
         }
 
 
@@ -141,6 +145,99 @@ class PlaylistSnapshot:
     root: Path
     generation: int
     playlists: tuple[PlaylistViewSnapshot, ...]
+
+
+def _fallback_identity(path: Path) -> tuple[str, str]:
+    stem = path.stem
+    if "-" not in stem:
+        return stem.strip(), "待识别"
+    title, artist = stem.rsplit("-", 1)
+    if not title.strip() or not artist.strip():
+        return stem.strip(), "待识别"
+    return title.strip(), artist.strip()
+
+
+def _duration_text(duration_ms: int | None) -> str:
+    if duration_ms is None:
+        return "—"
+    seconds = max(0, (duration_ms + 500) // 1000)
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def _playlist_file_status(source_state: str, shortcut_state: str) -> str:
+    source_ok = source_state == "active"
+    shortcut_ok = shortcut_state == "active"
+    if source_ok and shortcut_ok:
+        return "正常"
+    if shortcut_ok:
+        return "原文件缺失" if source_state == "missing" else "原文件异常"
+    if source_ok:
+        return "快捷方式异常"
+    return "文件异常"
+
+
+def _playlist_row(item: PlaylistItemRecord) -> PlaylistRowSnapshot:
+    source_state = item.source_state
+    if item.asset_state in {"missing", "external_changed"}:
+        source_state = item.asset_state
+    source_labels = {
+        "active": "正常",
+        "missing": "缺失",
+        "external_changed": "外部变化",
+        "unindexed": "未索引",
+    }
+    shortcut_labels = {
+        "active": "正常",
+        "missing": "缺失",
+        "broken": "损坏",
+        "external_changed": "目标变化",
+    }
+    status = _playlist_file_status(source_state, item.shortcut_state)
+    detail = (
+        f"原文件：{source_labels.get(source_state, source_state)}；"
+        f"快捷方式：{shortcut_labels.get(item.shortcut_state, item.shortcut_state)}"
+    )
+    if item.diagnostic:
+        detail += f"；{item.diagnostic}"
+    return PlaylistRowSnapshot(
+        shortcut_path=item.shortcut_path,
+        target_path=item.expected_target_path,
+        title=item.title,
+        artist=item.artist,
+        duration=_duration_text(item.duration_ms),
+        file_status=status,
+        detail=detail,
+    )
+
+
+def _save_relationship_recovery(
+    database_config: DatabaseConfig,
+    *,
+    action: str,
+    before: Path | None,
+    after: Path | None,
+    asset_id: str | None,
+    error: str,
+) -> None:
+    entry = {
+        "id": str(uuid4()),
+        "action": action,
+        "before": None if before is None else str(before),
+        "after": None if after is None else str(after),
+        "asset_id": asset_id,
+        "error": error,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "state": "pending",
+    }
+    with LibraryRepository(database_config) as repository:
+        setting = repository.get_setting(PLAYLIST_RELATIONSHIP_RECOVERY_KEY)
+        current = [] if setting is None else setting.value
+        if not isinstance(current, list) or not all(isinstance(item, dict) for item in current):
+            raise ValueError("歌单关系恢复日志格式损坏")
+        repository.set_setting(
+            PLAYLIST_RELATIONSHIP_RECOVERY_KEY,
+            (current + [entry])[-200:],
+        )
 
 
 def _item_paths(item: object, *, playlist_root: Path, playlist_name: str) -> tuple[Path | None, Path | None]:
@@ -513,6 +610,7 @@ class PlaylistShortcutWorker(QThread):
     def __init__(
         self,
         *,
+        database_config: DatabaseConfig,
         playlist_root: Path,
         playlist_name: str,
         add_items: tuple[PlaylistAudioInput, ...] = (),
@@ -525,6 +623,7 @@ class PlaylistShortcutWorker(QThread):
         if sum(bool(value) for value in (add_items, remove_items, retarget_items)) != 1:
             raise ValueError("必须且只能选择一种歌单操作")
         self._playlist_root = playlist_root
+        self._database_config = database_config
         self._playlist_name = playlist_name
         self._add_items = add_items
         self._remove_items = remove_items
@@ -713,6 +812,11 @@ class PlaylistShortcutWorker(QThread):
                                 PlaylistItemResult(source_path, target_path, "skipped", message)
                             )
                             continue
+                        with LibraryRepository(self._database_config) as repository:
+                            repository.retarget_playlist_items(
+                                source_path=item.source_path,
+                                target_path=item.target_path,
+                            )
                     elif isinstance(item, PlaylistAudioInput):
                         if item.file_state != "active":
                             raise ValueError("只允许添加 active 音频")
@@ -722,12 +826,79 @@ class PlaylistShortcutWorker(QThread):
                             shortcut_path=folder / f"{item.target_path.name}.lnk",
                             playlist_root=self._playlist_root,
                         )
+                        shortcut_path = folder / f"{item.target_path.name}.lnk"
+                        try:
+                            with LibraryRepository(self._database_config) as repository:
+                                repository.record_playlist_item_added(
+                                    playlist_root=self._playlist_root,
+                                    playlist_name=self._playlist_name,
+                                    shortcut_path=shortcut_path,
+                                    target_path=item.target_path,
+                                    audio_asset_id=item.asset_id,
+                                )
+                        except Exception as database_error:
+                            try:
+                                remove_shortcut(
+                                    shortcut_path=shortcut_path,
+                                    playlist_root=self._playlist_root,
+                                    expected_target=item.target_path,
+                                )
+                            except Exception as compensation_error:
+                                _save_relationship_recovery(
+                                    self._database_config,
+                                    action="remove_uncommitted_shortcut",
+                                    before=shortcut_path,
+                                    after=None,
+                                    asset_id=item.asset_id,
+                                    error=f"数据库：{database_error}；补偿：{compensation_error}",
+                                )
+                                raise RuntimeError("歌单关系提交和快捷方式补偿均失败，已保存恢复日志") from compensation_error
+                            raise
                     else:
                         remove_shortcut(
                             shortcut_path=item.shortcut_path,
                             playlist_root=self._playlist_root,
                             expected_target=item.expected_target,
                         )
+                        try:
+                            with LibraryRepository(self._database_config) as repository:
+                                repository.mark_playlist_item_removed(item.shortcut_path)
+                        except Exception as database_error:
+                            asset = None
+                            try:
+                                with LibraryRepository(self._database_config) as repository:
+                                    assets = repository.list_assets(kind="audio")
+                                    asset = next(
+                                        (
+                                            value for value in assets
+                                            if _path_key(value.canonical_path)
+                                            == _path_key(item.expected_target)
+                                        ),
+                                        None,
+                                    )
+                                    roots = (
+                                        {} if asset is None
+                                        else repository.latest_completed_audio_roots((asset.id,))
+                                    )
+                                if asset is None or asset.id not in roots:
+                                    raise RuntimeError("缺少可信音频根")
+                                create_shortcut(
+                                    target_path=item.expected_target,
+                                    audio_root=roots[asset.id],
+                                    shortcut_path=item.shortcut_path,
+                                    playlist_root=self._playlist_root,
+                                )
+                            except Exception as compensation_error:
+                                _save_relationship_recovery(
+                                    self._database_config,
+                                    action="restore_removed_shortcut",
+                                    before=None,
+                                    after=item.shortcut_path,
+                                    asset_id=None if asset is None else asset.id,
+                                    error=f"数据库：{database_error}；补偿：{compensation_error}",
+                                )
+                                raise RuntimeError("歌单关系提交和快捷方式恢复均失败，已保存恢复日志") from compensation_error
+                            raise
                 except ShortcutConflictError:
                     skipped += 1
                     item_path = (
@@ -839,6 +1010,30 @@ class PlaylistManagementWorker(QThread):
                     raise ValueError("歌单根在重命名期间发生变化")
                 if _directory_identity(destination) != source_identity:
                     raise ValueError("重命名后的歌单目录身份不一致")
+                try:
+                    with LibraryRepository(self._database_config) as repository:
+                        repository.rename_playlist(
+                            source_folder=source_folder,
+                            destination_folder=destination,
+                        )
+                except Exception as database_error:
+                    try:
+                        rename_playlist_directory(
+                            playlist_root=self._playlist_root,
+                            current_name=destination.name,
+                            new_name=source_folder.name,
+                        )
+                    except Exception as compensation_error:
+                        _save_relationship_recovery(
+                            self._database_config,
+                            action="restore_playlist_name",
+                            before=destination,
+                            after=source_folder,
+                            asset_id=None,
+                            error=f"数据库：{database_error}；补偿：{compensation_error}",
+                        )
+                        raise RuntimeError("歌单重命名提交和目录补偿均失败，已保存恢复日志") from compensation_error
+                    raise
                 self.completed.emit(
                     self._result(
                         playlist_name=destination.name,
@@ -852,10 +1047,13 @@ class PlaylistManagementWorker(QThread):
 
             folder_identity = _directory_identity(source_folder)
             with LibraryRepository(self._database_config) as repository:
-                allowed_targets = tuple(
-                    asset.canonical_path
-                    for asset in repository.list_assets(kind="audio")
+                active_assets = tuple(
+                    asset for asset in repository.list_assets(kind="audio")
                     if asset.file_state == "active"
+                )
+                allowed_targets = tuple(asset.canonical_path for asset in active_assets)
+                roots_by_asset = repository.latest_completed_audio_roots(
+                    asset.id for asset in active_assets
                 )
             infos = inspect_playlist_shortcuts(
                 playlist_root=self._playlist_root,
@@ -945,6 +1143,37 @@ class PlaylistManagementWorker(QThread):
                 details.append(
                     PlaylistItemResult(source_folder, None, "success", "已删除空歌单")
                 )
+            try:
+                with LibraryRepository(self._database_config) as repository:
+                    repository.mark_playlist_deleted(source_folder)
+            except Exception as database_error:
+                try:
+                    restored_folder = create_playlist_directory(
+                        playlist_root=self._playlist_root,
+                        name=self._playlist_name,
+                    )
+                    by_target = {_path_key(asset.canonical_path): asset for asset in active_assets}
+                    for info in infos:
+                        asset = by_target.get(_path_key(info.target_path))
+                        if asset is None or asset.id not in roots_by_asset:
+                            raise RuntimeError("缺少可信音频根")
+                        create_shortcut(
+                            target_path=info.target_path,
+                            audio_root=roots_by_asset[asset.id],
+                            shortcut_path=restored_folder / info.path.name,
+                            playlist_root=self._playlist_root,
+                        )
+                except Exception as compensation_error:
+                    _save_relationship_recovery(
+                        self._database_config,
+                        action="restore_deleted_playlist",
+                        before=None,
+                        after=source_folder,
+                        asset_id=None,
+                        error=f"数据库：{database_error}；补偿：{compensation_error}",
+                    )
+                    raise RuntimeError("歌单删除提交和目录补偿均失败，已保存恢复日志") from compensation_error
+                raise
             self.completed.emit(
                 self._result(
                     playlist_name=self._playlist_name,
@@ -1265,10 +1494,12 @@ class PlaylistRefreshWorker(QThread):
         self,
         name: str,
         by_path: dict[str, object],
-    ) -> PlaylistViewSnapshot:
+        roots_by_asset: dict[str, Path],
+    ) -> tuple[PlaylistItemObservation, ...]:
         folder = self._playlist_root / name
-        rows: list[PlaylistRowSnapshot] = []
-        with _locked_directory_chain(self._playlist_root, folder):
+        observations: list[PlaylistItemObservation] = []
+        folder_identity = _directory_identity(folder)
+        if folder_identity:
             with os.scandir(folder) as shortcut_entries:
                 shortcuts = []
                 for entry in shortcut_entries:
@@ -1296,47 +1527,86 @@ class PlaylistRefreshWorker(QThread):
                     )
                     asset = by_path.get(_path_key(info.target_path))
                 except Exception as error:
-                    rows.append(
-                        PlaylistRowSnapshot(
-                            shortcut_path,
-                            None,
-                            shortcut_path.stem,
-                            "待修复",
-                            "—",
-                            "LNK",
-                            "—",
-                            f"损坏：{error}",
+                    observations.append(
+                        PlaylistItemObservation(
+                            shortcut_path=shortcut_path,
+                            target_path=None,
+                            audio_asset_id=None,
+                            shortcut_state="broken",
+                            source_state="unindexed",
+                            title=shortcut_path.stem,
+                            artist="待识别",
+                            duration_ms=None,
+                            metadata_source="unknown",
+                            diagnostic=f"快捷方式不可读：{error}",
                         )
                     )
                     continue
                 if asset is None:
-                    title, artist = info.target_path.stem, "待识别"
-                    size = "—"
-                    extension = info.target_path.suffix.lstrip(".").upper()
-                    state = "目标未索引"
+                    title, artist = _fallback_identity(info.target_path)
+                    observation = PlaylistItemObservation(
+                        shortcut_path=shortcut_path,
+                        target_path=info.target_path,
+                        audio_asset_id=None,
+                        shortcut_state="active",
+                        source_state="unindexed",
+                        title=title,
+                        artist=artist,
+                        duration_ms=None,
+                        metadata_source="filename",
+                        diagnostic="快捷方式正常，但目标不在 active 音频索引中",
+                    )
                 else:
-                    stem = Path(asset.file_name).stem
-                    title, artist = (
-                        (stem.rsplit("-", 1) + ["待识别"])[:2]
-                        if "-" in stem
-                        else (stem, "待识别")
+                    title, artist = _fallback_identity(asset.canonical_path)
+                    duration_ms = None
+                    source = "filename"
+                    diagnostic = "使用索引文件名回退"
+                    source_state = asset.file_state
+                    if asset.file_state == "active":
+                        trusted_root = roots_by_asset.get(asset.id)
+                        if trusted_root is None:
+                            source_state = "external_changed"
+                            diagnostic = "active 资产缺少可信扫描根，已拒绝读取"
+                        else:
+                            try:
+                                metadata = read_audio_display_metadata(
+                                    MetadataPreviewInput(
+                                        asset_id=asset.id,
+                                        canonical_path=asset.canonical_path,
+                                        allowed_root=trusted_root,
+                                        file_state=asset.file_state,
+                                        size_bytes=asset.size_bytes,
+                                        mtime_ns=asset.mtime_ns,
+                                    )
+                                )
+                                title = metadata.title
+                                artist = metadata.artist
+                                duration_ms = metadata.duration_ms
+                                source = metadata.source
+                                diagnostic = metadata.diagnostic
+                            except MetadataPreviewError as error:
+                                source_state = (
+                                    "missing" if not asset.canonical_path.exists()
+                                    else "external_changed"
+                                )
+                                source = "unknown"
+                                diagnostic = f"源文件媒体信息不可安全读取：{error}"
+                    observation = PlaylistItemObservation(
+                        shortcut_path=shortcut_path,
+                        target_path=info.target_path,
+                        audio_asset_id=asset.id,
+                        shortcut_state="active",
+                        source_state=source_state,
+                        title=title,
+                        artist=artist,
+                        duration_ms=duration_ms,
+                        metadata_source=source,
+                        diagnostic=diagnostic,
                     )
-                    size = _human_size(asset.size_bytes)
-                    extension = asset.extension.lstrip(".").upper()
-                    state = "正常" if asset.file_state == "active" else asset.file_state
-                rows.append(
-                    PlaylistRowSnapshot(
-                        shortcut_path,
-                        info.target_path,
-                        title.strip(),
-                        artist.strip(),
-                        "—",
-                        extension,
-                        size,
-                        state,
-                    )
-                )
-        return PlaylistViewSnapshot(name, tuple(rows))
+                observations.append(observation)
+        if _directory_identity(folder) != folder_identity:
+            raise ValueError("歌单目录在刷新期间被替换")
+        return tuple(observations)
 
     def run(self) -> None:
         try:
@@ -1355,7 +1625,10 @@ class PlaylistRefreshWorker(QThread):
                     _path_key(asset.canonical_path): asset
                     for asset in assets
                 }
-                playlists: list[PlaylistViewSnapshot] = []
+                roots_by_asset = repository.latest_completed_audio_roots(
+                    asset.id for asset in assets
+                )
+                observed: dict[str, tuple[PlaylistItemObservation, ...]] = {}
                 with _locked_directory_chain(
                     self._playlist_root,
                     self._playlist_root,
@@ -1374,7 +1647,19 @@ class PlaylistRefreshWorker(QThread):
                                 entries.append(entry.name)
                 for name in sorted(entries, key=lambda value: (value.casefold(), value)):
                     self._check_cancel()
-                    playlists.append(self._scan_playlist(name, by_path))
+                    observed[name] = self._scan_playlist(name, by_path, roots_by_asset)
+                playlist_records = repository.reconcile_playlists(
+                    playlist_root=self._playlist_root,
+                    observed=observed,
+                )
+                playlists = [
+                    PlaylistViewSnapshot(
+                        playlist.name,
+                        tuple(_playlist_row(item) for item in repository.list_playlist_items(playlist.id)),
+                    )
+                    for playlist in playlist_records
+                    if playlist.state == "active"
+                ]
             self._check_cancel()
             self.completed.emit(
                 PlaylistSnapshot(self._playlist_root, self._generation, tuple(playlists))
@@ -1569,7 +1854,10 @@ class PlaylistController(QObject):
         if pinned:
             current.insert(0, canonical)
         with LibraryRepository(self._database_config) as repository:
-            repository.set_setting(PLAYLIST_PINNED_KEY, current)
+            root = self._require_root()
+            for playlist_name in names:
+                repository.ensure_playlist(playlist_root=root, name=playlist_name)
+            repository.set_playlist_pins(current, setting_key=PLAYLIST_PINNED_KEY)
         return self.ordered_playlist_names(names)
 
     def _sync_pins_after_management(
@@ -1589,10 +1877,22 @@ class PlaylistController(QObject):
         if updated == current:
             return
         with LibraryRepository(self._database_config) as repository:
-            repository.set_setting(PLAYLIST_PINNED_KEY, updated)
+            repository.set_playlist_pins(updated, setting_key=PLAYLIST_PINNED_KEY)
 
     def create_playlist(self, name: str) -> str:
         folder = create_playlist_directory(playlist_root=self._require_root(), name=name)
+        try:
+            with LibraryRepository(self._database_config) as repository:
+                repository.ensure_playlist(
+                    playlist_root=self._require_root(),
+                    name=folder.name,
+                )
+        except Exception:
+            remove_empty_playlist_directory(
+                playlist_root=self._require_root(),
+                name=folder.name,
+            )
+            raise
         result = PlaylistOperationResult(
             folder.name,
             1,
@@ -1612,69 +1912,18 @@ class PlaylistController(QObject):
         return folder.name
 
     def load_playlist(self, name: str) -> tuple[dict[str, object], ...]:
-        root = self._require_root()
-        matching = [item for item in self.list_playlists() if _name_key(item) == _name_key(name)]
-        if len(matching) != 1:
-            raise ValueError("歌单不存在或名称不唯一")
-        folder = root / matching[0]
+        self._require_root()
         with LibraryRepository(self._database_config) as repository:
-            assets = repository.list_assets(kind="audio")
-            matches = {
-                match.audio_asset_id: match.source_kind
-                for match in repository.list_lyrics_matches(current_only=True)
-            }
-        by_path = {
-            os.path.normcase(os.path.normpath(os.fspath(asset.canonical_path))): asset
-            for asset in assets
-        }
-        rows: list[dict[str, object]] = []
-        for path in sorted(folder.glob("*.lnk"), key=lambda item: (item.name.casefold(), item.name)):
-            try:
-                info = read_shortcut(path, playlist_root=root)
-                asset = by_path.get(os.path.normcase(os.path.normpath(os.fspath(info.target_path))))
-            except Exception as error:
-                rows.append(
-                    {
-                        "_shortcut_path": path,
-                        "_target_path": None,
-                        "title": path.stem,
-                        "artist": "待修复",
-                        "duration": "—",
-                        "format": "LNK",
-                        "size": "—",
-                        "status": "未检查",
-                        "file_status": "快捷方式损坏",
-                        "_file_status_detail": f"快捷方式损坏：{error}",
-                    }
-                )
-                continue
-            if asset is None:
-                lyric_status = "未检查"
-                file_status = "目标未索引"
-                title, artist = info.target_path.stem, "待识别"
-                size = "—"
-                extension = info.target_path.suffix.lstrip(".").upper()
-            else:
-                stem = Path(asset.file_name).stem
-                title, artist = (stem.rsplit("-", 1) + ["待识别"])[:2] if "-" in stem else (stem, "待识别")
-                lyric_status = lyrics_status_text(matches.get(asset.id))
-                file_status = file_status_text(asset.file_state)
-                size = _human_size(asset.size_bytes)
-                extension = asset.extension.lstrip(".").upper()
-            rows.append(
-                {
-                    "_shortcut_path": path,
-                    "_target_path": info.target_path,
-                    "title": title.strip(),
-                    "artist": artist.strip(),
-                    "duration": "—",
-                    "format": extension,
-                    "size": size,
-                    "status": lyric_status,
-                    "file_status": file_status,
-                }
+            matches = [
+                playlist for playlist in repository.list_playlists()
+                if playlist.state == "active" and _name_key(playlist.name) == _name_key(name)
+            ]
+            if len(matches) != 1:
+                raise ValueError("歌单不存在或名称不唯一")
+            return tuple(
+                _playlist_row(item).as_record()
+                for item in repository.list_playlist_items(matches[0].id)
             )
-        return tuple(rows)
 
     def start_add(self, playlist_name: str, items: tuple[PlaylistAudioInput, ...]) -> None:
         self._start_worker(playlist_name, add_items=items)
@@ -1813,6 +2062,7 @@ class PlaylistController(QObject):
             or ()
         )
         worker = PlaylistShortcutWorker(
+            database_config=self._database_config,
             playlist_root=playlist_root,
             playlist_name=playlist_name,
             expected_root_identity=expected_root_identity,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
+import math
 import os
 from pathlib import Path
 import stat
@@ -58,6 +59,15 @@ class MetadataPreviewResult:
     status: str
     message: str
     requires_confirmation: bool
+
+
+@dataclass(frozen=True, slots=True)
+class AudioDisplayMetadata:
+    title: str
+    artist: str
+    duration_ms: int | None
+    source: str
+    diagnostic: str
 
 
 CancelCallback = Callable[[], bool]
@@ -207,6 +217,70 @@ def _identity_from_file_name(path: Path) -> tuple[str | None, str | None, str | 
     if not title.strip() or not artist.strip():
         return None, None, "文件名分隔符两侧必须都有内容"
     return title, artist, None
+
+
+def read_audio_display_metadata(item: MetadataPreviewInput) -> AudioDisplayMetadata:
+    """Safely read playlist display fields without mutating the media file."""
+
+    _validate_request((item,))
+    if item.file_state != "active":
+        raise MetadataPreviewError("只有 active 音频资产允许读取媒体信息")
+    try:
+        before = _file_metadata(item.canonical_path, item.allowed_root)
+    except OSError as error:
+        raise MetadataPreviewError(f"无法读取文件信息：{error}") from error
+    if before.st_size != item.size_bytes or (
+        item.mtime_ns is not None and before.st_mtime_ns != item.mtime_ns
+    ):
+        raise MetadataPreviewError("源文件指纹与 active 索引不一致")
+    before_identity = _file_identity(before)
+    if before_identity is None:
+        raise MetadataPreviewError("当前文件系统无法提供可靠文件身份")
+    try:
+        with item.canonical_path.open("rb") as stream:
+            opened_identity = _file_identity(os.fstat(stream.fileno()))
+            if opened_identity is None or opened_identity != before_identity:
+                raise MetadataPreviewError("源文件在安全检查与只读打开之间发生变化")
+            media = MutagenFile(stream, easy=True)
+            if media is None:
+                raise MetadataPreviewError("无法识别音频容器")
+            tags = getattr(media, "tags", None)
+            titles = [] if tags is None else _tag_values(tags, ("title", "TIT2", "\xa9nam"))
+            artists = [] if tags is None else _tag_values(tags, ("artist", "TPE1", "\xa9ART", "aART"))
+            length = getattr(getattr(media, "info", None), "length", None)
+            duration_ms = None
+            if isinstance(length, (int, float)) and not isinstance(length, bool):
+                numeric_length = float(length)
+                if math.isfinite(numeric_length) and numeric_length >= 0:
+                    duration_ms = int(round(numeric_length * 1000))
+            handle_after = _file_identity(os.fstat(stream.fileno()))
+            if handle_after is None or handle_after != opened_identity:
+                raise MetadataPreviewError("源文件在媒体信息分析期间发生变化")
+        after = _file_metadata(item.canonical_path, item.allowed_root)
+        if _file_identity(after) != before_identity:
+            raise MetadataPreviewError("源文件路径在媒体信息分析后发生变化")
+    except MetadataPreviewError:
+        raise
+    except Exception as error:
+        raise MetadataPreviewError(f"无法安全读取音频媒体信息：{error}") from error
+
+    if titles and artists:
+        return AudioDisplayMetadata(
+            titles[0], "、".join(artists), duration_ms, "tags", "Title/Artist 来自音频标签"
+        )
+    title, artist, message = _identity_from_file_name(item.canonical_path)
+    if title is None or artist is None:
+        return AudioDisplayMetadata(
+            item.canonical_path.stem,
+            "待识别",
+            duration_ms,
+            "unknown",
+            message or "无法从文件名识别歌名和歌手",
+        )
+    return AudioDisplayMetadata(
+        title.strip(), artist.strip(), duration_ms, "filename",
+        "Title 与 Artist 未同时有效，已整体回退到文件名",
+    )
 
 
 def _file_metadata(path: Path, allowed_root: Path) -> os.stat_result:

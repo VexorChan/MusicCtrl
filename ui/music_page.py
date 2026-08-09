@@ -149,11 +149,15 @@ class LibraryTableModel(QAbstractTableModel):
     def columns(self) -> tuple[str, ...]:
         if self.kind == "lyrics":
             return ("", "歌名", "歌手", "格式", "大小", "歌词状态", "文件状态")
+        if self.kind == "playlist":
+            return ("", "歌名", "歌手", "时长", "文件状态")
         return ("", "歌名", "歌手", "时长", "格式", "大小", "歌词状态", "文件状态")
 
     def fields(self) -> tuple[str, ...]:
         if self.kind == "lyrics":
             return ("title", "artist", "format", "size", "status", "file_status")
+        if self.kind == "playlist":
+            return ("title", "artist", "duration", "file_status")
         return ("title", "artist", "duration", "format", "size", "status", "file_status")
 
     def replace_records(self, records: Iterable[dict[str, object]]) -> None:
@@ -239,6 +243,17 @@ class LibraryTableModel(QAbstractTableModel):
             self.dataChanged.emit(index, index, [Qt.ItemDataRole.CheckStateRole])
         if changed:
             self.check_state_changed.emit()
+
+    def set_checked_rows(self, rows: Iterable[int]) -> None:
+        checked = {row for row in rows if 0 <= row < len(self._records)}
+        changed = sorted(self._checked.symmetric_difference(checked))
+        if not changed:
+            return
+        self._checked = checked
+        for row in changed:
+            index = self.index(row, 0)
+            self.dataChanged.emit(index, index, [Qt.ItemDataRole.CheckStateRole])
+        self.check_state_changed.emit()
 
 
 class LibraryPage(QWidget):
@@ -341,21 +356,26 @@ class LibraryPage(QWidget):
             self.table = ModelDataTable(checkable_header=True)
             self._table_model = LibraryTableModel(kind=self.kind, parent=self.table)
             self.table.setModel(self._table_model)
-            for column in (
-                len(self._table_model.columns()) - 2,
-                len(self._table_model.columns()) - 1,
-            ):
+            status_columns = (
+                (len(self._table_model.columns()) - 1,)
+                if self.kind == "playlist"
+                else (
+                    len(self._table_model.columns()) - 2,
+                    len(self._table_model.columns()) - 1,
+                )
+            )
+            for column in status_columns:
                 self.table.setItemDelegateForColumn(
                     column,
                     StatusBadgeDelegate(self.table),
                 )
-            self._table_model.check_state_changed.connect(self._update_selection_state)
+            self._table_model.check_state_changed.connect(self._check_state_changed)
         else:
             self.table = DataTable(checkable_header=True)
         self.checkable_header = self.table.require_checkable_header()
         self.table.selectionModel().selectionChanged.connect(self._selection_changed)
         if not self.use_model_view:
-            self.table.itemChanged.connect(self._update_selection_state)
+            self.table.itemChanged.connect(self._check_state_changed)
         self.checkable_header.toggle_requested.connect(self._toggle_select_all)
         self.table.horizontalHeader().sectionClicked.connect(self._header_clicked)
         self.table.customContextMenuRequested.connect(self._context_menu)
@@ -410,11 +430,15 @@ class LibraryPage(QWidget):
     def _columns(self) -> list[str]:
         if self.kind == "lyrics":
             return ["", "歌名", "歌手", "格式", "大小", "歌词状态", "文件状态"]
+        if self.kind == "playlist":
+            return ["", "歌名", "歌手", "时长", "文件状态"]
         return ["", "歌名", "歌手", "时长", "格式", "大小", "歌词状态", "文件状态"]
 
     def _field_order(self) -> list[str]:
         if self.kind == "lyrics":
             return ["title", "artist", "format", "size", "status", "file_status"]
+        if self.kind == "playlist":
+            return ["title", "artist", "duration", "file_status"]
         return ["title", "artist", "duration", "format", "size", "status", "file_status"]
 
     def _populate_table(self) -> None:
@@ -425,11 +449,12 @@ class LibraryPage(QWidget):
             self._table_model.replace_records(self.visible_data)
             header = self.table.horizontalHeader()
             header.setMinimumSectionSize(40)
-            widths = (
-                (44, 220, 180, 60, 72, 116, 102)
-                if self.kind == "lyrics"
-                else (44, 210, 170, 66, 60, 72, 116, 102)
-            )
+            if self.kind == "lyrics":
+                widths = (44, 220, 180, 60, 72, 116, 102)
+            elif self.kind == "playlist":
+                widths = (44, 260, 220, 72, 140)
+            else:
+                widths = (44, 210, 170, 66, 60, 72, 116, 102)
             for column, width in enumerate(widths):
                 self.table.setColumnWidth(column, width)
             header.setStretchLastSection(False)
@@ -482,6 +507,9 @@ class LibraryPage(QWidget):
             self.table.setColumnWidth(4, 72)
             self.table.setColumnWidth(5, 116)
             self.table.setColumnWidth(6, 102)
+        elif self.kind == "playlist":
+            self.table.setColumnWidth(3, 72)
+            self.table.setColumnWidth(4, 140)
         else:
             self.table.setColumnWidth(3, 66)
             self.table.setColumnWidth(4, 60)
@@ -565,32 +593,54 @@ class LibraryPage(QWidget):
         else:
             header_state = Qt.CheckState.PartiallyChecked
         self.checkable_header.set_check_state(header_state)
-        self.add_button.setEnabled(count > 0 and self.kind == "music")
+        self.add_button.setEnabled(count > 0 and self.kind in {"music", "playlist"})
         self.delete_button.setEnabled(count > 0)
         shown = len(self.visible_data)
         suffix = "索引来自用户选择目录" if self.live_mode else "仅演示界面，不操作真实文件"
         self.status.setText(f"已选择 {count} 项    ·    当前显示 {shown} 项    ·    {suffix}")
 
-    def _selection_changed(self, selected, _deselected) -> None:
+    def _selection_changed(self, _selected, _deselected) -> None:
         if self._syncing_selection_checks:
             return
-        rows = sorted({index.row() for index in selected.indexes()})
-        if rows:
-            self._syncing_selection_checks = True
-            try:
-                if self._table_model is not None:
-                    self._table_model.set_rows_checked(rows)
-                else:
-                    self.table.blockSignals(True)
-                    try:
-                        for row in rows:
-                            item = self.table.item(row, 0)
-                            if item is not None:
-                                item.setCheckState(Qt.CheckState.Checked)
-                    finally:
-                        self.table.blockSignals(False)
-            finally:
-                self._syncing_selection_checks = False
+        rows = sorted(index.row() for index in self.table.selectionModel().selectedRows())
+        self._syncing_selection_checks = True
+        try:
+            if self._table_model is not None:
+                self._table_model.set_checked_rows(rows)
+            else:
+                self.table.blockSignals(True)
+                try:
+                    selected_rows = set(rows)
+                    for row in range(self.table.rowCount()):
+                        item = self.table.item(row, 0)
+                        if item is not None:
+                            item.setCheckState(
+                                Qt.CheckState.Checked
+                                if row in selected_rows
+                                else Qt.CheckState.Unchecked
+                            )
+                finally:
+                    self.table.blockSignals(False)
+        finally:
+            self._syncing_selection_checks = False
+        self._update_selection_state()
+
+    def _check_state_changed(self, *_args) -> None:
+        if self._syncing_selection_checks:
+            return
+        checked = set(self._checked_rows())
+        selection_model = self.table.selectionModel()
+        self._syncing_selection_checks = True
+        try:
+            selection_model.clearSelection()
+            for row in sorted(checked):
+                selection_model.select(
+                    self.table.model().index(row, 0),
+                    selection_model.SelectionFlag.Select
+                    | selection_model.SelectionFlag.Rows,
+                )
+        finally:
+            self._syncing_selection_checks = False
         self._update_selection_state()
 
     def _header_clicked(self, column: int) -> None:
