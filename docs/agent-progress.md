@@ -4,7 +4,7 @@
 
 - M1～P8 主体功能已完成，项目处于私人、本机、自用稳定维护阶段。
 - 当前分支为 `main`；最终交付要求 `HEAD == origin/main` 且 ahead/behind 为 `0/0`。
-- 当前开发基线为 402 项单元测试；`ResourceWarning` 提升为错误时仍全部通过，并同时执行 `compileall`、`smoke_test.py` 和 `git diff --check`。
+- 当前开发基线为 408 项单元测试；`ResourceWarning` 提升为错误时仍全部通过，并同时执行 `compileall`、`smoke_test.py` 和 `git diff --check`。
 - 最终 EXE 从运行时提交 `fb89f8df685c80a7804d8fbd2a7150a701bc658f` 构建；准确解释器、PyInstaller 和依赖版本以安装目录中的 `BUILD-INFO.txt` 为准。其后的交付记录提交仅含文档，不改变 EXE 来源。
 
 ## 已完成
@@ -28,6 +28,8 @@
 6. 所有歌词及真实扫描、导入、重命名、歌词匹配和历史表格曾残留 `QTableWidget`；现在正式路径统一使用 Model/View，并保留既有选择、编辑、提示和状态徽标语义。
 7. 安全导入测试 controller 曾依赖 `TemporaryDirectory` 隐式析构；现在提供幂等 `close()`，运行中拒绝关闭，测试显式释放后不再报告 `ResourceWarning`。
 8. 项目规则的 Python 版本曾滞后；现在统一为实际验证和构建基准 Python 3.13.5。
+9. 删除操作曾只能处理 `active` 文件，扫描后留下的 `missing` 异常记录无法清理。现在缺失记录经二次确认后只从列表隐藏，保留索引与审计；文件仍存在、状态变化或来源不符时 fail-closed，重新扫描发现文件后自动恢复显示。
+10. 数据维护中的“重新检查已标记文件”入口较深。现在所有正式主页面增加“刷新”按钮，并复用同一条音乐、歌词、歌单已记住目录后台检查队列。
 
 ## 交付证据
 

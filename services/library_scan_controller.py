@@ -226,10 +226,12 @@ class LibraryScanController(QObject):
         repository = self._open_repository()
         try:
             assets = repository.list_assets(kind="audio")
+            hidden = set(repository.list_hidden_asset_ids())
             roots = repository.latest_completed_audio_roots(asset.id for asset in assets)
             return tuple(
                 asset_to_music_record(asset, allowed_root=roots.get(asset.id))
                 for asset in assets
+                if asset.id not in hidden
             )
         finally:
             repository.close()

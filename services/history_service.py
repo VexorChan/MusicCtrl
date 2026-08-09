@@ -265,7 +265,12 @@ class HistoryService:
                     )
                     if action == "backup" and result == "success" and entry_id in current_entries:
                         restore_ids.append(entry_id)
-                action_text = {"backup": "删除到备份", "restore": "恢复备份", "cleanup": "永久清理"}[action]
+                action_text = {
+                    "backup": "删除到备份",
+                    "restore": "恢复备份",
+                    "cleanup": "永久清理",
+                    "dismiss": "清理缺失记录",
+                }[action]
                 records.append(
                     HistoryRecord(
                         identifier,

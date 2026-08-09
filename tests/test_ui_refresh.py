@@ -4,9 +4,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 from PySide6.QtCore import QObject, Signal
-from PySide6.QtWidgets import QApplication, QLabel, QPushButton
+from PySide6.QtWidgets import QApplication, QDialog, QLabel, QPushButton
 
 from dialogs.delete_confirm_dialog import DeleteConfirmDialog, DeleteLyricsConfirmDialog
 from ui.main_window import MainWindow
@@ -75,7 +76,10 @@ class FakeOperationController(QObject):
         self.started.append(args)
 
     def start_backup(self, *args: object) -> None:
-        self.started.append(args)
+        self.started.append(("backup",) + args)
+
+    def start_dismiss_missing(self, *args: object) -> None:
+        self.started.append(("dismiss",) + args)
 
     def start_restore(self, *args: object) -> None:
         self.started.append(args)
@@ -369,6 +373,32 @@ class UiRefreshTests(unittest.TestCase):
         self.assertTrue(hasattr(live_music, "backup_linked_lyrics"))
         self.assertFalse(live_music.backup_linked_lyrics.isChecked())
         self.assertIn("外部 LRC", live_music.backup_linked_lyrics.text())
+
+    def test_missing_delete_dispatches_record_cleanup_and_external_change_requires_refresh(self) -> None:
+        backup = FakeOperationController()
+        window = self._window(audio=FakeLibraryController(), backup=backup)
+        page = window.pages["所有音乐"]
+        source = self.root / "missing.mp3"
+        record = {
+            "title": "缺失",
+            "artist": "文件",
+            "_asset_id": "asset-missing",
+            "_canonical_path": source,
+            "_allowed_root": self.root,
+            "_file_state": "missing",
+            "_size_bytes": 1,
+            "_mtime_ns": 2,
+        }
+
+        with patch.object(DeleteConfirmDialog, "exec", return_value=QDialog.DialogCode.Accepted):
+            window._confirm_delete(page, [record])
+
+        self.assertEqual(backup.started[0][0], "dismiss")
+        backup.started.clear()
+        changed = dict(record, _file_state="external_changed")
+        window._confirm_delete(page, [changed])
+        self.assertEqual(backup.started, [])
+        self.assertIn("刷新", page.status.text())
 
 
 if __name__ == "__main__":

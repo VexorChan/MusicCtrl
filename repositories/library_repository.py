@@ -19,6 +19,7 @@ from database import DatabaseConfig, apply_migrations, open_database
 
 ASSET_KINDS = frozenset({"audio", "lyric"})
 ASSET_STATES = frozenset({"active", "missing", "external_changed"})
+HIDDEN_ASSET_IDS_KEY = "p7.hidden_asset_ids"
 SCAN_MODES = frozenset({"audio", "lyric"})
 SCAN_SESSION_FINAL_STATES = frozenset({"cancelled", "completed", "failed"})
 SCAN_ITEM_STATES = frozenset({"waiting", "indexed", "skipped", "failed"})
@@ -2114,7 +2115,95 @@ class LibraryRepository:
                 asset_record = self._upsert_indexed_asset(asset)
                 scan_item_record = self._insert_prepared_scan_item(session_id, scan_item)
                 records.append(IndexBatchRecord(asset_record, scan_item_record))
+            self._update_hidden_asset_ids(
+                tuple(record.asset.id for record in records), hidden=False
+            )
         return tuple(records)
+
+    def _hidden_asset_ids(self) -> tuple[str, ...]:
+        row = self._connection.execute(
+            "SELECT value_json FROM settings WHERE key = ?", (HIDDEN_ASSET_IDS_KEY,)
+        ).fetchone()
+        if row is None:
+            return ()
+        value = _strict_json_loads(row["value_json"])
+        if (
+            not isinstance(value, list)
+            or len(value) > 10000
+            or any(not isinstance(item, str) or not item.strip() for item in value)
+            or len(value) != len(set(value))
+        ):
+            raise RepositoryDataError("隐藏资产记录格式损坏")
+        return tuple(value)
+
+    def list_hidden_asset_ids(self) -> tuple[str, ...]:
+        self._require_open_in_owner_thread()
+        return self._hidden_asset_ids()
+
+    def _update_hidden_asset_ids(
+        self, asset_ids: tuple[str, ...], *, hidden: bool
+    ) -> None:
+        current = set(self._hidden_asset_ids())
+        original = set(current)
+        if hidden:
+            current.update(asset_ids)
+        else:
+            current.difference_update(asset_ids)
+        if current == original:
+            return
+        if len(current) > 10000:
+            raise RepositoryDataError("隐藏资产记录超过安全上限")
+        encoded = self._encode_setting_value(sorted(current))
+        self._connection.execute(
+            """
+            INSERT INTO settings(key, value_json, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value_json = excluded.value_json,
+                updated_at = excluded.updated_at
+            """,
+            (HIDDEN_ASSET_IDS_KEY, encoded, _utc_now()),
+        )
+
+    def set_assets_hidden(
+        self,
+        asset_ids: Iterable[str],
+        *,
+        hidden: bool,
+        expected_kind: str | None = None,
+        expected_state: str | None = None,
+    ) -> None:
+        """Hide stale list records without deleting assets or audit history."""
+
+        self._require_open_in_owner_thread()
+        requested = tuple(asset_ids)
+        if (
+            not requested
+            or any(not isinstance(item, str) or not item.strip() for item in requested)
+            or len(requested) != len(set(requested))
+            or not isinstance(hidden, bool)
+        ):
+            raise RepositoryDataError("隐藏资产参数无效")
+        if expected_kind is not None:
+            _require_choice(expected_kind, ASSET_KINDS, field_name="kind")
+        if expected_state is not None:
+            _require_choice(expected_state, ASSET_STATES, field_name="file_state")
+        placeholders = ",".join("?" for _ in requested)
+        with self._transaction():
+            rows = self._connection.execute(
+                f"SELECT id, kind, file_state FROM assets WHERE id IN ({placeholders})",
+                requested,
+            ).fetchall()
+            by_id = {row["id"]: row for row in rows}
+            if set(by_id) != set(requested):
+                raise RepositoryDataError("待隐藏资产不存在")
+            if any(
+                (expected_kind is not None and row["kind"] != expected_kind)
+                or (expected_state is not None and row["file_state"] != expected_state)
+                for row in rows
+            ):
+                raise RepositoryDataError("待隐藏资产类型或状态已变化")
+            self._update_hidden_asset_ids(requested, hidden=hidden)
 
     def complete_scan_and_reconcile(self, session_id: str) -> ScanReconcileResult:
         """Complete one audio scan and atomically reconcile its exact-root baseline."""

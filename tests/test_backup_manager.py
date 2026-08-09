@@ -12,7 +12,7 @@ from PySide6.QtWidgets import QApplication
 
 import services.backup_manager as backup_module
 from database import DatabaseConfig
-from repositories import IndexBatchItem, LibraryRepository
+from repositories import AssetUpsert, IndexBatchItem, LibraryRepository
 from services.backup_manager import (
     BACKUP_MANIFEST_KEY,
     PENDING_CLEANUP_KEY,
@@ -23,6 +23,7 @@ from services.backup_manager import (
     BackupInput,
     BackupWorker,
 )
+from services.library_scan_controller import LibraryScanController
 
 
 class BackupManagerTests(unittest.TestCase):
@@ -162,6 +163,63 @@ class BackupManagerTests(unittest.TestCase):
         self.assertEqual(self.controller.list_entries(), ())
         self.assertEqual(results[-1].action, "restore")
         self.assertEqual(results[-1].affected_roots, (("audio", self.media_root),))
+
+    def test_dismiss_missing_hides_only_index_record_without_creating_backup(self) -> None:
+        metadata = self.file.stat()
+        self.file.unlink()
+        with LibraryRepository(self.config) as repository:
+            repository.upsert_asset(
+                AssetUpsert(
+                    self.file,
+                    metadata.st_size,
+                    metadata.st_mtime_ns,
+                    file_state="missing",
+                )
+            )
+
+        completed: list[object] = []
+        self.controller.completed.connect(completed.append)
+        self.controller.start_dismiss_missing(
+            (BackupInput(self.asset.id, self.file, self.media_root, "audio"),)
+        )
+        self._wait()
+
+        self.assertEqual(len(completed), 1)
+        self.assertEqual(completed[0].action, "dismiss")
+        self.assertEqual(completed[0].success_count, 1)
+        self.assertFalse(self.backup_root.exists())
+        self.assertFalse(self.file.exists())
+        with LibraryRepository(self.config) as repository:
+            self.assertEqual(repository.list_hidden_asset_ids(), (self.asset.id,))
+        self.assertEqual(LibraryScanController(self.config).load_library(), ())
+        self.assertEqual(self.controller.list_history()[0].action, "dismiss")
+
+    def test_dismiss_missing_rejects_record_when_file_reappeared(self) -> None:
+        metadata = self.file.stat()
+        self.file.unlink()
+        with LibraryRepository(self.config) as repository:
+            repository.upsert_asset(
+                AssetUpsert(
+                    self.file,
+                    metadata.st_size,
+                    metadata.st_mtime_ns,
+                    file_state="missing",
+                )
+            )
+        self.file.write_bytes(self.payload)
+        failures: list[str] = []
+        self.controller.failed.connect(failures.append)
+
+        self.controller.start_dismiss_missing(
+            (BackupInput(self.asset.id, self.file, self.media_root, "audio"),)
+        )
+        self._wait()
+
+        self.assertEqual(len(failures), 1)
+        self.assertIn("文件仍存在", failures[0])
+        self.assertTrue(self.file.exists())
+        with LibraryRepository(self.config) as repository:
+            self.assertEqual(repository.list_hidden_asset_ids(), ())
 
     def test_linked_lyrics_default_off_and_opt_in_group_restore(self) -> None:
         lyric_root, lyric_path, lyric_asset, match = self._seed_linked_lyric()

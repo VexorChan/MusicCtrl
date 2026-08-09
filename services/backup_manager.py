@@ -30,7 +30,7 @@ BACKUP_HISTORY_KEY = "p7.operation_history"
 PENDING_CLEANUP_KEY = "p7.pending_cleanup"
 PENDING_LINKED_BACKUP_KEY = "p7.pending_linked_backup"
 _BACKUP_HISTORY_LIMIT = 200
-_BACKUP_ACTIONS = {"backup", "restore", "cleanup"}
+_BACKUP_ACTIONS = {"backup", "restore", "cleanup", "dismiss"}
 _BACKUP_HISTORY_STATUSES = {"completed", "cancelled", "failed"}
 _BACKUP_ITEM_RESULTS = {"success", "failed", "cancelled"}
 
@@ -429,6 +429,10 @@ class BackupWorker(QThread):
         repository = None
         try:
             repository = self._repository_factory()
+            if self._action == "dismiss":
+                result = self._dismiss(repository)
+                self.completed.emit(self._save_history(repository, result))
+                return
             self._validate_backup_root()
             self._recover_pending_linked_backup(repository)
             self._recover_pending_cleanup(repository)
@@ -462,6 +466,56 @@ class BackupWorker(QThread):
         finally:
             if repository is not None:
                 repository.close()
+
+    def _dismiss(self, repository: LibraryRepository) -> BackupRunResult:
+        requested = tuple(self._payload)
+        if not requested or not all(isinstance(item, BackupInput) for item in requested):
+            raise BackupError("异常记录清理输入无效")
+        audio_roots = repository.latest_completed_audio_roots(
+            item.asset_id for item in requested if item.kind == "audio"
+        )
+        lyric_roots = repository.latest_completed_lyric_roots(
+            item.asset_id for item in requested if item.kind == "lyric"
+        )
+        details: list[BackupHistoryItem] = []
+        for item in requested:
+            asset = repository.get_asset_by_id(item.asset_id)
+            expected_root = (
+                audio_roots.get(item.asset_id)
+                if item.kind == "audio"
+                else lyric_roots.get(item.asset_id)
+            )
+            if (
+                asset is None
+                or asset.kind != item.kind
+                or asset.file_state != "missing"
+                or _path_key(asset.canonical_path) != _path_key(item.source_path)
+                or expected_root is None
+                or _path_key(expected_root) != _path_key(item.allowed_root)
+                or os.path.lexists(item.source_path)
+            ):
+                raise BackupError("异常记录已变化或文件仍存在，请重新扫描")
+        repository.set_assets_hidden(
+            (item.asset_id for item in requested),
+            hidden=True,
+            expected_state="missing",
+        )
+        for item in requested:
+            details.append(
+                self._history_item(
+                    entry_id=None,
+                    asset_id=item.asset_id,
+                    kind=item.kind,
+                    source_path=item.source_path,
+                    backup_path=None,
+                    restore_target=None,
+                    result="success",
+                    message="已从列表清理缺失记录；索引审计仍保留",
+                )
+            )
+        return BackupRunResult(
+            "dismiss", len(details), 0, (), (), "completed", None, tuple(details)
+        )
 
     def _build_linked_backup_plan(
         self,
@@ -2017,12 +2071,15 @@ class BackupController(QObject):
             raise BackupError("当前设置为永久保留，没有到期备份可清理")
         self._start("cleanup", (), retention_days=effective)
 
+    def start_dismiss_missing(self, items: tuple[BackupInput, ...]) -> None:
+        self._start("dismiss", items)
+
     def _start(self, action: str, payload: tuple[object, ...], *, retention_days: int = 7) -> None:
         if self.running:
             raise RuntimeError("已有备份任务正在运行")
         if action != "cleanup" and not payload:
             raise BackupError("至少选择一项")
-        if action == "backup":
+        if action in {"backup", "dismiss"}:
             for value in payload:
                 if (
                     not isinstance(value, BackupInput)
@@ -2045,7 +2102,8 @@ class BackupController(QObject):
                 raise BackupError("清理保留天数必须是非负整数")
         else:
             raise BackupError("未知备份操作")
-        self._backup_root.mkdir(parents=True, exist_ok=True)
+        if action != "dismiss":
+            self._backup_root.mkdir(parents=True, exist_ok=True)
         worker = BackupWorker(action=action, payload=payload, backup_root=self._backup_root, repository_factory=self._repository_factory, retention_days=retention_days)
         worker.completed.connect(lambda value: self._cache("completed", value))
         worker.failed.connect(lambda value: self._cache("failed", value))

@@ -883,6 +883,7 @@ class LyricsMatchController(QObject):
         repository = self._open_repository()
         try:
             assets = repository.list_assets(kind="lyric")
+            hidden = set(repository.list_hidden_asset_ids())
             roots = repository.latest_completed_lyric_roots(
                 asset.id for asset in assets
             )
@@ -893,6 +894,8 @@ class LyricsMatchController(QObject):
             }
             records = []
             for asset in assets:
+                if asset.id in hidden:
+                    continue
                 title, artist = _identity_from_file_name(asset.file_name)
                 records.append(
                     {

@@ -247,6 +247,7 @@ class LibraryPage(QWidget):
     open_location_requested = Signal(object)
     rename_context_requested = Signal(object)
     rematch_lyrics_requested = Signal(object)
+    refresh_requested = Signal()
 
     def __init__(
         self,
@@ -307,6 +308,12 @@ class LibraryPage(QWidget):
         self.sort_button.setFixedWidth(88)
         self.sort_button.clicked.connect(self._show_sort_menu)
         actions.addWidget(self.sort_button)
+        self.refresh_button = QPushButton("刷新")
+        self.refresh_button.setAccessibleName("刷新已记住目录")
+        self.refresh_button.setFixedWidth(88)
+        self.refresh_button.setVisible(self.live_mode)
+        self.refresh_button.clicked.connect(self.refresh_requested.emit)
+        actions.addWidget(self.refresh_button)
         self.add_button = QPushButton("添加到")
         self.add_button.setAccessibleName("添加到歌单")
         self.add_button.setFixedWidth(104)

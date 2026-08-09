@@ -301,6 +301,24 @@ class SettingsLiveTests(unittest.TestCase):
         self.assertEqual((empty_audio.started, empty_lyrics.started), ([], []))
         self.assertIn("尚未记住", empty_dialog.status.text())  # type: ignore[union-attr]
 
+    def test_main_page_refresh_reuses_remembered_directory_recheck_queue(self) -> None:
+        window, audio, lyrics = self._window()
+        playlist = window._playlist_controller
+        page = window.pages["所有音乐"]
+
+        self.assertTrue(page.refresh_button.isVisible())
+        page.refresh_button.click()
+        self.assertEqual(audio.started, [self.audio_root])
+        self.assertEqual(lyrics.started, [])
+        self.assertIn("3 个已记住目录", page.status.text())
+
+        audio.finish()
+        self._events()
+        self.assertEqual(lyrics.started, [self.lyrics_root])
+        lyrics.finish()
+        self._events()
+        self.assertEqual(playlist.started, [self.playlist_root])
+
     def test_playlist_path_buttons_choose_candidate_and_refresh_remembered_root(self) -> None:
         window, _audio, _lyrics = self._window()
         playlist = window._playlist_controller

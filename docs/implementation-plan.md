@@ -162,6 +162,7 @@ P2 不更新 Windows 快捷方式；音乐移动或重命名后的 `.lnk` 联动
 - `QSortFilterProxyModel`
 - 一万条模拟记录性能验证
 - `missing` 和 `external_changed` 状态
+- 正式主页面“刷新”复用数据维护的已记住目录检查队列；缺失记录清理只隐藏列表记录，重新扫描发现文件时自动恢复显示
 - 稳定维护阶段已把所有正式主列表和真实业务表格统一到 `QTableView/QAbstractTableModel`，并复用勾选语义与状态徽标 delegate；M1 模拟路径不受影响。
 
 ### P4：歌词扫描与匹配（已完成）

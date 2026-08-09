@@ -251,6 +251,9 @@ class MainWindow(QMainWindow):
         page.open_location_requested.connect(self._open_selected_location)
         page.rename_context_requested.connect(self._rename_selected_context)
         page.rematch_lyrics_requested.connect(self._rematch_selected_lyrics)
+        page.refresh_requested.connect(
+            lambda p=page: self._rescan_remembered_libraries(page=p)
+        )
 
     @staticmethod
     def _audio_snapshot_from_record(record: object) -> AudioAssetSnapshot:
@@ -1370,9 +1373,20 @@ class MainWindow(QMainWindow):
             return
         dialog.show_message(f"已打开备份目录：{root}")
 
-    def _rescan_remembered_libraries(self, dialog: SettingsDialog) -> None:
+    def _rescan_remembered_libraries(
+        self,
+        dialog: SettingsDialog | None = None,
+        *,
+        page: LibraryPage | None = None,
+    ) -> None:
+        def show(message: str) -> None:
+            if dialog is not None:
+                dialog.show_message(message)
+            elif page is not None:
+                page.status.setText(message)
+
         if self._has_running_background_task():
-            dialog.show_message("已有后台任务运行，请完成后再重新检查。")
+            show("已有后台任务运行，请完成后再刷新。")
             return
         paths = self._remembered_settings_paths()
         roots = tuple(
@@ -1385,9 +1399,9 @@ class MainWindow(QMainWindow):
             if path is not None
         )
         if not roots:
-            dialog.show_message("尚未记住音乐、歌词或歌单目录，请先明确选择并完成扫描。")
+            show("尚未记住音乐、歌词或歌单目录，请先明确选择并完成扫描。")
             return
-        dialog.show_message(f"正在重新检查 {len(roots)} 个已记住目录…")
+        show(f"正在刷新 {len(roots)} 个已记住目录…")
         self._queue_library_refresh(roots)
 
     def _choose_playlist_root(self, dialog: SettingsDialog) -> None:
@@ -1650,6 +1664,13 @@ class MainWindow(QMainWindow):
         if self._has_running_background_task():
             page.status.setText("已有后台任务运行，请完成后再执行删除或移除。")
             return
+        states = {str(record.get("_file_state", "active")) for record in records}
+        if "external_changed" in states:
+            page.status.setText("外部变化文件仍存在；请先点击“刷新”重新确认，再执行删除。")
+            return
+        if page.playlist_name is None and states == {"active", "missing"}:
+            page.status.setText("请分别选择正常文件和缺失记录执行操作，避免混合语义。")
+            return
         dialog = self._create_delete_dialog(page, records)
         if dialog.exec() != dialog.DialogCode.Accepted:
             return
@@ -1683,7 +1704,10 @@ class MainWindow(QMainWindow):
                     )
                     for record in records
                 )
-                self._backup_controller.start_backup(items)
+                if states == {"missing"}:
+                    self._backup_controller.start_dismiss_missing(items)
+                else:
+                    self._backup_controller.start_backup(items)
             except Exception as error:
                 page.status.setText(f"无法备份删除：{error}")
 
@@ -1699,8 +1723,8 @@ class MainWindow(QMainWindow):
         asset_id = record.get("_asset_id")
         if not isinstance(asset_id, str) or not isinstance(path, Path) or not isinstance(allowed_root, Path):
             raise ValueError("所选记录缺少可验证的扫描来源，请重新扫描")
-        if record.get("_file_state", "active") != "active":
-            raise ValueError("只允许备份删除 active 文件")
+        if record.get("_file_state", "active") not in {"active", "missing"}:
+            raise ValueError("只允许备份正常文件或清理缺失记录")
         size_bytes = record.get("_size_bytes")
         mtime_ns = record.get("_mtime_ns")
         return BackupInput(
@@ -1719,6 +1743,7 @@ class MainWindow(QMainWindow):
             "backup": "已安全移入备份",
             "restore": "已恢复备份",
             "cleanup": "已永久清理到期备份",
+            "dismiss": "已清理缺失记录",
         }.get(action, "备份操作已完成")
         message = f"{action_label} {getattr(result, 'success_count', 0)} 项，失败 {getattr(result, 'failure_count', 0)} 项"
         current = self.stack.currentWidget()
@@ -1729,8 +1754,29 @@ class MainWindow(QMainWindow):
             self._settings_dialog.show_message(message)
         if self._history_dialog is not None:
             self._history_dialog.close()
-        if action in {"backup", "restore"}:
+        if action == "dismiss":
+            self._reload_visible_libraries()
+        elif action in {"backup", "restore"}:
             self._queue_library_refresh(getattr(result, "affected_roots", ()))
+
+    def _reload_visible_libraries(self) -> None:
+        for controller, replace_library in (
+            (self._scan_controller, self._replace_music_library),
+            (self._lyrics_match_controller, self._replace_lyrics_library),
+        ):
+            if controller is None:
+                continue
+            try:
+                records = (
+                    controller.load_library()
+                    if controller is self._scan_controller
+                    else controller.load_lyrics_library()
+                )
+                replace_library(records)
+            except Exception as error:
+                current = self.stack.currentWidget()
+                if isinstance(current, LibraryPage):
+                    current.status.setText(f"记录已清理，但刷新列表失败：{error}")
 
     def _backup_failed(self, message: str) -> None:
         if self._settings_dialog is not None:

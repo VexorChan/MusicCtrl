@@ -333,6 +333,45 @@ class LibraryRepositoryTests(unittest.TestCase):
         self.assertEqual(states["mtime.mp3"], "external_changed")
         self.assertEqual(states["both.mp3"], "external_changed")
 
+    def test_hidden_missing_asset_is_unhidden_when_scan_finds_it_again(self) -> None:
+        repository = self.create_repository()
+        scan_root = self.root / "scan"
+        source = scan_root / "returns.mp3"
+        asset = repository.upsert_asset(
+            AssetUpsert(source, 10, 100, file_state="missing")
+        )
+
+        repository.set_assets_hidden(
+            (asset.id,),
+            hidden=True,
+            expected_kind="audio",
+            expected_state="missing",
+        )
+        self.assertEqual(repository.list_hidden_asset_ids(), (asset.id,))
+
+        session = repository.create_scan_session(mode="audio", source_folder=scan_root)
+        indexed = repository.index_scan_batch(
+            session.id,
+            (IndexBatchItem(source, 10, 100),),
+        )[0].asset
+
+        self.assertEqual(indexed.file_state, "active")
+        self.assertEqual(repository.list_hidden_asset_ids(), ())
+
+    def test_hiding_fails_closed_when_asset_state_changed(self) -> None:
+        repository = self.create_repository()
+        asset = repository.upsert_asset(self.audio("active.mp3"))
+
+        with self.assertRaisesRegex(RepositoryDataError, "状态已变化"):
+            repository.set_assets_hidden(
+                (asset.id,),
+                hidden=True,
+                expected_kind="audio",
+                expected_state="missing",
+            )
+
+        self.assertEqual(repository.list_hidden_asset_ids(), ())
+
     def test_generic_asset_upsert_keeps_explicit_state_behavior(self) -> None:
         repository = self.create_repository()
         source = self.root / "music" / "explicit.mp3"
