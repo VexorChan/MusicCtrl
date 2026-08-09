@@ -66,6 +66,10 @@ class RevalidatedAudioRecord:
         return self.asset_id
 
 
+class AudioFileDriftError(ValueError):
+    """The indexed active audio no longer matches the current filesystem fact."""
+
+
 def _path_key(path: Path) -> str:
     return os.path.normcase(os.path.normpath(os.path.abspath(os.fspath(path))))
 
@@ -147,15 +151,15 @@ def revalidate_audio_snapshots(
             with _locked_directory_chain(allowed_root, asset.canonical_path.parent):
                 metadata = os.lstat(asset.canonical_path)
         except OSError as error:
-            raise ValueError(f"音乐文件不存在或无法访问：{asset.file_name}") from error
+            raise AudioFileDriftError(f"音乐文件不存在或无法访问：{asset.file_name}") from error
         if (
             not stat.S_ISREG(metadata.st_mode)
             or stat.S_ISLNK(metadata.st_mode)
             or _is_reparse(metadata)
         ):
-            raise ValueError(f"音乐路径不是安全普通文件：{asset.file_name}")
+            raise AudioFileDriftError(f"音乐路径不是安全普通文件：{asset.file_name}")
         if metadata.st_size != asset.size_bytes or metadata.st_mtime_ns != asset.mtime_ns:
-            raise ValueError(f"音乐文件已在外部变化，请重新扫描：{asset.file_name}")
+            raise AudioFileDriftError(f"音乐文件已在外部变化，请重新扫描：{asset.file_name}")
         results.append(
             RevalidatedAudioRecord(
                 asset.id,

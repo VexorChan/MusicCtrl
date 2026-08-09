@@ -40,6 +40,7 @@ from services.playlist_controller import (
 from services.backup_manager import BackupInput
 from services.history_service import HistoryService
 from services.library_scan_controller import (
+    AudioFileDriftError,
     AudioAssetSnapshot,
     RevalidatedAudioRecord,
 )
@@ -317,6 +318,19 @@ class MainWindow(QMainWindow):
                 launched = launched[0]
             if not launched and not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent))):
                 raise RuntimeError("系统无法打开资源管理器或文件所在目录")
+        except AudioFileDriftError as error:
+            record = records[0] if isinstance(records, tuple) and len(records) == 1 else None
+            root = record.get("_allowed_root") if isinstance(record, dict) else None
+            if isinstance(root, Path) and root.is_absolute():
+                self._context_status(f"无法打开所在文件夹：{error}；正在后台刷新文件状态…")
+                refresh_roots = [("audio", root)]
+                remembered = self._scan_controller.remembered_root() if self._scan_controller else None
+                if isinstance(remembered, Path) and remembered.is_absolute() and remembered != root:
+                    # 历史来源先刷新，当前记住的目录最后刷新，避免维护操作改变用户设置。
+                    refresh_roots.append(("audio", remembered))
+                self._queue_library_refresh(tuple(refresh_roots))
+            else:
+                self._context_status(f"无法打开所在文件夹：{error}；请点击“刷新”重新检查。")
         except Exception as error:
             self._context_status(f"无法打开所在文件夹：{error}")
 
@@ -1453,26 +1467,35 @@ class MainWindow(QMainWindow):
             )
             if path is not None
         )
-        marked_roots: tuple[tuple[str, Path], ...] = ()
-        if page is not None and page.kind in {"music", "lyrics"}:
-            kind = "audio" if page.kind == "music" else "lyric"
-            marked_roots = tuple(
-                dict.fromkeys(
-                    (kind, root)
-                    for record in page.all_data
-                    if record.get("_file_state") in {"missing", "external_changed"}
-                    and isinstance((root := record.get("_allowed_root")), Path)
-                    and root.is_absolute()
-                )
+        source_pages = (
+            (page,)
+            if page is not None and page.kind in {"music", "lyrics"}
+            else tuple(
+                candidate
+                for key in ("所有音乐", "所有歌词")
+                if isinstance((candidate := self.pages.get(key)), LibraryPage)
             )
-        # 先检查已标记记录所在的旧目录，再检查已记住目录。后者放在最后可避免
-        # 维护刷新意外改变用户当前记住的目录。
-        roots = tuple(dict.fromkeys(marked_roots + remembered_roots))
+        )
+        indexed_roots = tuple(
+            dict.fromkeys(
+                (
+                    "audio" if source_page.kind == "music" else "lyric",
+                    root,
+                )
+                for source_page in source_pages
+                for record in source_page.all_data
+                if isinstance((root := record.get("_allowed_root")), Path)
+                and root.is_absolute()
+            )
+        )
+        # 先检查当前列表涉及的全部历史扫描来源，再检查已记住目录。否则旧来源中
+        # 仍标为 active、但已从磁盘删除的记录永远不会进入 reconcile。
+        roots = tuple(dict.fromkeys(indexed_roots + remembered_roots))
         if not roots:
             show("尚未记住音乐、歌词或歌单目录，请先明确选择并完成扫描。")
             return
-        if marked_roots:
-            show(f"正在刷新 {len(roots)} 个目录（含已标记文件所在目录）…")
+        if indexed_roots:
+            show(f"正在刷新 {len(roots)} 个目录（含当前列表的历史扫描来源）…")
         else:
             show(f"正在刷新 {len(roots)} 个已记住目录…")
         self._queue_library_refresh(roots)

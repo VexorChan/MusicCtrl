@@ -199,16 +199,24 @@ class UiRefreshTests(unittest.TestCase):
         self._events()
         self.assertEqual(lyric.started, [source, target, target, source])
 
-    def test_main_refresh_rechecks_marked_record_roots_before_remembered_roots(self) -> None:
+    def test_main_refresh_rechecks_every_indexed_root_before_remembered_root(self) -> None:
         audio = FakeLibraryController()
         window = self._window(audio=audio)
         page = window.pages["所有音乐"]
+        active_root = self.root / "old-active-library"
         marked_root = self.root / "old-library"
         remembered_root = self.root / "current-library"
+        active_root.mkdir()
         marked_root.mkdir()
         remembered_root.mkdir()
         page.replace_data(
             (
+                {
+                    "title": "索引仍正常但磁盘已变化",
+                    "artist": "文件",
+                    "_file_state": "active",
+                    "_allowed_root": active_root,
+                },
                 {
                     "title": "待复核",
                     "artist": "文件",
@@ -230,11 +238,14 @@ class UiRefreshTests(unittest.TestCase):
         ):
             window._rescan_remembered_libraries(page=page)
 
-        self.assertEqual(audio.started, [marked_root])
-        self.assertIn("已标记文件所在目录", page.status.text())
+        self.assertEqual(audio.started, [active_root])
+        self.assertIn("当前列表的历史扫描来源", page.status.text())
         audio.finish()
         self._events()
-        self.assertEqual(audio.started, [marked_root, remembered_root])
+        self.assertEqual(audio.started, [active_root, marked_root])
+        audio.finish()
+        self._events()
+        self.assertEqual(audio.started, [active_root, marked_root, remembered_root])
 
     def test_backup_restore_roots_refresh_sequentially_and_cleanup_never_refreshes(self) -> None:
         first = self.root / "first"

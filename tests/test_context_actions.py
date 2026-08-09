@@ -144,6 +144,26 @@ class ContextActionTests(unittest.TestCase):
         fallback_url = fallback.call_args.args[0]
         self.assertEqual(Path(fallback_url.toLocalFile()), asset.canonical_path.parent)
 
+    def test_open_location_missing_file_refreshes_source_and_updates_file_status(self) -> None:
+        audio_root = self.root / "audio"
+        asset = self._seed_audio(audio_root, "消失-文件.wav")
+        scan = LibraryScanController(self.config)
+        window = MainWindow(scan_controller=scan)
+        self.addCleanup(window.close)
+        record = dict(scan.load_library()[0])
+        asset.canonical_path.unlink()
+
+        with mock.patch("ui.main_window.QProcess.startDetached") as launch:
+            window._open_selected_location((record,))
+        launch.assert_not_called()
+        self.assertTrue(scan.running)
+        self.assertIn("正在后台刷新文件状态", window.pages["所有音乐"].status.text())
+        self._wait(scan)
+
+        refreshed = window.pages["所有音乐"].all_data[0]
+        self.assertEqual(refreshed["_file_state"], "missing")
+        self.assertEqual(refreshed["file_status"], "文件缺失")
+
     def test_context_actions_reject_non_active_snapshot_and_forged_provenance(self) -> None:
         audio_root = self.root / "audio"
         self._seed_audio(audio_root, "A-甲.wav")
