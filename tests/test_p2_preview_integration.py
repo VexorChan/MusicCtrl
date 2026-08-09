@@ -214,6 +214,8 @@ class P2PreviewIntegrationTests(unittest.TestCase):
         self.assertIs(record["_canonical_path"], path)
         self.assertEqual(record["_allowed_root"], self.root)
         self.assertEqual(record["_file_state"], "external_changed")
+        self.assertEqual(record["status"], "未检查")
+        self.assertEqual(record["file_status"], "外部变化")
         self.assertIsInstance(record["_size_bytes"], int)
         self.assertIsInstance(record["_mtime_ns"], int)
         self.assertEqual((record["title"], record["artist"]), ("标题", "歌手"))

@@ -15,6 +15,7 @@ from PySide6.QtCore import QObject, QThread, Signal
 from database import DatabaseConfig
 from repositories import LibraryRepository
 from services.file_safety import _is_reparse, _locked_directory_chain
+from services.library_scan_controller import file_status_text, lyrics_status_text
 from services.windows_shortcuts import (
     ShortcutConflictError,
     create_playlist_directory,
@@ -1351,6 +1352,10 @@ class PlaylistController(QObject):
         folder = root / matching[0]
         with LibraryRepository(self._database_config) as repository:
             assets = repository.list_assets(kind="audio")
+            matches = {
+                match.audio_asset_id: match.source_kind
+                for match in repository.list_lyrics_matches(current_only=True)
+            }
         by_path = {
             os.path.normcase(os.path.normpath(os.fspath(asset.canonical_path))): asset
             for asset in assets
@@ -1370,19 +1375,23 @@ class PlaylistController(QObject):
                         "duration": "—",
                         "format": "LNK",
                         "size": "—",
-                        "status": f"损坏：{error}",
+                        "status": "未检查",
+                        "file_status": "快捷方式损坏",
+                        "_file_status_detail": f"快捷方式损坏：{error}",
                     }
                 )
                 continue
             if asset is None:
-                status = "目标未索引"
+                lyric_status = "未检查"
+                file_status = "目标未索引"
                 title, artist = info.target_path.stem, "待识别"
                 size = "—"
                 extension = info.target_path.suffix.lstrip(".").upper()
             else:
                 stem = Path(asset.file_name).stem
                 title, artist = (stem.rsplit("-", 1) + ["待识别"])[:2] if "-" in stem else (stem, "待识别")
-                status = "正常" if asset.file_state == "active" else asset.file_state
+                lyric_status = lyrics_status_text(matches.get(asset.id))
+                file_status = file_status_text(asset.file_state)
                 size = _human_size(asset.size_bytes)
                 extension = asset.extension.lstrip(".").upper()
             rows.append(
@@ -1394,7 +1403,8 @@ class PlaylistController(QObject):
                     "duration": "—",
                     "format": extension,
                     "size": size,
-                    "status": status,
+                    "status": lyric_status,
+                    "file_status": file_status,
                 }
             )
         return tuple(rows)

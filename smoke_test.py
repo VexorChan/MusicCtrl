@@ -152,18 +152,21 @@ def run() -> None:
     assert music.table.rowCount() == 0
     assert music.content_stack.currentIndex() == 1
     music.apply_search_immediately("")
-    assert music.table.columnCount() == 7
-    assert [music.table.horizontalHeaderItem(column).text() for column in range(7)] == [
-        "", "歌名", "歌手", "时长", "格式", "大小", "歌词状态"
+    assert music.table.columnCount() == 8
+    assert [music.table.horizontalHeaderItem(column).text() for column in range(8)] == [
+        "", "歌名", "歌手", "时长", "格式", "大小", "歌词状态", "文件状态"
     ]
     checkable_header = music.table.require_checkable_header()
     assert isinstance(checkable_header, CheckableHeaderView)
     assert checkable_header.check_state() == Qt.CheckState.Unchecked
     assert checkable_header.checkbox.checkState() == Qt.CheckState.Unchecked
     assert not music.table.wordWrap()
-    assert music.table.columnWidth(6) >= 132
+    assert music.table.columnWidth(6) >= 114
+    assert music.table.columnWidth(7) >= 100
     assert music.table.item(0, 6).text() == ""
     assert music.table.item(0, 6).toolTip() == "未检查"
+    assert music.table.item(0, 7).text() == ""
+    assert music.table.item(0, 7).toolTip() == "正常"
     assert not music.add_button.isEnabled()
     assert not music.delete_button.isEnabled()
 
@@ -302,16 +305,16 @@ def run() -> None:
     assert delete_requests == []
 
     lyrics = window.pages["所有歌词"]
-    assert lyrics.table.columnCount() == 6
-    assert [lyrics.table.horizontalHeaderItem(column).text() for column in range(6)] == [
-        "", "歌名", "歌手", "格式", "大小", "歌词状态"
+    assert lyrics.table.columnCount() == 7
+    assert [lyrics.table.horizontalHeaderItem(column).text() for column in range(7)] == [
+        "", "歌名", "歌手", "格式", "大小", "歌词状态", "文件状态"
     ]
     assert any(item["status"] == "已有内嵌歌词" for item in window.pages["所有音乐"].all_data)
     cantonese = window.pages["playlist:粤语"]
     assert cantonese.playlist_note is not None
     assert cantonese.playlist_note.text() == "从歌单移除只会删除快捷方式，不会删除音乐文件。"
-    assert [cantonese.table.horizontalHeaderItem(column).text() for column in range(7)] == [
-        "", "歌名", "歌手", "时长", "格式", "大小", "歌词状态"
+    assert [cantonese.table.horizontalHeaderItem(column).text() for column in range(8)] == [
+        "", "歌名", "歌手", "时长", "格式", "大小", "歌词状态", "文件状态"
     ]
 
     music_delete_dialog = window._create_delete_dialog(music, [music.all_data[0]])
@@ -341,8 +344,8 @@ def run() -> None:
         app.processEvents()
         assert window.size().toTuple() == (width, height)
         assert window.sidebar.width() == 216
-        assert music.table.columnWidth(1) >= 135
-        assert music.table.columnWidth(2) >= 135
+        assert music.table.columnWidth(1) >= 105
+        assert music.table.columnWidth(2) >= 105
         for button in window.toolbar.buttons_by_text.values():
             assert button.isVisible()
             assert button.geometry().right() <= window.toolbar.width()

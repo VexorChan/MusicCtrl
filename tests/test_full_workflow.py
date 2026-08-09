@@ -103,6 +103,10 @@ class FullWorkflowTests(unittest.TestCase):
                 1,
                 repr(review.items),
             )
+        music_record = scan.load_library()[0]
+        self.assertEqual(music_record["status"], "已匹配")
+        self.assertEqual(music_record["file_status"], "正常")
+        self.assertEqual(lyrics.load_lyrics_library()[0]["file_status"], "正常")
 
         playlist = PlaylistController(self.database_config)
         playlist.set_root(playlists)
@@ -112,7 +116,10 @@ class FullWorkflowTests(unittest.TestCase):
             (PlaylistAudioInput(asset.id, renamed, media, "active"),),
         )
         self.wait(playlist)
-        self.assertEqual(len(playlist.load_playlist("通勤")), 1)
+        playlist_rows = playlist.load_playlist("通勤")
+        self.assertEqual(len(playlist_rows), 1)
+        self.assertEqual(playlist_rows[0]["status"], "已匹配")
+        self.assertEqual(playlist_rows[0]["file_status"], "正常")
 
         incoming = import_source / "新歌-歌手.mp3"
         incoming.write_bytes(b"temporary imported audio")

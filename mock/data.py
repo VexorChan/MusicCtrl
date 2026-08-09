@@ -29,6 +29,10 @@ LYRICS = [
     {"title": "大鱼", "artist": "周深", "format": "LRC", "size": "24 KB", "status": "未检查"},
 ]
 
+for _record in (*SONGS, *LYRICS):
+    _record["file_status"] = "正常"
+del _record
+
 PLAYLISTS = ["我喜欢的", "粤语", "通勤", "怀旧", "古巨基"]
 
 PLAYLIST_MAP = {

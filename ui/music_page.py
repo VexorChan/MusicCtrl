@@ -161,13 +161,13 @@ class LibraryTableModel(QAbstractTableModel):
 
     def columns(self) -> tuple[str, ...]:
         if self.kind == "lyrics":
-            return ("", "歌名", "歌手", "格式", "大小", "歌词状态")
-        return ("", "歌名", "歌手", "时长", "格式", "大小", "歌词状态")
+            return ("", "歌名", "歌手", "格式", "大小", "歌词状态", "文件状态")
+        return ("", "歌名", "歌手", "时长", "格式", "大小", "歌词状态", "文件状态")
 
     def fields(self) -> tuple[str, ...]:
         if self.kind == "lyrics":
-            return ("title", "artist", "format", "size", "status")
-        return ("title", "artist", "duration", "format", "size", "status")
+            return ("title", "artist", "format", "size", "status", "file_status")
+        return ("title", "artist", "duration", "format", "size", "status", "file_status")
 
     def replace_records(self, records: Iterable[dict[str, object]]) -> None:
         self.beginResetModel()
@@ -205,7 +205,9 @@ class LibraryTableModel(QAbstractTableModel):
             return record.get("_index", index.row())
         if role == Qt.ItemDataRole.TextAlignmentRole and field in {"duration", "format", "size"}:
             return int(Qt.AlignmentFlag.AlignCenter)
-        if role == Qt.ItemDataRole.ToolTipRole and field == "status":
+        if role == Qt.ItemDataRole.ToolTipRole and field in {"status", "file_status"}:
+            if field == "file_status":
+                return str(record.get("_file_status_detail", record.get(field, "")))
             return str(record.get(field, ""))
         return None
 
@@ -339,10 +341,14 @@ class LibraryPage(QWidget):
             self.table = ModelDataTable(checkable_header=True)
             self._table_model = LibraryTableModel(kind=self.kind, parent=self.table)
             self.table.setModel(self._table_model)
-            self.table.setItemDelegateForColumn(
+            for column in (
+                len(self._table_model.columns()) - 2,
                 len(self._table_model.columns()) - 1,
-                StatusBadgeDelegate(self.table),
-            )
+            ):
+                self.table.setItemDelegateForColumn(
+                    column,
+                    StatusBadgeDelegate(self.table),
+                )
             self._table_model.check_state_changed.connect(self._update_selection_state)
         else:
             self.table = DataTable(checkable_header=True)
@@ -403,13 +409,13 @@ class LibraryPage(QWidget):
 
     def _columns(self) -> list[str]:
         if self.kind == "lyrics":
-            return ["", "歌名", "歌手", "格式", "大小", "歌词状态"]
-        return ["", "歌名", "歌手", "时长", "格式", "大小", "歌词状态"]
+            return ["", "歌名", "歌手", "格式", "大小", "歌词状态", "文件状态"]
+        return ["", "歌名", "歌手", "时长", "格式", "大小", "歌词状态", "文件状态"]
 
     def _field_order(self) -> list[str]:
         if self.kind == "lyrics":
-            return ["title", "artist", "format", "size", "status"]
-        return ["title", "artist", "duration", "format", "size", "status"]
+            return ["title", "artist", "format", "size", "status", "file_status"]
+        return ["title", "artist", "duration", "format", "size", "status", "file_status"]
 
     def _populate_table(self) -> None:
         columns = self._columns()
@@ -419,7 +425,12 @@ class LibraryPage(QWidget):
             self._table_model.replace_records(self.visible_data)
             header = self.table.horizontalHeader()
             header.setMinimumSectionSize(40)
-            for column, width in enumerate((44, 230, 190, 76, 72, 84, 136)):
+            widths = (
+                (44, 220, 180, 60, 72, 116, 102)
+                if self.kind == "lyrics"
+                else (44, 210, 170, 66, 60, 72, 116, 102)
+            )
+            for column, width in enumerate(widths):
                 self.table.setColumnWidth(column, width)
             header.setStretchLastSection(False)
             header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
@@ -449,13 +460,17 @@ class LibraryPage(QWidget):
             for offset, field in enumerate(fields, start=1):
                 value = str(record.get(field, ""))
                 # 状态列由自定义徽标负责显示，底层项目不再重复绘制文字。
-                item = QTableWidgetItem("" if field == "status" else value)
+                item = QTableWidgetItem("" if field in {"status", "file_status"} else value)
                 item.setData(Qt.ItemDataRole.UserRole, record.get("_index", row))
                 if field in {"duration", "format", "size"}:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.table.setItem(row, offset, item)
-                if field == "status":
-                    item.setToolTip(value)
+                if field in {"status", "file_status"}:
+                    item.setToolTip(
+                        str(record.get("_file_status_detail", value))
+                        if field == "file_status"
+                        else value
+                    )
                     self.table.setCellWidget(row, offset, make_status_badge(value))
         header = self.table.horizontalHeader()
         header.setMinimumSectionSize(40)
@@ -463,14 +478,16 @@ class LibraryPage(QWidget):
         self.table.setColumnWidth(1, 230)
         self.table.setColumnWidth(2, 190)
         if self.kind == "lyrics":
-            self.table.setColumnWidth(3, 72)
-            self.table.setColumnWidth(4, 84)
-            self.table.setColumnWidth(5, 136)
-        else:
-            self.table.setColumnWidth(3, 76)
+            self.table.setColumnWidth(3, 60)
             self.table.setColumnWidth(4, 72)
-            self.table.setColumnWidth(5, 84)
-            self.table.setColumnWidth(6, 136)
+            self.table.setColumnWidth(5, 116)
+            self.table.setColumnWidth(6, 102)
+        else:
+            self.table.setColumnWidth(3, 66)
+            self.table.setColumnWidth(4, 60)
+            self.table.setColumnWidth(5, 72)
+            self.table.setColumnWidth(6, 116)
+            self.table.setColumnWidth(7, 102)
         header.setStretchLastSection(False)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)

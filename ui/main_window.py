@@ -179,7 +179,7 @@ class MainWindow(QMainWindow):
             lyrics_match_controller.cancelled.connect(self._lyrics_cancelled)
             lyrics_match_controller.failed.connect(self._lyrics_failed)
             lyrics_match_controller.warning.connect(self._lyrics_warning)
-            lyrics_match_controller.match_changed.connect(self._lyrics_warning)
+            lyrics_match_controller.match_changed.connect(self._lyrics_match_changed)
             lyrics_match_controller.running_changed.connect(self._lyrics_running_changed)
             try:
                 self._replace_lyrics_library(lyrics_match_controller.load_lyrics_library())
@@ -655,6 +655,15 @@ class MainWindow(QMainWindow):
 
     def _replace_lyrics_library(self, records) -> None:
         self.pages["所有歌词"].replace_data(records)
+
+    def _lyrics_match_changed(self, message: str) -> None:
+        self._lyrics_warning(message)
+        if self._scan_controller is None:
+            return
+        try:
+            self._replace_music_library(self._scan_controller.load_library())
+        except Exception as error:
+            self._lyrics_warning(f"歌词关系已更新，但音乐列表刷新失败：{error}")
 
     def _background_running_changed(self, running: bool) -> None:
         if self._settings_dialog is not None:

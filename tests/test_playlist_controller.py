@@ -103,6 +103,8 @@ class PlaylistControllerTests(unittest.TestCase):
         rows = self.controller.load_playlist("通勤")
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["title"], "晴天")
+        self.assertEqual(rows[0]["status"], "未检查")
+        self.assertEqual(rows[0]["file_status"], "正常")
         shortcut = rows[0]["_shortcut_path"]
         self.assertTrue(shortcut.is_file())
 
@@ -113,6 +115,24 @@ class PlaylistControllerTests(unittest.TestCase):
         self._wait()
         self.assertEqual(self.controller.load_playlist("通勤"), ())
         self.assertEqual((self.audio.read_bytes(), self.audio.stat().st_mtime_ns), snapshot)
+
+    def test_load_playlist_reports_unindexed_and_broken_shortcut_file_status(self) -> None:
+        unindexed = self.audio_root / "未索引-歌手.mp3"
+        unindexed.write_bytes(b"unindexed")
+        create_shortcut(
+            target_path=unindexed,
+            audio_root=self.audio_root,
+            shortcut_path=self.playlist_root / "通勤" / "未索引.lnk",
+            playlist_root=self.playlist_root,
+        )
+        broken = self.playlist_root / "通勤" / "损坏.lnk"
+        broken.write_bytes(b"not-a-shortcut")
+
+        rows = {row["title"]: row for row in self.controller.load_playlist("通勤")}
+
+        self.assertEqual(rows["未索引-歌手"]["file_status"], "目标未索引")
+        self.assertEqual(rows["损坏"]["file_status"], "快捷方式损坏")
+        self.assertIn("快捷方式损坏", rows["损坏"]["_file_status_detail"])
 
     def test_duplicate_is_skipped_without_overwrite(self) -> None:
         results = []

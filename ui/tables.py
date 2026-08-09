@@ -213,7 +213,11 @@ class StatusBadgeDelegate(QStyledItemDelegate):
             return
         colors = {
             "失败": ("#fde8e8", "#9b1c1c"),
+            "文件缺失": ("#fde8e8", "#9b1c1c"),
+            "快捷方式损坏": ("#fde8e8", "#9b1c1c"),
             "冲突": ("#fff1d6", "#8a4b08"),
+            "外部变化": ("#fff1d6", "#8a4b08"),
+            "目标未索引": ("#fff1d6", "#8a4b08"),
             "已忽略": ("#eeeeee", "#555555"),
             "未匹配": ("#fff1d6", "#8a4b08"),
         }

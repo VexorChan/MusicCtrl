@@ -26,6 +26,7 @@ from services.lyrics_scanner import (
 from services.library_scan_controller import (
     AudioAssetSnapshot,
     RevalidatedAudioRecord,
+    file_status_text,
     revalidate_audio_snapshots,
 )
 from services.file_safety import _is_reparse, _locked_directory_chain, _within_root
@@ -908,6 +909,7 @@ class LyricsMatchController(QObject):
                         "format": asset.extension.lstrip(".").upper(),
                         "size": _human_size(asset.size_bytes),
                         "status": "已匹配" if asset.id in matched_ids else "未匹配",
+                        "file_status": file_status_text(asset.file_state),
                     }
                 )
             return tuple(records)

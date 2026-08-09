@@ -17,6 +17,23 @@ from services.scan_worker import ReadOnlyScanWorker
 
 
 LAST_SUCCESSFUL_ROOT_KEY = "p1.last_successful_audio_root"
+FILE_STATE_LABELS = {
+    "active": "正常",
+    "missing": "文件缺失",
+    "external_changed": "外部变化",
+}
+
+
+def file_status_text(file_state: str) -> str:
+    return FILE_STATE_LABELS.get(file_state, "状态异常")
+
+
+def lyrics_status_text(source_kind: str | None) -> str:
+    if source_kind == "embedded":
+        return "已有内嵌歌词"
+    if source_kind == "external":
+        return "已匹配"
+    return "未检查"
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +186,7 @@ def asset_to_music_record(
     asset: AssetRecord,
     *,
     allowed_root: Path | None = None,
+    lyrics_status: str = "未检查",
 ) -> dict[str, object]:
     stem = Path(asset.file_name).stem
     title = stem
@@ -178,11 +196,6 @@ def asset_to_music_record(
         if parsed_title and parsed_artist:
             title = parsed_title
             artist = parsed_artist
-    status = {
-        "active": "未检查",
-        "missing": "文件缺失",
-        "external_changed": "外部变化",
-    }.get(asset.file_state, "未检查")
     return {
         "_asset_id": asset.id,
         "_canonical_path": asset.canonical_path,
@@ -195,7 +208,8 @@ def asset_to_music_record(
         "duration": "—",
         "format": asset.extension.lstrip(".").upper(),
         "size": _human_size(asset.size_bytes),
-        "status": status,
+        "status": lyrics_status,
+        "file_status": file_status_text(asset.file_state),
     }
 
 
@@ -228,8 +242,16 @@ class LibraryScanController(QObject):
             assets = repository.list_assets(kind="audio")
             hidden = set(repository.list_hidden_asset_ids())
             roots = repository.latest_completed_audio_roots(asset.id for asset in assets)
+            matches = {
+                match.audio_asset_id: match.source_kind
+                for match in repository.list_lyrics_matches(current_only=True)
+            }
             return tuple(
-                asset_to_music_record(asset, allowed_root=roots.get(asset.id))
+                asset_to_music_record(
+                    asset,
+                    allowed_root=roots.get(asset.id),
+                    lyrics_status=lyrics_status_text(matches.get(asset.id)),
+                )
                 for asset in assets
                 if asset.id not in hidden
             )

@@ -25,6 +25,7 @@ def _record(index: int, *, title: str | None = None, artist: str | None = None):
         "format": "MP3",
         "size": "5 MB",
         "status": "未检查",
+        "file_status": "正常",
     }
 
 
@@ -42,6 +43,18 @@ class LibraryModelTests(unittest.TestCase):
         )
         self.assertIsInstance(page.table, QTableView)
         self.assertIsInstance(page.table.model(), QAbstractTableModel)
+        self.assertEqual(page.table.model().columnCount(), 8)
+        self.assertEqual(
+            [
+                page.table.model().headerData(column, Qt.Orientation.Horizontal)
+                for column in range(8)
+            ],
+            ["", "歌名", "歌手", "时长", "格式", "大小", "歌词状态", "文件状态"],
+        )
+        self.assertEqual(
+            page.table.model().data(page.table.model().index(0, 7)),
+            "正常",
+        )
         page.table.selectRow(0)
         model = page.table.model()
         self.assertTrue(
@@ -75,6 +88,23 @@ class LibraryModelTests(unittest.TestCase):
             ["asset-0", "asset-2"],
         )
         self.assertTrue(page.table.horizontalHeader().isSortIndicatorShown())
+
+        page._sort_records("file_status", False)
+        self.assertEqual(page.sort_key, "file_status")
+
+    def test_lyrics_model_places_file_status_after_lyrics_status(self) -> None:
+        record = _record(0)
+        record.update({"format": "LRC", "status": "已匹配", "file_status": "外部变化"})
+        page = LibraryPage("所有歌词", (record,), kind="lyrics", use_model_view=True)
+        model = page.table.model()
+
+        self.assertEqual(model.columnCount(), 7)
+        self.assertEqual(
+            [model.headerData(column, Qt.Orientation.Horizontal) for column in range(7)],
+            ["", "歌名", "歌手", "格式", "大小", "歌词状态", "文件状态"],
+        )
+        self.assertEqual(model.data(model.index(0, 5)), "已匹配")
+        self.assertEqual(model.data(model.index(0, 6)), "外部变化")
 
     def test_model_reload_clears_selection_checks_and_sort_but_keeps_search(self) -> None:
         page = LibraryPage(

@@ -93,6 +93,7 @@ class P4IntegrationTests(unittest.TestCase):
 
         self.assertEqual(len(window.pages["所有歌词"].all_data), 1)
         self.assertEqual(window.pages["所有歌词"].all_data[0]["status"], "已匹配")
+        self.assertEqual(window.pages["所有歌词"].all_data[0]["file_status"], "正常")
         self.assertIn("已索引 1 个 LRC", window._lyrics_dialog.summary.text())
 
     def test_no_p4_controller_keeps_m1_mock_dialog(self) -> None:

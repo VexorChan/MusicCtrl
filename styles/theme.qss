@@ -94,9 +94,9 @@ QHeaderView::section {
 }
 QTableCornerButton::section { background: #f5f5f5; border: 0; border-bottom: 1px solid #d7d7d7; }
 QLabel#StatusBadge { border-radius: 9px; padding: 2px 8px; font-size: 12px; }
-QLabel[status="已匹配"], QLabel[status="成功"], QLabel[status="导入成功"], QLabel[status="可导入"], QLabel[status="可自动处理"] { background: #e8f3ea; color: #34663f; }
-QLabel[status="可能匹配"], QLabel[status="部分成功"], QLabel[status="名称待确认"], QLabel[status="待手动确认"], QLabel[status="校验中"] { background: #fff2d9; color: #835d16; }
-QLabel[status="冲突"], QLabel[status="内容冲突"], QLabel[status="导入失败"] { background: #fbe9e8; color: #973e37; }
+QLabel[status="已匹配"], QLabel[status="成功"], QLabel[status="导入成功"], QLabel[status="可导入"], QLabel[status="可自动处理"], QLabel[status="正常"] { background: #e8f3ea; color: #34663f; }
+QLabel[status="可能匹配"], QLabel[status="部分成功"], QLabel[status="名称待确认"], QLabel[status="待手动确认"], QLabel[status="校验中"], QLabel[status="外部变化"], QLabel[status="目标未索引"] { background: #fff2d9; color: #835d16; }
+QLabel[status="冲突"], QLabel[status="内容冲突"], QLabel[status="导入失败"], QLabel[status="文件缺失"], QLabel[status="快捷方式损坏"] { background: #fbe9e8; color: #973e37; }
 QLabel[status="已有内嵌歌词"] { background: #e4eff8; color: #315f82; }
 QLabel[status="未检查"], QLabel[status="未匹配"], QLabel[status="等待处理"], QLabel[status="重复文件"], QLabel[status="已跳过"], QLabel[status="目标文件已存在"] { background: #eeeeee; color: #606060; }
 
