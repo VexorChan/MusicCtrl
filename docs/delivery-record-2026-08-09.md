@@ -1,5 +1,20 @@
 # 2026-08-09 本机稳定交付记录
 
+## 2026-08-09 08:05 缺失记录清理与主页面刷新维护交付
+
+- `RUNTIME_HEAD=896d2e1d56ecfcb009421a5988b996fa208b94ef`，构建时已回读 `ORIGIN_MAIN_AT_BUILD` 完全一致。
+- `python -W error::ResourceWarning -m unittest discover -q`：408 项通过；`compileall`、`smoke_test.py`、`git diff --check` 通过。
+- 系统共享 Python 环境的 `pip check` 存在与本项目无关的旧包冲突；未修改该共享环境。实际构建使用 `.venv-build`，其 `pip check` 为 `No broken requirements found.`。
+- 独立构建工作树：`work/p8-final-896d2e1-20260809-080217`；Python 3.13.5、PyInstaller 6.21.0、PySide6 6.9.2、Mutagen 1.48.1、pywin32 308。
+- 构建 EXE 从项目目录外启动并保持运行 5 秒，无提前退出；安装 EXE 再次从项目外启动，窗口标题回读为“乐库整理助手”。
+- 960×600 窗口在 125% 和 150% Qt 缩放下，“刷新”及相邻操作按钮完整可见且无重叠。离屏平台未正确栅格化中文字体，因此这两张维护截图只作为几何布局证据，不冒充字体渲染验收。
+- `MusicCtrl.exe` SHA-256：`60732C8F931B31E9D4718FAC99463AC94C54E256688340B020954E75AF01C6D6`。
+- `SHA256SUMS.txt` 共 225 个条目并全部回读；含清单自身的构建包与安装目录均为 226 个文件，文件集合与逐文件 SHA-256 完全一致。
+- 安装目录：`%LOCALAPPDATA%\Programs\MusicCtrl`；安装目录内数据库、日志或备份文件为 0。
+- 旧安装恢复副本：`%LOCALAPPDATA%\Programs\MusicCtrl-backup-20260809-080535`，未删除。
+- 桌面快捷方式回读目标为 `%LOCALAPPDATA%\Programs\MusicCtrl\MusicCtrl.exe`，工作目录为 `%LOCALAPPDATA%\Programs\MusicCtrl`，图标为该 EXE 资源 0。
+- 本节之后的提交只更新受版本控制的交付记录，不改变已构建运行时；最终仍要求文档提交推送后 `HEAD == origin/main`、ahead/behind `0/0`。
+
 ## 提交关系
 
 - `RUNTIME_HEAD=fb89f8df685c80a7804d8fbd2a7150a701bc658f`

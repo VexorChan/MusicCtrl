@@ -5,7 +5,7 @@
 - M1～P8 主体功能已完成，项目处于私人、本机、自用稳定维护阶段。
 - 当前分支为 `main`；最终交付要求 `HEAD == origin/main` 且 ahead/behind 为 `0/0`。
 - 当前开发基线为 408 项单元测试；`ResourceWarning` 提升为错误时仍全部通过，并同时执行 `compileall`、`smoke_test.py` 和 `git diff --check`。
-- 最终 EXE 从运行时提交 `fb89f8df685c80a7804d8fbd2a7150a701bc658f` 构建；准确解释器、PyInstaller 和依赖版本以安装目录中的 `BUILD-INFO.txt` 为准。其后的交付记录提交仅含文档，不改变 EXE 来源。
+- 最终 EXE 从运行时提交 `896d2e1d56ecfcb009421a5988b996fa208b94ef` 构建；准确解释器、PyInstaller 和依赖版本以安装目录中的 `BUILD-INFO.txt` 为准。其后的交付记录提交仅含文档，不改变 EXE 来源。
 
 ## 已完成
 
@@ -35,6 +35,7 @@
 
 - 2026-08-09 接管审计确认旧稳定基线 `3647af77ab437842945ebe18a50293b5e03db259` 已有对应安装包：EXE SHA-256 为 `9A16F1E69C81E4E6E501E9EB25D74714C92457F651079645DAE7E775BE8BDC51`，225 个清单文件全部通过，桌面快捷方式指向 `%LOCALAPPDATA%\Programs\MusicCtrl\MusicCtrl.exe`。
 - 本轮最终 EXE 已从运行时提交 `fb89f8df685c80a7804d8fbd2a7150a701bc658f` 隔离构建并安装，SHA-256 为 `4B43D9B7539C90F78CB17EA4C02F0C8E315F543FC10A792435FCB467A5C46FD4`；225 个清单条目和构建包/安装包 226 个文件已全部回读一致。完整证据见 `docs/delivery-record-2026-08-09.md`。
+- 缺失记录清理与主页面刷新修复已从运行时提交 `896d2e1d56ecfcb009421a5988b996fa208b94ef` 重新隔离构建并安装，EXE SHA-256 为 `60732C8F931B31E9D4718FAC99463AC94C54E256688340B020954E75AF01C6D6`；225 个清单条目与构建包/安装包 226 个文件再次全部回读一致。
 - 生产数据库和备份位于 `%LOCALAPPDATA%\LocalMusicTools\乐库整理助手`，安装目录不得包含运行时数据库、日志或备份。
 
 ## 非阻塞 backlog
