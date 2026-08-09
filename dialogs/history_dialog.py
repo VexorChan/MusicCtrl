@@ -31,6 +31,17 @@ _FILTERS = (
 )
 
 
+def _display_time(value: str) -> str:
+    """Render stored ISO timestamps in the user's local, readable format."""
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return str(value)
+    return parsed.astimezone().strftime("%Y-%m-%d %H:%M")
+
+
 def _mock_snapshot() -> HistorySnapshot:
     categories = {
         "导入音频": "import",
@@ -203,7 +214,7 @@ class HistoryDialog(PrototypeDialog):
         self.table.setRowCount(len(self._visible_records))
         for row, record in enumerate(self._visible_records):
             values = (
-                record.created_at,
+                _display_time(record.created_at),
                 record.action,
                 record.success_count,
                 record.failure_count,
@@ -215,6 +226,7 @@ class HistoryDialog(PrototypeDialog):
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 if column == 0:
                     item.setData(Qt.ItemDataRole.UserRole, record)
+                    item.setToolTip(record.created_at)
                 if column == 4:
                     item.setData(Qt.ItemDataRole.UserRole, record.status)
                     item.setToolTip(str(value))
@@ -249,11 +261,11 @@ class HistoryDialog(PrototypeDialog):
                 "" if detail.target_path is None else str(detail.target_path),
                 detail.result,
                 detail.reason,
-                detail.completed_at,
+                _display_time(detail.completed_at),
             )
             for column, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
-                item.setToolTip(str(value))
+                item.setToolTip(detail.completed_at if column == 5 else str(value))
                 self.detail_table.setItem(row, column, item)
         self.restore_button.setEnabled(bool(record is not None and record.restore_ids))
         self.undo_import_button.setEnabled(bool(record is not None and record.undoable))

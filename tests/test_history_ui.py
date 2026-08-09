@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -98,6 +99,18 @@ class HistoryUiTests(unittest.TestCase):
             self.assertIn(f"{category}-source", dialog.detail_table.item(0, 1).text())
             self.assertIn(f"{category}-target", dialog.detail_table.item(0, 2).text())
             self.assertEqual(dialog.detail_table.item(0, 4).text(), f"{category}-reason")
+
+    def test_iso_timestamps_are_displayed_as_readable_local_time(self) -> None:
+        dialog = HistoryDialog(snapshot=HistorySnapshot((self.records[0],)))
+        self.addCleanup(dialog.close)
+        expected = datetime.fromisoformat(self.records[0].created_at).astimezone().strftime(
+            "%Y-%m-%d %H:%M"
+        )
+
+        self.assertEqual(dialog.table.item(0, 0).text(), expected)
+        self.assertEqual(dialog.table.item(0, 0).toolTip(), self.records[0].created_at)
+        self.assertEqual(dialog.detail_table.item(0, 5).text(), expected)
+        self.assertEqual(dialog.detail_table.item(0, 5).toolTip(), self.records[0].created_at)
 
     def test_restore_and_undo_are_enabled_only_by_selected_record_eligibility(self) -> None:
         dialog = HistoryDialog(snapshot=HistorySnapshot(self.records))

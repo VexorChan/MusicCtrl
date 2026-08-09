@@ -204,16 +204,16 @@ class SettingsDialog(PrototypeDialog):
         group = QGroupBox("数据维护")
         group_layout = QVBoxLayout(group)
         actions = [
-            ("重新检查已标记文件", "重新扫描已记住的音乐和歌词目录", self.rescan_requested),
-            ("打开备份目录", "打开当前应用的真实备份目录", self.open_backup_requested),
-            ("清理过期备份", "预览数量和路径后再永久清理", self.cleanup_requested),
+            ("重新检查已标记文件", "重新扫描已记住的音乐和歌词目录", "重新检查", self.rescan_requested),
+            ("打开备份目录", "打开当前应用的真实备份目录", "打开目录", self.open_backup_requested),
+            ("清理过期备份", "预览数量和路径后再永久清理", "清理备份", self.cleanup_requested),
         ] if self.live_mode else [
-            ("重新检查已标记文件", "重新生成模拟检查状态", None),
-            ("打开备份目录", "查看本地备份文件", None),
-            ("清理过期备份", "按保留时间清理过期项目", self.cleanup_requested),
+            ("重新检查已标记文件", "重新生成模拟检查状态", "重新检查", None),
+            ("打开备份目录", "查看本地备份文件", "打开目录", None),
+            ("清理过期备份", "按保留时间清理过期项目", "清理备份", self.cleanup_requested),
         ]
         self.maintenance_buttons: dict[str, QPushButton] = {}
-        for text, hint, signal in actions:
+        for text, hint, button_text, signal in actions:
             row = QHBoxLayout()
             labels = QVBoxLayout()
             labels.addWidget(QLabel(text))
@@ -222,7 +222,9 @@ class SettingsDialog(PrototypeDialog):
             labels.addWidget(small)
             row.addLayout(labels)
             row.addStretch(1)
-            execute = QPushButton("执行")
+            execute = QPushButton(button_text)
+            if text == "清理过期备份":
+                execute.setObjectName("DangerButton")
             if signal is not None:
                 execute.clicked.connect(signal)
             self.maintenance_buttons[text] = execute

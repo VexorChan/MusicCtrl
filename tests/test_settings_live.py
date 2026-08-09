@@ -210,6 +210,21 @@ class SettingsLiveTests(unittest.TestCase):
             set(dialog.maintenance_buttons),
             {"重新检查已标记文件", "打开备份目录", "清理过期备份"},
         )
+        self.assertEqual(
+            {
+                name: button.text()
+                for name, button in dialog.maintenance_buttons.items()
+            },
+            {
+                "重新检查已标记文件": "重新检查",
+                "打开备份目录": "打开目录",
+                "清理过期备份": "清理备份",
+            },
+        )
+        self.assertEqual(
+            dialog.maintenance_buttons["清理过期备份"].objectName(),
+            "DangerButton",
+        )
         self.assertTrue(dialog.playlist_choose_button.isEnabled())
         self.assertTrue(dialog.playlist_refresh_button.isEnabled())
 
