@@ -2,7 +2,7 @@
 
 ## 执行摘要
 
-- 测试版本：当前项目 `HEAD`，通过项目内隔离人工测试入口启动。
+- 测试版本：运行时代码提交 `796cb8c170d42f30d502cac85c2a9c21cd2cc468`，通过项目内隔离人工测试入口启动。
 - 操作方式：Codex 电脑插件模拟普通用户点击与输入。
 - 来源目录：`C:\Users\15180\Music\yinyve`。
 - 目标目录：`C:\Users\15180\Music\音乐`。
@@ -62,4 +62,9 @@
 - smoke：`SMOKE TEST PASSED`。
 - 依赖：`pip check` 返回 `No broken requirements found.`。
 - Git 检查：`git diff --check` 通过（仅有工作区换行风格提示）。
-- 本轮未安装 EXE：用户授权范围不含项目外安装目录、桌面或应用数据目录。
+- 从运行时提交 `796cb8c170d42f30d502cac85c2a9c21cd2cc468` 在 `work/p8-final-796cb8c-20260809-091001` 独立构建成功。
+- 构建环境：Python 3.13.5、PyInstaller 6.21.0、PySide6 6.9.2、Mutagen 1.48.1、pywin32 308。
+- EXE SHA-256：`49DA06064B644F015690DFCBCAB1B265567FBC69092085BE29DF5EE0E63325D0`。
+- 完整清单共 225 个条目，逐项回读失败 0；加上清单本身共 226 个文件。
+- EXE 从构建目录外启动并保持运行 5 秒；探针将 `LOCALAPPDATA` 重定向到项目内目录，未写入用户真实应用数据目录。
+- 本轮未安装 EXE、未改桌面快捷方式：用户授权范围不含项目外安装目录、桌面或真实应用数据目录。
