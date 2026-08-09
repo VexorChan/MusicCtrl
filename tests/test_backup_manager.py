@@ -221,6 +221,155 @@ class BackupManagerTests(unittest.TestCase):
         with LibraryRepository(self.config) as repository:
             self.assertEqual(repository.list_hidden_asset_ids(), ())
 
+    def test_abnormal_preview_and_cleanup_cover_visible_missing_and_external_changed(self) -> None:
+        missing = self.media_root / "missing.mp3"
+        changed = self.media_root / "changed.mp3"
+        changed.write_bytes(b"changed")
+        lyric_root = self.root / "lyrics"
+        lyric_root.mkdir()
+        lyric = lyric_root / "changed.lrc"
+        lyric.write_text("[00:01]changed", encoding="utf-8")
+        hidden = self.media_root / "already-hidden.mp3"
+        with LibraryRepository(self.config) as repository:
+            audio_session = repository.create_scan_session(mode="audio", source_folder=self.media_root)
+            audio_records = repository.index_scan_batch(
+                audio_session.id,
+                (
+                    IndexBatchItem(self.file, self.file.stat().st_size, self.file.stat().st_mtime_ns),
+                    IndexBatchItem(missing, 10, 10),
+                    IndexBatchItem(changed, changed.stat().st_size, changed.stat().st_mtime_ns),
+                    IndexBatchItem(hidden, 10, 10),
+                ),
+            )
+            repository.complete_scan_and_reconcile(audio_session.id)
+            lyric_session = repository.create_scan_session(mode="lyric", source_folder=lyric_root)
+            lyric_asset = repository.index_scan_batch(
+                lyric_session.id,
+                (IndexBatchItem(lyric, lyric.stat().st_size, lyric.stat().st_mtime_ns, kind="lyric"),),
+            )[0].asset
+            repository.finish_scan_session(lyric_session.id, status="completed")
+            by_name = {record.asset.file_name: record.asset for record in audio_records}
+            missing_asset = repository.upsert_asset(
+                AssetUpsert(missing, 10, 10, file_state="missing")
+            )
+            changed_asset = repository.upsert_asset(
+                AssetUpsert(
+                    changed,
+                    changed.stat().st_size,
+                    changed.stat().st_mtime_ns,
+                    file_state="external_changed",
+                )
+            )
+            lyric_asset = repository.upsert_asset(
+                AssetUpsert(
+                    lyric,
+                    lyric.stat().st_size,
+                    lyric.stat().st_mtime_ns,
+                    kind="lyric",
+                    file_state="external_changed",
+                )
+            )
+            repository.upsert_asset(AssetUpsert(hidden, 10, 10, file_state="missing"))
+            repository.set_assets_hidden(
+                (by_name["already-hidden.mp3"].id,), hidden=True, expected_state="missing"
+            )
+
+        preview = self.controller.abnormal_cleanup_preview()
+        self.assertEqual(
+            (preview.total_count, preview.audio_count, preview.lyric_count),
+            (3, 2, 1),
+        )
+        self.assertEqual((preview.missing_count, preview.external_changed_count), (1, 2))
+        self.assertEqual(
+            {item.asset_id for item in preview.items},
+            {missing_asset.id, changed_asset.id, lyric_asset.id},
+        )
+        self.controller.start_dismiss_abnormal(preview.items)
+        self._wait()
+
+        self.assertTrue(changed.exists())
+        self.assertTrue(lyric.exists())
+        self.assertFalse(self.backup_root.exists())
+        history = self.controller.list_history()
+        self.assertEqual((history[0].action, len(history[0].items)), ("dismiss", 3))
+        with LibraryRepository(self.config) as repository:
+            self.assertEqual(
+                set(repository.list_hidden_asset_ids()),
+                {
+                    by_name["already-hidden.mp3"].id,
+                    missing_asset.id,
+                    changed_asset.id,
+                    lyric_asset.id,
+                },
+            )
+            audio_rescan = repository.create_scan_session(
+                mode="audio", source_folder=self.media_root
+            )
+            repository.index_scan_batch(
+                audio_rescan.id,
+                (
+                    IndexBatchItem(
+                        self.file, self.file.stat().st_size, self.file.stat().st_mtime_ns
+                    ),
+                    IndexBatchItem(
+                        changed, changed.stat().st_size, changed.stat().st_mtime_ns
+                    ),
+                ),
+            )
+            repository.complete_scan_and_reconcile(audio_rescan.id)
+            lyric_rescan = repository.create_scan_session(
+                mode="lyric", source_folder=lyric_root
+            )
+            repository.index_scan_batch(
+                lyric_rescan.id,
+                (
+                    IndexBatchItem(
+                        lyric,
+                        lyric.stat().st_size,
+                        lyric.stat().st_mtime_ns,
+                        kind="lyric",
+                    ),
+                ),
+            )
+            repository.finish_scan_session(lyric_rescan.id, status="completed")
+            self.assertEqual(
+                set(repository.list_hidden_asset_ids()),
+                {by_name["already-hidden.mp3"].id, missing_asset.id},
+            )
+
+    def test_abnormal_cleanup_rejects_batch_atomically_when_record_becomes_active(self) -> None:
+        metadata = self.file.stat()
+        self.file.unlink()
+        with LibraryRepository(self.config) as repository:
+            repository.upsert_asset(
+                AssetUpsert(
+                    self.file,
+                    metadata.st_size,
+                    metadata.st_mtime_ns,
+                    file_state="missing",
+                )
+            )
+        preview = self.controller.abnormal_cleanup_preview()
+        self.file.write_bytes(self.payload)
+        with LibraryRepository(self.config) as repository:
+            repository.upsert_asset(
+                AssetUpsert(
+                    self.file,
+                    self.file.stat().st_size,
+                    self.file.stat().st_mtime_ns,
+                    file_state="active",
+                )
+            )
+        failures: list[str] = []
+        self.controller.failed.connect(failures.append)
+
+        self.controller.start_dismiss_abnormal(preview.items)
+        self._wait()
+
+        self.assertEqual(len(failures), 1)
+        with LibraryRepository(self.config) as repository:
+            self.assertEqual(repository.list_hidden_asset_ids(), ())
+
     def test_linked_lyrics_default_off_and_opt_in_group_restore(self) -> None:
         lyric_root, lyric_path, lyric_asset, match = self._seed_linked_lyric()
         self.controller.start_backup(

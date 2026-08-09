@@ -84,6 +84,7 @@ class MainWindow(QMainWindow):
         self._safe_import_recovery_active = False
         self._playlist_retarget_recovery_queued = False
         self._pending_safe_rename_items: tuple[SafeRenameInput, ...] = ()
+        self._abnormal_cleanup_active = False
         self.setWindowTitle("乐库整理助手")
         app = QApplication.instance()
         if app is not None and not app.windowIcon().isNull():
@@ -1315,6 +1316,9 @@ class MainWindow(QMainWindow):
             dialog.cleanup_requested.connect(
                 lambda current=dialog: self._cleanup_backups(current)
             )
+            dialog.abnormal_cleanup_requested.connect(
+                lambda current=dialog: self._cleanup_abnormal_records(current)
+            )
             dialog.open_backup_requested.connect(
                 lambda current=dialog: self._open_backup_directory(current)
             )
@@ -1379,6 +1383,41 @@ class MainWindow(QMainWindow):
             dialog.show_message(f"无法打开备份目录：{error}")
             return
         dialog.show_message(f"已打开备份目录：{root}")
+
+    def _cleanup_abnormal_records(self, dialog: SettingsDialog) -> None:
+        if self._backup_controller is None:
+            return
+        if self._has_running_background_task():
+            dialog.show_message("已有后台任务运行，请完成后再删除异常文件记录。")
+            return
+        try:
+            preview = self._backup_controller.abnormal_cleanup_preview()
+        except Exception as error:
+            dialog.show_message(f"无法统计异常文件记录：{error}")
+            return
+        if preview.total_count <= 0:
+            dialog.show_message("当前没有异常文件记录。")
+            return
+        answer = QMessageBox.warning(
+            dialog,
+            "确认删除异常文件记录",
+            f"将从列表隐藏 {preview.total_count} 条异常文件记录：\n"
+            f"音乐 {preview.audio_count} 条，歌词 {preview.lyric_count} 条；\n"
+            f"文件缺失 {preview.missing_count} 条，外部变化 {preview.external_changed_count} 条。\n\n"
+            "不会删除或修改磁盘文件，SQLite 索引和审计记录仍会保留。\n"
+            "外部变化文件可能仍然存在于磁盘；重新扫描发现文件后会恢复显示。是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self._backup_controller.start_dismiss_abnormal(preview.items)
+            self._abnormal_cleanup_active = True
+            dialog.set_maintenance_running(True)
+            dialog.show_message("正在后台删除已确认的异常文件记录…")
+        except Exception as error:
+            dialog.show_message(f"无法删除异常文件记录：{error}")
 
     def _rescan_remembered_libraries(
         self,
@@ -1764,11 +1803,12 @@ class MainWindow(QMainWindow):
 
     def _backup_completed(self, result: object) -> None:
         action = getattr(result, "action", "backup")
+        self._abnormal_cleanup_active = False
         action_label = {
             "backup": "已安全移入备份",
             "restore": "已恢复备份",
             "cleanup": "已永久清理到期备份",
-            "dismiss": "已清理缺失记录",
+            "dismiss": "已清理异常记录",
         }.get(action, "备份操作已完成")
         message = f"{action_label} {getattr(result, 'success_count', 0)} 项，失败 {getattr(result, 'failure_count', 0)} 项"
         current = self.stack.currentWidget()
@@ -1804,12 +1844,18 @@ class MainWindow(QMainWindow):
                     current.status.setText(f"记录已清理，但刷新列表失败：{error}")
 
     def _backup_failed(self, message: str) -> None:
+        abnormal_cleanup = self._abnormal_cleanup_active
+        self._abnormal_cleanup_active = False
         if self._settings_dialog is not None:
             self._settings_dialog.set_maintenance_running(False)
-            self._settings_dialog.show_message(f"备份操作失败：{message}")
+            self._settings_dialog.show_message(
+                f"{'异常记录清理' if abnormal_cleanup else '备份操作'}失败：{message}"
+            )
         current = self.stack.currentWidget()
         if isinstance(current, LibraryPage):
-            current.status.setText(f"备份删除失败：{message}")
+            current.status.setText(
+                f"{'异常记录清理' if abnormal_cleanup else '备份删除'}失败：{message}"
+            )
 
     def _create_delete_dialog(self, page: LibraryPage, records: list[dict]) -> QDialog:
         if page.playlist_name:

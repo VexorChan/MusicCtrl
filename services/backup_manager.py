@@ -125,6 +125,19 @@ class BackupCleanupPreview:
     eligible_count: int
 
 
+@dataclass(frozen=True, slots=True)
+class AbnormalCleanupPreview:
+    items: tuple[BackupInput, ...]
+    audio_count: int
+    lyric_count: int
+    missing_count: int
+    external_changed_count: int
+
+    @property
+    def total_count(self) -> int:
+        return len(self.items)
+
+
 def _aware_datetime(value: object, *, label: str) -> datetime:
     if not isinstance(value, str) or not value:
         raise BackupError(f"{label}损坏")
@@ -488,17 +501,17 @@ class BackupWorker(QThread):
             if (
                 asset is None
                 or asset.kind != item.kind
-                or asset.file_state != "missing"
+                or asset.file_state not in {"missing", "external_changed"}
                 or _path_key(asset.canonical_path) != _path_key(item.source_path)
                 or expected_root is None
                 or _path_key(expected_root) != _path_key(item.allowed_root)
-                or os.path.lexists(item.source_path)
+                or (asset.file_state == "missing" and os.path.lexists(item.source_path))
             ):
                 raise BackupError("异常记录已变化或文件仍存在，请重新扫描")
         repository.set_assets_hidden(
             (item.asset_id for item in requested),
             hidden=True,
-            expected_state="missing",
+            expected_states={"missing", "external_changed"},
         )
         for item in requested:
             details.append(
@@ -510,7 +523,7 @@ class BackupWorker(QThread):
                     backup_path=None,
                     restore_target=None,
                     result="success",
-                    message="已从列表清理缺失记录；索引审计仍保留",
+                    message="已从列表清理异常记录；索引审计仍保留",
                 )
             )
         return BackupRunResult(
@@ -2059,6 +2072,48 @@ class BackupController(QObject):
                 eligible_count += 1
         return BackupCleanupPreview(self._backup_root, retention_days, eligible_count)
 
+    def abnormal_cleanup_preview(self) -> AbnormalCleanupPreview:
+        with self._repository_factory() as repository:
+            hidden = set(repository.list_hidden_asset_ids())
+            assets = tuple(
+                asset
+                for asset in repository.list_assets()
+                if asset.id not in hidden
+                and asset.file_state in {"missing", "external_changed"}
+            )
+            audio_roots = repository.latest_completed_audio_roots(
+                asset.id for asset in assets if asset.kind == "audio"
+            )
+            lyric_roots = repository.latest_completed_lyric_roots(
+                asset.id for asset in assets if asset.kind == "lyric"
+            )
+        items: list[BackupInput] = []
+        for asset in assets:
+            allowed_root = (
+                audio_roots.get(asset.id)
+                if asset.kind == "audio"
+                else lyric_roots.get(asset.id)
+            )
+            if not isinstance(allowed_root, Path) or not allowed_root.is_absolute():
+                raise BackupError(f"异常记录缺少可信扫描来源：{asset.file_name}")
+            items.append(
+                BackupInput(
+                    asset.id,
+                    asset.canonical_path,
+                    allowed_root,
+                    asset.kind,
+                    expected_size_bytes=asset.size_bytes,
+                    expected_mtime_ns=asset.mtime_ns,
+                )
+            )
+        return AbnormalCleanupPreview(
+            tuple(items),
+            sum(asset.kind == "audio" for asset in assets),
+            sum(asset.kind == "lyric" for asset in assets),
+            sum(asset.file_state == "missing" for asset in assets),
+            sum(asset.file_state == "external_changed" for asset in assets),
+        )
+
     def start_backup(self, items: tuple[BackupInput, ...]) -> None:
         self._start("backup", items)
 
@@ -2072,6 +2127,9 @@ class BackupController(QObject):
         self._start("cleanup", (), retention_days=effective)
 
     def start_dismiss_missing(self, items: tuple[BackupInput, ...]) -> None:
+        self._start("dismiss", items)
+
+    def start_dismiss_abnormal(self, items: tuple[BackupInput, ...]) -> None:
         self._start("dismiss", items)
 
     def _start(self, action: str, payload: tuple[object, ...], *, retention_days: int = 7) -> None:

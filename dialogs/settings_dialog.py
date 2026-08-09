@@ -24,6 +24,7 @@ from dialogs.common import PrototypeDialog, dialog_header
 class SettingsDialog(PrototypeDialog):
     save_requested = Signal(object)
     cleanup_requested = Signal()
+    abnormal_cleanup_requested = Signal()
     open_backup_requested = Signal()
     rescan_requested = Signal()
     playlist_root_requested = Signal()
@@ -205,10 +206,12 @@ class SettingsDialog(PrototypeDialog):
         group_layout = QVBoxLayout(group)
         actions = [
             ("重新检查已标记文件", "重新扫描已记住的音乐和歌词目录", "重新检查", self.rescan_requested),
+            ("一键删除异常文件记录", "隐藏缺失和外部变化记录，保留索引审计和磁盘文件", "删除记录", self.abnormal_cleanup_requested),
             ("打开备份目录", "打开当前应用的真实备份目录", "打开目录", self.open_backup_requested),
             ("清理过期备份", "预览数量和路径后再永久清理", "清理备份", self.cleanup_requested),
         ] if self.live_mode else [
             ("重新检查已标记文件", "重新生成模拟检查状态", "重新检查", None),
+            ("一键删除异常文件记录", "隐藏模拟异常记录，不删除磁盘文件", "删除记录", None),
             ("打开备份目录", "查看本地备份文件", "打开目录", None),
             ("清理过期备份", "按保留时间清理过期项目", "清理备份", self.cleanup_requested),
         ]
@@ -223,7 +226,7 @@ class SettingsDialog(PrototypeDialog):
             row.addLayout(labels)
             row.addStretch(1)
             execute = QPushButton(button_text)
-            if text == "清理过期备份":
+            if text in {"一键删除异常文件记录", "清理过期备份"}:
                 execute.setObjectName("DangerButton")
             if signal is not None:
                 execute.clicked.connect(signal)

@@ -7,7 +7,7 @@
 - 标记为“P1 v1 已部署”的表、字段、约束、索引和事务已经存在于当前 migration。
 - 标记为“P2-B1 v2 已部署”的重命名审计表和 repository 状态机已经存在于当前 migration；v2 本身不执行文件重命名。
 - P2-C 已复用 v2 rename operation 的 `after_json.metadata_sync` 保存原始/写入标签快照和实际新指纹，没有新增 schema；P4 v3 只新增最小 `lyrics_matches`。
-- P5 使用 `p5.playlist_root`、`p5.operation_history`、`p5.pending_retargets`；其中 pending retarget v2 区分 `discover` 与 `apply`，v1 按 `apply` 兼容读取，阶段转换以 batch ID、旧值完整 JSON 的条件更新防止并发覆盖。P6 使用 `p6.import_history`、`p6.pending_import`、`p6.last_paths`；P7 使用 `p7.backup_entries`、`p7.retention_days`、`p7.operation_history`、`p7.pending_cleanup`、`p7.pending_linked_backup` 和 `p7.hidden_asset_ids`。最后一项只保存用户已确认清理的 `missing` 资产 ID，不删除 `assets` 或审计记录；索引批次再次发现对应资产时原子移除该 ID。
+- P5 使用 `p5.playlist_root`、`p5.operation_history`、`p5.pending_retargets`；其中 pending retarget v2 区分 `discover` 与 `apply`，v1 按 `apply` 兼容读取，阶段转换以 batch ID、旧值完整 JSON 的条件更新防止并发覆盖。P6 使用 `p6.import_history`、`p6.pending_import`、`p6.last_paths`；P7 使用 `p7.backup_entries`、`p7.retention_days`、`p7.operation_history`、`p7.pending_cleanup`、`p7.pending_linked_backup` 和 `p7.hidden_asset_ids`。最后一项只保存用户已确认清理的 `missing` 或 `external_changed` 资产 ID，不删除 `assets`、审计记录或磁盘文件；索引批次再次发现对应资产时原子移除该 ID。
 - 这些值全部通过 repository 严格 JSON 读写和校验；未来的规范化表仅是可选演进方向，不代表当前功能未完成。
 - 后续新增正式字段或表时，必须先更新设计、增加连续 migration，并完成升级、回滚和数据保留测试。
 

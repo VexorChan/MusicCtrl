@@ -2172,11 +2172,13 @@ class LibraryRepository:
         hidden: bool,
         expected_kind: str | None = None,
         expected_state: str | None = None,
+        expected_states: Iterable[str] | None = None,
     ) -> None:
         """Hide stale list records without deleting assets or audit history."""
 
         self._require_open_in_owner_thread()
         requested = tuple(asset_ids)
+        allowed_states = None if expected_states is None else frozenset(expected_states)
         if (
             not requested
             or any(not isinstance(item, str) or not item.strip() for item in requested)
@@ -2188,6 +2190,12 @@ class LibraryRepository:
             _require_choice(expected_kind, ASSET_KINDS, field_name="kind")
         if expected_state is not None:
             _require_choice(expected_state, ASSET_STATES, field_name="file_state")
+        if expected_state is not None and allowed_states is not None:
+            raise RepositoryDataError("待隐藏资产状态条件不能重复指定")
+        if allowed_states is not None and (
+            not allowed_states or not allowed_states.issubset(ASSET_STATES)
+        ):
+            raise RepositoryDataError("待隐藏资产状态条件无效")
         placeholders = ",".join("?" for _ in requested)
         with self._transaction():
             rows = self._connection.execute(
@@ -2200,6 +2208,7 @@ class LibraryRepository:
             if any(
                 (expected_kind is not None and row["kind"] != expected_kind)
                 or (expected_state is not None and row["file_state"] != expected_state)
+                or (allowed_states is not None and row["file_state"] not in allowed_states)
                 for row in rows
             ):
                 raise RepositoryDataError("待隐藏资产类型或状态已变化")

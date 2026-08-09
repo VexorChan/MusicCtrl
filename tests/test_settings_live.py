@@ -208,7 +208,7 @@ class SettingsLiveTests(unittest.TestCase):
         self.assertNotIn("、", texts)
         self.assertEqual(
             set(dialog.maintenance_buttons),
-            {"重新检查已标记文件", "打开备份目录", "清理过期备份"},
+            {"重新检查已标记文件", "一键删除异常文件记录", "打开备份目录", "清理过期备份"},
         )
         self.assertEqual(
             {
@@ -217,12 +217,17 @@ class SettingsLiveTests(unittest.TestCase):
             },
             {
                 "重新检查已标记文件": "重新检查",
+                "一键删除异常文件记录": "删除记录",
                 "打开备份目录": "打开目录",
                 "清理过期备份": "清理备份",
             },
         )
         self.assertEqual(
             dialog.maintenance_buttons["清理过期备份"].objectName(),
+            "DangerButton",
+        )
+        self.assertEqual(
+            dialog.maintenance_buttons["一键删除异常文件记录"].objectName(),
             "DangerButton",
         )
         self.assertTrue(dialog.playlist_choose_button.isEnabled())
@@ -413,6 +418,58 @@ class SettingsLiveTests(unittest.TestCase):
         self.assertIn("已永久清理", dialog.status.text())  # type: ignore[union-attr]
         window._backup_failed("deterministic cleanup failure")
         self.assertIn("cleanup failure", dialog.status.text())  # type: ignore[union-attr]
+
+    def test_abnormal_cleanup_previews_counts_requires_confirmation_and_starts_batch(self) -> None:
+        window, _audio, _lyrics = self._window()
+        window.open_settings()
+        dialog = window._settings_dialog
+        self.assertIsNotNone(dialog)
+        button = dialog.maintenance_buttons["一键删除异常文件记录"]  # type: ignore[union-attr]
+        items = (object(), object(), object())
+        preview = SimpleNamespace(
+            items=items,
+            total_count=3,
+            audio_count=2,
+            lyric_count=1,
+            missing_count=1,
+            external_changed_count=2,
+        )
+
+        with patch.object(self.backup, "abnormal_cleanup_preview", return_value=preview), patch.object(
+            self.backup, "start_dismiss_abnormal"
+        ) as started, patch(
+            "ui.main_window.QMessageBox.warning",
+            return_value=QMessageBox.StandardButton.No,
+        ) as warning:
+            button.click()
+        started.assert_not_called()
+        message = warning.call_args.args[2]
+        for expected in ("音乐 2 条", "歌词 1 条", "文件缺失 1 条", "外部变化 2 条", "可能仍然存在"):
+            self.assertIn(expected, message)
+
+        with patch.object(self.backup, "abnormal_cleanup_preview", return_value=preview), patch.object(
+            self.backup, "start_dismiss_abnormal"
+        ) as started, patch(
+            "ui.main_window.QMessageBox.warning",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            button.click()
+        started.assert_called_once_with(items)
+        self.assertIn("正在后台删除", dialog.status.text())  # type: ignore[union-attr]
+        self.assertFalse(button.isEnabled())
+
+    def test_abnormal_cleanup_empty_preview_does_not_confirm(self) -> None:
+        window, _audio, _lyrics = self._window()
+        window.open_settings()
+        dialog = window._settings_dialog
+        preview = SimpleNamespace(total_count=0)
+        with patch.object(self.backup, "abnormal_cleanup_preview", return_value=preview), patch.object(
+            self.backup, "start_dismiss_abnormal"
+        ) as started, patch("ui.main_window.QMessageBox.warning") as warning:
+            dialog.maintenance_buttons["一键删除异常文件记录"].click()  # type: ignore[union-attr]
+        started.assert_not_called()
+        warning.assert_not_called()
+        self.assertIn("当前没有异常", dialog.status.text())  # type: ignore[union-attr]
 
 
 if __name__ == "__main__":
