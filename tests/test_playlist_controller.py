@@ -17,6 +17,7 @@ import services.playlist_controller as playlist_module
 from services.playlist_controller import (
     PENDING_RETARGET_KEY,
     PLAYLIST_HISTORY_KEY,
+    PLAYLIST_PINNED_KEY,
     PLAYLIST_ROOT_KEY,
     PlaylistAudioInput,
     PlaylistController,
@@ -115,6 +116,83 @@ class PlaylistControllerTests(unittest.TestCase):
         self._wait()
         self.assertEqual(self.controller.load_playlist("通勤"), ())
         self.assertEqual((self.audio.read_bytes(), self.audio.stat().st_mtime_ns), snapshot)
+
+    def test_rename_pin_and_delete_playlist_preserve_audio(self) -> None:
+        media_before = (self.audio.read_bytes(), self.audio.stat().st_mtime_ns)
+        self.controller.create_playlist("怀旧")
+        self.controller.set_playlist_pinned("通勤", True)
+        self.controller.set_playlist_pinned("怀旧", True)
+        self.assertEqual(self.controller.ordered_playlist_names(), ("怀旧", "通勤"))
+
+        self.controller.start_rename_playlist("怀旧", "夜晚")
+        self._wait()
+        self.assertTrue((self.playlist_root / "夜晚").is_dir())
+        self.assertFalse((self.playlist_root / "怀旧").exists())
+        self.assertEqual(self.controller.pinned_playlists(), ("夜晚", "通勤"))
+
+        item = PlaylistAudioInput(self.asset.id, self.audio, self.audio_root, "active")
+        self.controller.start_add("夜晚", (item,))
+        self._wait()
+        self.controller.start_delete_playlist("夜晚")
+        self._wait()
+        self.assertFalse((self.playlist_root / "夜晚").exists())
+        self.assertEqual(self.controller.pinned_playlists(), ("通勤",))
+        self.assertEqual((self.audio.read_bytes(), self.audio.stat().st_mtime_ns), media_before)
+        self.assertEqual(self._setting_value(PLAYLIST_PINNED_KEY), ["通勤"])
+
+        actions = [entry.action for entry in self.controller.list_history()]
+        self.assertIn("rename", actions)
+        self.assertIn("delete", actions)
+
+    def test_delete_playlist_with_unknown_or_broken_item_fails_closed(self) -> None:
+        unknown = self.playlist_root / "通勤" / "note.txt"
+        unknown.write_text("not managed", encoding="utf-8")
+        failures: list[str] = []
+        self.controller.failed.connect(failures.append)
+
+        self.controller.start_delete_playlist("通勤")
+        self._wait()
+
+        self.assertTrue((self.playlist_root / "通勤").is_dir())
+        self.assertTrue(unknown.is_file())
+        self.assertTrue(self.audio.is_file())
+        self.assertTrue(failures)
+        self.assertIn("未知或不安全", failures[-1])
+
+    def test_rename_playlist_rejects_windows_equivalent_collision(self) -> None:
+        self.controller.create_playlist("夜晚")
+        failures: list[str] = []
+        self.controller.failed.connect(failures.append)
+
+        self.controller.start_rename_playlist("通勤", "夜晚")
+        self._wait()
+
+        self.assertTrue((self.playlist_root / "通勤").is_dir())
+        self.assertTrue((self.playlist_root / "夜晚").is_dir())
+        self.assertTrue(failures)
+        self.assertIn("已存在", failures[-1])
+
+    def test_rename_reports_failure_when_pinned_setting_cannot_follow_file_change(self) -> None:
+        self.controller.set_playlist_pinned("通勤", True)
+        results = []
+        warnings: list[str] = []
+        self.controller.completed.connect(results.append)
+        self.controller.warning.connect(warnings.append)
+        original_set = LibraryRepository.set_setting
+
+        def fail_pinned(repository, key, value):
+            if key == PLAYLIST_PINNED_KEY:
+                raise RuntimeError("deterministic pin failure")
+            return original_set(repository, key, value)
+
+        with patch.object(LibraryRepository, "set_setting", new=fail_pinned):
+            self.controller.start_rename_playlist("通勤", "夜晚")
+            self._wait()
+
+        self.assertTrue((self.playlist_root / "夜晚").is_dir())
+        self.assertEqual(results[-1].status, "failed")
+        self.assertEqual(results[-1].failure_count, 1)
+        self.assertTrue(any("置顶状态同步失败" in message for message in warnings))
 
     def test_load_playlist_reports_unindexed_and_broken_shortcut_file_status(self) -> None:
         unindexed = self.audio_root / "未索引-歌手.mp3"

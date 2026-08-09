@@ -20,17 +20,21 @@ from services.windows_shortcuts import (
     ShortcutConflictError,
     create_playlist_directory,
     create_shortcut,
+    inspect_playlist_shortcuts,
     read_shortcut,
+    remove_empty_playlist_directory,
     remove_shortcut,
+    rename_playlist_directory,
 )
 
 
 PLAYLIST_ROOT_KEY = "p5.playlist_root"
 PLAYLIST_HISTORY_KEY = "p5.operation_history"
+PLAYLIST_PINNED_KEY = "p5.pinned_playlists"
 PENDING_RETARGET_KEY = "p5.pending_retargets"
 _RETARGET_JOURNAL_VERSION = 2
 _PLAYLIST_HISTORY_LIMIT = 200
-_PLAYLIST_ACTIONS = {"create", "add", "remove", "retarget"}
+_PLAYLIST_ACTIONS = {"create", "add", "remove", "retarget", "rename", "delete"}
 _PLAYLIST_TERMINALS = {"completed", "cancelled", "failed"}
 _PLAYLIST_ITEM_RESULTS = {"success", "skipped", "failed", "cancelled"}
 
@@ -754,6 +758,204 @@ class PlaylistShortcutWorker(QThread):
             self.failed.emit(str(error).strip() or error.__class__.__name__)
 
 
+class PlaylistManagementWorker(QThread):
+    """Rename or delete one playlist without touching target audio files."""
+
+    completed = Signal(object)
+    cancelled = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        *,
+        database_config: DatabaseConfig,
+        playlist_root: Path,
+        playlist_name: str,
+        action: str,
+        new_name: str | None = None,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        if action not in {"rename", "delete"}:
+            raise ValueError("不支持的歌单管理操作")
+        if action == "rename" and not isinstance(new_name, str):
+            raise ValueError("重命名歌单缺少新名称")
+        self._database_config = database_config
+        self._playlist_root = playlist_root
+        self._playlist_name = playlist_name
+        self._action = action
+        self._new_name = new_name
+        self._created_at = datetime.now(timezone.utc).isoformat()
+        self._cancel = threading.Event()
+
+    def request_cancel(self) -> None:
+        self._cancel.set()
+        self.requestInterruption()
+
+    def _result(
+        self,
+        *,
+        playlist_name: str,
+        status: str,
+        details: list[PlaylistItemResult],
+        messages: list[str] | None = None,
+    ) -> PlaylistOperationResult:
+        return PlaylistOperationResult(
+            playlist_name,
+            sum(item.result == "success" for item in details),
+            sum(item.result == "skipped" for item in details),
+            sum(item.result == "failed" for item in details),
+            tuple(messages or ()),
+            (playlist_name,),
+            self._action,
+            status,
+            self._created_at,
+            tuple(details),
+        )
+
+    def run(self) -> None:
+        try:
+            root_identity = _directory_identity(self._playlist_root)
+            source_folder = self._playlist_root / self._playlist_name
+            if self._cancel.is_set():
+                detail = PlaylistItemResult(source_folder, None, "cancelled", "未执行：操作已取消")
+                self.cancelled.emit(
+                    self._result(
+                        playlist_name=self._playlist_name,
+                        status="cancelled",
+                        details=[detail],
+                    )
+                )
+                return
+            if self._action == "rename":
+                assert self._new_name is not None
+                source_identity = _directory_identity(source_folder)
+                destination = rename_playlist_directory(
+                    playlist_root=self._playlist_root,
+                    current_name=self._playlist_name,
+                    new_name=self._new_name,
+                )
+                if _directory_identity(self._playlist_root) != root_identity:
+                    raise ValueError("歌单根在重命名期间发生变化")
+                if _directory_identity(destination) != source_identity:
+                    raise ValueError("重命名后的歌单目录身份不一致")
+                self.completed.emit(
+                    self._result(
+                        playlist_name=destination.name,
+                        status="completed",
+                        details=[
+                            PlaylistItemResult(source_folder, destination, "success", "已重命名歌单")
+                        ],
+                    )
+                )
+                return
+
+            folder_identity = _directory_identity(source_folder)
+            with LibraryRepository(self._database_config) as repository:
+                allowed_targets = tuple(
+                    asset.canonical_path
+                    for asset in repository.list_assets(kind="audio")
+                    if asset.file_state == "active"
+                )
+            infos = inspect_playlist_shortcuts(
+                playlist_root=self._playlist_root,
+                name=self._playlist_name,
+                allowed_targets=allowed_targets,
+            )
+            if _directory_identity(self._playlist_root) != root_identity:
+                raise ValueError("歌单根在删除预检期间发生变化")
+            if _directory_identity(source_folder) != folder_identity:
+                raise ValueError("歌单目录在删除预检期间被替换")
+            details: list[PlaylistItemResult] = []
+            for index, info in enumerate(infos):
+                if self._cancel.is_set():
+                    details.extend(
+                        PlaylistItemResult(
+                            remaining.path,
+                            remaining.target_path,
+                            "cancelled",
+                            "未执行：操作已取消",
+                        )
+                        for remaining in infos[index:]
+                    )
+                    self.cancelled.emit(
+                        self._result(
+                            playlist_name=self._playlist_name,
+                            status="cancelled",
+                            details=details,
+                        )
+                    )
+                    return
+                if _directory_identity(source_folder) != folder_identity:
+                    raise ValueError("歌单目录在删除期间被替换，已停止后续操作")
+                try:
+                    remove_shortcut(
+                        shortcut_path=info.path,
+                        playlist_root=self._playlist_root,
+                        expected_target=info.target_path,
+                    )
+                except Exception as error:
+                    message = str(error).strip() or error.__class__.__name__
+                    details.append(
+                        PlaylistItemResult(info.path, info.target_path, "failed", message)
+                    )
+                    details.extend(
+                        PlaylistItemResult(
+                            remaining.path,
+                            remaining.target_path,
+                            "cancelled",
+                            "未执行：前一项删除失败",
+                        )
+                        for remaining in infos[index + 1 :]
+                    )
+                    self.completed.emit(
+                        self._result(
+                            playlist_name=self._playlist_name,
+                            status="failed",
+                            details=details,
+                            messages=[message],
+                        )
+                    )
+                    return
+                details.append(
+                    PlaylistItemResult(info.path, info.target_path, "success", "已删除受管快捷方式")
+                )
+            try:
+                if _directory_identity(source_folder) != folder_identity:
+                    raise ValueError("歌单目录在删除期间被替换，拒绝删除目录")
+                remove_empty_playlist_directory(
+                    playlist_root=self._playlist_root,
+                    name=self._playlist_name,
+                )
+            except Exception as error:
+                message = str(error).strip() or error.__class__.__name__
+                details.append(
+                    PlaylistItemResult(source_folder, None, "failed", message)
+                )
+                self.completed.emit(
+                    self._result(
+                        playlist_name=self._playlist_name,
+                        status="failed",
+                        details=details,
+                        messages=[message],
+                    )
+                )
+                return
+            if not infos:
+                details.append(
+                    PlaylistItemResult(source_folder, None, "success", "已删除空歌单")
+                )
+            self.completed.emit(
+                self._result(
+                    playlist_name=self._playlist_name,
+                    status="completed",
+                    details=details,
+                )
+            )
+        except Exception as error:
+            self.failed.emit(str(error).strip() or error.__class__.__name__)
+
+
 class PlaylistRetargetImpactWorker(QThread):
     """Count managed shortcuts affected by a rename without writing anything."""
 
@@ -1203,6 +1405,7 @@ class PlaylistController(QObject):
         self._database_config = database_config
         self._worker: (
             PlaylistShortcutWorker
+            | PlaylistManagementWorker
             | PlaylistRetargetImpactWorker
             | PlaylistRefreshWorker
             | PlaylistRetargetRecoveryLoader
@@ -1324,6 +1527,70 @@ class PlaylistController(QObject):
                 names.append(entry.name)
         return tuple(sorted(names, key=lambda name: (name.casefold(), name)))
 
+    def pinned_playlists(self) -> tuple[str, ...]:
+        with LibraryRepository(self._database_config) as repository:
+            setting = repository.get_setting(PLAYLIST_PINNED_KEY)
+        if setting is None:
+            return ()
+        if not isinstance(setting.value, list) or not all(
+            isinstance(name, str) and name.strip() for name in setting.value
+        ):
+            raise ValueError("置顶歌单设置格式损坏")
+        result: list[str] = []
+        seen: set[str] = set()
+        for name in setting.value:
+            key = _name_key(name)
+            if key not in seen:
+                seen.add(key)
+                result.append(name)
+        return tuple(result)
+
+    def ordered_playlist_names(self, names: object | None = None) -> tuple[str, ...]:
+        available = self.list_playlists() if names is None else tuple(str(name) for name in names)
+        by_key = {_name_key(name): name for name in available}
+        pinned = [by_key[_name_key(name)] for name in self.pinned_playlists() if _name_key(name) in by_key]
+        pinned_keys = {_name_key(name) for name in pinned}
+        remaining = sorted(
+            (name for name in available if _name_key(name) not in pinned_keys),
+            key=lambda name: (name.casefold(), name),
+        )
+        return tuple(pinned + remaining)
+
+    def set_playlist_pinned(self, name: str, pinned: bool) -> tuple[str, ...]:
+        names = self.list_playlists()
+        matching = [item for item in names if _name_key(item) == _name_key(name)]
+        if len(matching) != 1:
+            raise ValueError("歌单不存在或名称不唯一")
+        canonical = matching[0]
+        current = [
+            item for item in self.pinned_playlists()
+            if _name_key(item) != _name_key(canonical)
+        ]
+        if pinned:
+            current.insert(0, canonical)
+        with LibraryRepository(self._database_config) as repository:
+            repository.set_setting(PLAYLIST_PINNED_KEY, current)
+        return self.ordered_playlist_names(names)
+
+    def _sync_pins_after_management(
+        self,
+        old_name: str,
+        result: PlaylistOperationResult,
+    ) -> None:
+        if result.status != "completed" or result.failure_count or result.action not in {"rename", "delete"}:
+            return
+        current = list(self.pinned_playlists())
+        updated: list[str] = []
+        for name in current:
+            if _name_key(name) != _name_key(old_name):
+                updated.append(name)
+            elif result.action == "rename":
+                updated.append(result.playlist_name)
+        if updated == current:
+            return
+        with LibraryRepository(self._database_config) as repository:
+            repository.set_setting(PLAYLIST_PINNED_KEY, updated)
+
     def create_playlist(self, name: str) -> str:
         folder = create_playlist_directory(playlist_root=self._require_root(), name=name)
         result = PlaylistOperationResult(
@@ -1414,6 +1681,52 @@ class PlaylistController(QObject):
 
     def start_remove(self, playlist_name: str, items: tuple[PlaylistRemovalInput, ...]) -> None:
         self._start_worker(playlist_name, remove_items=items)
+
+    def start_rename_playlist(self, playlist_name: str, new_name: str) -> None:
+        self._start_management_worker(
+            playlist_name=playlist_name,
+            action="rename",
+            new_name=new_name,
+        )
+
+    def start_delete_playlist(self, playlist_name: str) -> None:
+        self._start_management_worker(
+            playlist_name=playlist_name,
+            action="delete",
+        )
+
+    def _start_management_worker(
+        self,
+        *,
+        playlist_name: str,
+        action: str,
+        new_name: str | None = None,
+    ) -> None:
+        if self.running:
+            raise RuntimeError("歌单操作已经在运行")
+        worker = PlaylistManagementWorker(
+            database_config=self._database_config,
+            playlist_root=self._require_root(),
+            playlist_name=playlist_name,
+            action=action,
+            new_name=new_name,
+        )
+        worker.completed.connect(lambda result: self._cache("completed", result))
+        worker.cancelled.connect(lambda result: self._cache("cancelled", result))
+        worker.failed.connect(lambda message: self._cache("failed", message))
+        worker.finished.connect(self._finished)
+        self._worker = worker
+        self._terminal = None
+        self._active_action = action
+        self._active_playlist_name = playlist_name
+        self._active_created_at = worker._created_at
+        root = worker._playlist_root
+        target = root / (new_name.strip() if action == "rename" and isinstance(new_name, str) else playlist_name)
+        self._active_items = (
+            PlaylistItemResult(root / playlist_name, target, "failed", ""),
+        )
+        self.running_changed.emit(True)
+        worker.start()
 
     def start_retarget(self, items: tuple[PlaylistRetargetInput, ...]) -> None:
         if self.running:
@@ -1596,6 +1909,34 @@ class PlaylistController(QObject):
                 self._active_created_at or datetime.now(timezone.utc).isoformat(),
                 failed_items,
             )
+        if isinstance(payload, PlaylistOperationResult):
+            try:
+                self._sync_pins_after_management(
+                    self._active_playlist_name,
+                    history_result,
+                )
+            except Exception as error:
+                message = f"歌单文件操作已完成，但置顶状态同步失败：{error}"
+                self.warning.emit(message)
+                failed_detail = PlaylistItemResult(
+                    None,
+                    None,
+                    "failed",
+                    message,
+                )
+                history_result = PlaylistOperationResult(
+                    history_result.playlist_name,
+                    history_result.success_count,
+                    history_result.skipped_count,
+                    history_result.failure_count + 1,
+                    history_result.messages + (message,),
+                    history_result.affected_playlists,
+                    history_result.action,
+                    "failed",
+                    history_result.created_at,
+                    history_result.items + (failed_detail,),
+                )
+                payload = history_result
         history_saved = False
         if (
             self._active_action == "retarget"

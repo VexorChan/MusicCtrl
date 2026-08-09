@@ -34,7 +34,7 @@ class LibraryModelTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         _app()
 
-    def test_production_page_uses_qt_model_view_and_keeps_selection_union(self) -> None:
+    def test_production_page_uses_checks_as_operation_source_of_truth(self) -> None:
         page = LibraryPage(
             "所有音乐",
             (_record(0), _record(1)),
@@ -57,6 +57,7 @@ class LibraryModelTests(unittest.TestCase):
         )
         page.table.selectRow(0)
         model = page.table.model()
+        self.assertEqual(page._checked_rows(), [0])
         self.assertTrue(
             model.setData(
                 model.index(1, 0),
@@ -69,6 +70,64 @@ class LibraryModelTests(unittest.TestCase):
             ["asset-0", "asset-1"],
         )
         self.assertIn("索引来自用户选择目录", page.status.text())
+
+        page.table.clearSelection()
+        self.assertEqual(
+            [record["_asset_id"] for record in page.selected_records()],
+            ["asset-0", "asset-1"],
+        )
+
+    def test_new_row_selection_checks_shift_or_ctrl_selected_rows_without_unchecking_old(self) -> None:
+        page = LibraryPage(
+            "所有音乐",
+            tuple(_record(index) for index in range(5)),
+            use_model_view=True,
+            live_mode=True,
+        )
+        selection = page.table.selectionModel()
+        model = page.table.model()
+        selection.select(
+            model.index(1, 0),
+            selection.SelectionFlag.ClearAndSelect | selection.SelectionFlag.Rows,
+        )
+        selection.select(
+            model.index(3, 0),
+            selection.SelectionFlag.Select | selection.SelectionFlag.Rows,
+        )
+        self.assertEqual(page._checked_rows(), [1, 3])
+
+        selection.clearSelection()
+        self.assertEqual(page._checked_rows(), [1, 3])
+        model.setData(model.index(1, 0), Qt.CheckState.Unchecked, Qt.ItemDataRole.CheckStateRole)
+        self.assertEqual(
+            [record["_asset_id"] for record in page.selected_records()],
+            ["asset-3"],
+        )
+        self.assertIn("已选择 1 项", page.status.text())
+
+    def test_playlist_menu_click_immediately_emits_one_destination_with_checked_records(self) -> None:
+        page = LibraryPage(
+            "所有音乐",
+            (_record(0), _record(1)),
+            use_model_view=True,
+            live_mode=True,
+            playlist_names=("通勤", "怀旧"),
+        )
+        model = page.table.model()
+        model.setData(model.index(1, 0), Qt.CheckState.Checked, Qt.ItemDataRole.CheckStateRole)
+        emitted: list[tuple[object, object]] = []
+        page.add_to_playlists_requested.connect(
+            lambda records, name: emitted.append((records, name))
+        )
+
+        menu = page.create_playlist_menu()
+        menu.playlist_actions["通勤"].trigger()
+
+        self.assertFalse(hasattr(menu, "confirm_button"))
+        self.assertEqual(len(emitted), 1)
+        records, name = emitted[0]
+        self.assertEqual(name, "通勤")
+        self.assertEqual([record["_asset_id"] for record in records], ["asset-1"])
 
     def test_model_search_is_title_first_and_sort_is_stable(self) -> None:
         records = (

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QPoint, Qt, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMenu,
     QPushButton,
     QScrollArea,
     QVBoxLayout,
@@ -26,6 +27,9 @@ APP_ICON_PATH = PROJECT_ROOT / "assets" / "app_icon.png"
 class Sidebar(QWidget):
     navigation_requested = Signal(str)
     create_playlist_requested = Signal()
+    rename_playlist_requested = Signal(str)
+    delete_playlist_requested = Signal(str)
+    pin_playlist_requested = Signal(str, bool)
 
     def __init__(self, parent: QWidget | None = None, *, live_mode: bool = False) -> None:
         super().__init__(parent)
@@ -33,6 +37,8 @@ class Sidebar(QWidget):
         self.setFixedWidth(216)
         self._buttons: dict[str, QPushButton] = {}
         self._playlist_buttons: dict[str, QPushButton] = {}
+        self._pinned_playlists: set[str] = set()
+        self._playlist_management_enabled = True
         self._group = QButtonGroup(self)
         self._group.setExclusive(True)
 
@@ -143,10 +149,22 @@ class Sidebar(QWidget):
         if not name or name in self._playlist_buttons:
             return
         button = self._nav_button(f"playlist:{name}", name)
+        button.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        button.customContextMenuRequested.connect(
+            lambda pos, playlist=name, source=button: self._show_playlist_menu(
+                playlist, source, pos
+            )
+        )
         self._playlist_buttons[name] = button
         self.playlist_layout.insertWidget(self.playlist_layout.count() - 1, button)
 
-    def set_playlists(self, names: tuple[str, ...] | list[str]) -> None:
+    def set_playlists(
+        self,
+        names: tuple[str, ...] | list[str],
+        *,
+        pinned: tuple[str, ...] | list[str] = (),
+    ) -> None:
+        self._pinned_playlists = {str(name) for name in pinned}
         for name, button in tuple(self._playlist_buttons.items()):
             self._group.removeButton(button)
             self._buttons.pop(f"playlist:{name}", None)
@@ -156,3 +174,37 @@ class Sidebar(QWidget):
         for name in names:
             self.add_playlist(name)
         self._filter_playlists(self.search.text())
+
+    def _show_playlist_menu(
+        self,
+        name: str,
+        button: QPushButton,
+        pos: QPoint,
+    ) -> None:
+        menu = self.create_playlist_context_menu(name)
+        menu.exec(button.mapToGlobal(pos))
+
+    def create_playlist_context_menu(self, name: str) -> QMenu:
+        menu = QMenu(self)
+        rename_action = menu.addAction("重命名")
+        delete_action = menu.addAction("删除")
+        menu.addSeparator()
+        is_pinned = name in self._pinned_playlists
+        pin_action = menu.addAction("取消置顶" if is_pinned else "置顶")
+        rename_action.setEnabled(self._playlist_management_enabled)
+        delete_action.setEnabled(self._playlist_management_enabled)
+        pin_action.setEnabled(self._playlist_management_enabled)
+        rename_action.triggered.connect(
+            lambda _checked=False: self.rename_playlist_requested.emit(name)
+        )
+        delete_action.triggered.connect(
+            lambda _checked=False: self.delete_playlist_requested.emit(name)
+        )
+        pin_action.triggered.connect(
+            lambda _checked=False: self.pin_playlist_requested.emit(name, not is_pinned)
+        )
+        return menu
+
+    def set_playlist_management_enabled(self, enabled: bool) -> None:
+        self._playlist_management_enabled = bool(enabled)
+        self.add_playlist_button.setEnabled(self._playlist_management_enabled)

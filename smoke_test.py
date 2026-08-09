@@ -188,8 +188,11 @@ def run() -> None:
     music.table.selectRow(0)
     assert music.add_button.isEnabled()
     assert music.delete_button.isEnabled()
-    assert checkable_header.check_state() == Qt.CheckState.Unchecked
+    assert checkable_header.check_state() == Qt.CheckState.PartiallyChecked
     music.table.clearSelection()
+    assert music.add_button.isEnabled()
+    assert music.delete_button.isEnabled()
+    music.table.item(0, 0).setCheckState(Qt.CheckState.Unchecked)
     assert not music.add_button.isEnabled()
     assert not music.delete_button.isEnabled()
 
@@ -286,11 +289,32 @@ def run() -> None:
     playlist_menu.search.setText("粤")
     assert playlist_menu.playlist_actions["粤语"].isVisible()
     assert not playlist_menu.playlist_actions["通勤"].isVisible()
-    playlist_menu.playlist_actions["粤语"].setChecked(True)
-    assert playlist_menu.confirm_button.isEnabled()
+    assert not playlist_menu.playlist_actions["粤语"].isCheckable()
+    assert not hasattr(playlist_menu, "confirm_button")
     playlist_menu_texts = [action.text() for action in playlist_menu.actions()]
     assert any("已存在，将自动跳过" in text for text in playlist_menu_texts)
     assert any("不会复制音乐文件" in text for text in playlist_menu_texts)
+
+    sidebar_menu = window.sidebar.create_playlist_context_menu("粤语")
+    assert [action.text() for action in sidebar_menu.actions() if not action.isSeparator()] == [
+        "重命名", "删除", "置顶"
+    ]
+    playlist_context_requests: list[tuple[str, object]] = []
+    window.sidebar.rename_playlist_requested.connect(
+        lambda name: playlist_context_requests.append(("rename", name))
+    )
+    window.sidebar.delete_playlist_requested.connect(
+        lambda name: playlist_context_requests.append(("delete", name))
+    )
+    window.sidebar.pin_playlist_requested.connect(
+        lambda name, pinned: playlist_context_requests.append(("pin", (name, pinned)))
+    )
+    actions = [action for action in sidebar_menu.actions() if not action.isSeparator()]
+    for action in actions:
+        action.trigger()
+    assert playlist_context_requests == [
+        ("rename", "粤语"), ("delete", "粤语"), ("pin", ("粤语", True))
+    ]
 
     context_menu = music.create_context_menu()
     assert [action.text() for action in context_menu.actions()] == [

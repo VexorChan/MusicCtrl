@@ -33,6 +33,11 @@ class ShortcutInfo:
 
 
 _INVALID_NAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_RESERVED_NAMES = {
+    "con", "prn", "aux", "nul",
+    *(f"com{index}" for index in range(1, 10)),
+    *(f"lpt{index}" for index in range(1, 10)),
+}
 
 
 def _require_absolute_path(path: Path, *, label: str) -> None:
@@ -79,6 +84,41 @@ def _ensure_destination_available(path: Path) -> None:
         raise ShortcutBoundaryError(f"无法读取歌单目录：{path.parent}") from error
     if any(_windows_name_key(entry.name) == wanted for entry in entries):
         raise ShortcutConflictError(f"快捷方式目标已存在，禁止覆盖：{path.name}")
+
+
+def _validate_playlist_name(name: str) -> str:
+    if not isinstance(name, str) or not name.strip():
+        raise ShortcutBoundaryError("歌单名称不能为空")
+    clean = name.strip()
+    base_name = clean.split(".", 1)[0].casefold()
+    if (
+        _INVALID_NAME.search(clean)
+        or clean != name
+        or clean.endswith((" ", "."))
+        or clean in {".", ".."}
+        or base_name in _RESERVED_NAMES
+    ):
+        raise ShortcutBoundaryError("歌单名称包含 Windows 非法字符或保留名称")
+    return clean
+
+
+def _find_playlist_directory(*, playlist_root: Path, name: str) -> Path:
+    _validate_directory_root(playlist_root, label="歌单根")
+    clean = _validate_playlist_name(name)
+    matches: list[str] = []
+    try:
+        entries = tuple(os.scandir(playlist_root))
+    except OSError as error:
+        raise ShortcutBoundaryError(f"无法读取歌单根：{playlist_root}") from error
+    for entry in entries:
+        if _windows_name_key(entry.name) != _windows_name_key(clean):
+            continue
+        metadata = entry.stat(follow_symlinks=False)
+        if entry.is_dir(follow_symlinks=False) and not entry.is_symlink() and not _is_reparse(metadata):
+            matches.append(entry.name)
+    if len(matches) != 1:
+        raise ShortcutBoundaryError("歌单不存在、名称不唯一或不是安全目录")
+    return playlist_root / matches[0]
 
 
 def _shell():
@@ -190,11 +230,7 @@ def create_shortcut(
 
 def create_playlist_directory(*, playlist_root: Path, name: str) -> Path:
     _validate_directory_root(playlist_root, label="歌单根")
-    if not isinstance(name, str) or not name.strip():
-        raise ShortcutBoundaryError("歌单名称不能为空")
-    clean = name.strip()
-    if _INVALID_NAME.search(clean) or clean.endswith((" ", ".")) or clean in {".", ".."}:
-        raise ShortcutBoundaryError("歌单名称包含 Windows 非法字符")
+    clean = _validate_playlist_name(name)
     existing = {
         _windows_name_key(entry.name): entry
         for entry in os.scandir(playlist_root)
@@ -212,6 +248,99 @@ def create_playlist_directory(*, playlist_root: Path, name: str) -> Path:
     except OSError as error:
         raise ShortcutError(f"无法创建歌单目录：{clean}") from error
     return path
+
+
+def rename_playlist_directory(
+    *,
+    playlist_root: Path,
+    current_name: str,
+    new_name: str,
+) -> Path:
+    """Rename one ordinary playlist directory without overwriting another path."""
+
+    clean = _validate_playlist_name(new_name)
+    source = _find_playlist_directory(playlist_root=playlist_root, name=current_name)
+    destination = playlist_root / clean
+    source_key = _windows_name_key(source.name)
+    destination_key = _windows_name_key(clean)
+    try:
+        entries = tuple(os.scandir(playlist_root))
+    except OSError as error:
+        raise ShortcutBoundaryError(f"无法读取歌单根：{playlist_root}") from error
+    if any(
+        _windows_name_key(entry.name) == destination_key
+        and _windows_name_key(entry.name) != source_key
+        for entry in entries
+    ):
+        raise ShortcutConflictError("目标歌单名称已存在，禁止覆盖")
+    if source.name == clean:
+        return source
+    # Lock the managed root, but not the directory being renamed: on Windows an
+    # open handle to the leaf directory itself prevents os.rename from succeeding.
+    with _locked_directory_chain(playlist_root, source.parent):
+        metadata = os.lstat(source)
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode) or _is_reparse(metadata):
+            raise ShortcutBoundaryError("歌单目录已变化，拒绝重命名")
+        try:
+            os.rename(source, destination)
+        except OSError as error:
+            raise ShortcutError(f"无法重命名歌单：{source.name}") from error
+    return destination
+
+
+def inspect_playlist_shortcuts(
+    *,
+    playlist_root: Path,
+    name: str,
+    allowed_targets: tuple[Path, ...],
+) -> tuple[ShortcutInfo, ...]:
+    """Preflight a playlist deletion and return only verified managed shortcuts."""
+
+    folder = _find_playlist_directory(playlist_root=playlist_root, name=name)
+    allowed = {
+        os.path.normcase(os.path.normpath(os.fspath(path)))
+        for path in allowed_targets
+    }
+    infos: list[ShortcutInfo] = []
+    try:
+        entries = tuple(os.scandir(folder))
+    except OSError as error:
+        raise ShortcutBoundaryError(f"无法读取歌单目录：{folder}") from error
+    for entry in entries:
+        metadata = entry.stat(follow_symlinks=False)
+        if (
+            not entry.is_file(follow_symlinks=False)
+            or entry.is_symlink()
+            or _is_reparse(metadata)
+            or not entry.name.casefold().endswith(".lnk")
+        ):
+            raise ShortcutBoundaryError(f"歌单包含未知或不安全项目：{entry.name}")
+        # read_shortcut obtains its own verified directory-chain lock and
+        # rechecks the file immediately before COM reads it.
+        info = read_shortcut(folder / entry.name, playlist_root=playlist_root)
+        target_key = os.path.normcase(os.path.normpath(os.fspath(info.target_path)))
+        if target_key not in allowed:
+            raise ShortcutBoundaryError(
+                f"快捷方式目标不是 active 音频，拒绝删除歌单：{entry.name}"
+            )
+        infos.append(info)
+    return tuple(sorted(infos, key=lambda item: (item.path.name.casefold(), item.path.name)))
+
+
+def remove_empty_playlist_directory(*, playlist_root: Path, name: str) -> None:
+    folder = _find_playlist_directory(playlist_root=playlist_root, name=name)
+    # As with rename, do not hold an open handle to the leaf directory while
+    # asking Windows to remove that directory.
+    with _locked_directory_chain(playlist_root, folder.parent):
+        try:
+            with os.scandir(folder) as entries:
+                if next(entries, None) is not None:
+                    raise ShortcutConflictError("歌单目录仍包含项目，拒绝删除目录")
+            os.rmdir(folder)
+        except ShortcutError:
+            raise
+        except OSError as error:
+            raise ShortcutError(f"无法删除空歌单目录：{folder.name}") from error
 
 
 def remove_shortcut(

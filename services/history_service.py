@@ -338,7 +338,14 @@ class HistoryService:
                         created_at,
                     )
                 )
-            action_text = {"create": "创建歌单", "add": "添加到歌单", "remove": "从歌单移除", "retarget": "更新快捷方式"}.get(action, action)
+            action_text = {
+                "create": "创建歌单",
+                "add": "添加到歌单",
+                "remove": "从歌单移除",
+                "retarget": "更新快捷方式",
+                "rename": "重命名歌单",
+                "delete": "删除歌单",
+            }.get(action, action)
             identifier = f"playlist:{created_at}:{action}:{playlist_name}:{index}"
             yield HistoryRecord(
                 identifier,

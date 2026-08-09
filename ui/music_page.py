@@ -72,7 +72,7 @@ def _duration_number(value: str) -> int:
 
 
 class PlaylistAddMenu(QMenu):
-    confirmed = Signal(list)
+    confirmed = Signal(str)
     create_requested = Signal()
 
     def __init__(self, playlist_names: Iterable[str], parent: QWidget | None = None) -> None:
@@ -98,8 +98,9 @@ class PlaylistAddMenu(QMenu):
             if playlist == "我喜欢的":
                 label = f"{playlist}    已存在，将自动跳过"
             action = QAction(label, self)
-            action.setCheckable(True)
-            action.toggled.connect(self._update_confirm_state)
+            action.triggered.connect(
+                lambda _checked=False, name=playlist: self._choose_playlist(name)
+            )
             self.playlist_actions[playlist] = action
             self.addAction(action)
 
@@ -117,34 +118,20 @@ class PlaylistAddMenu(QMenu):
         footer_layout.addStretch(1)
         cancel = QPushButton("取消")
         cancel.clicked.connect(self.close)
-        self.confirm_button = QPushButton("添加")
-        self.confirm_button.setObjectName("PrimaryButton")
-        self.confirm_button.setEnabled(False)
-        self.confirm_button.clicked.connect(self._confirm)
         footer_layout.addWidget(cancel)
-        footer_layout.addWidget(self.confirm_button)
         footer_action = QWidgetAction(self)
         footer_action.setDefaultWidget(footer_host)
         self.addAction(footer_action)
 
         self.search.textChanged.connect(self._filter_playlists)
 
-    def selected_playlists(self) -> list[str]:
-        return [name for name, action in self.playlist_actions.items() if action.isChecked()]
-
     def _filter_playlists(self, text: str) -> None:
         query = _normalize(text)
         for name, action in self.playlist_actions.items():
             action.setVisible(not query or query in _normalize(name))
 
-    def _update_confirm_state(self, *_args) -> None:
-        self.confirm_button.setEnabled(bool(self.selected_playlists()))
-
-    def _confirm(self) -> None:
-        selected = self.selected_playlists()
-        if not selected:
-            return
-        self.confirmed.emit(selected)
+    def _choose_playlist(self, name: str) -> None:
+        self.confirmed.emit(name)
         self.close()
 
 
@@ -241,6 +228,18 @@ class LibraryTableModel(QAbstractTableModel):
             )
         self.check_state_changed.emit()
 
+    def set_rows_checked(self, rows: Iterable[int]) -> None:
+        changed: list[int] = []
+        for row in rows:
+            if 0 <= row < len(self._records) and row not in self._checked:
+                self._checked.add(row)
+                changed.append(row)
+        for row in changed:
+            index = self.index(row, 0)
+            self.dataChanged.emit(index, index, [Qt.ItemDataRole.CheckStateRole])
+        if changed:
+            self.check_state_changed.emit()
+
 
 class LibraryPage(QWidget):
     delete_requested = Signal(list)
@@ -276,6 +275,7 @@ class LibraryPage(QWidget):
         self.sort_key: str | None = None
         self.sort_descending = False
         self.playlist_note: QLabel | None = None
+        self._syncing_selection_checks = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 20, 24, 12)
@@ -353,7 +353,7 @@ class LibraryPage(QWidget):
         else:
             self.table = DataTable(checkable_header=True)
         self.checkable_header = self.table.require_checkable_header()
-        self.table.selectionModel().selectionChanged.connect(self._update_selection_state)
+        self.table.selectionModel().selectionChanged.connect(self._selection_changed)
         if not self.use_model_view:
             self.table.itemChanged.connect(self._update_selection_state)
         self.checkable_header.toggle_requested.connect(self._toggle_select_all)
@@ -540,12 +540,10 @@ class LibraryPage(QWidget):
         return rows
 
     def _selected_rows(self) -> list[int]:
-        rows = {index.row() for index in self.table.selectionModel().selectedRows()}
-        rows.update(self._checked_rows())
-        return sorted(rows)
+        return self._checked_rows()
 
     def selected_records(self) -> tuple[dict[str, object], ...]:
-        """Return a frozen-by-copy snapshot of the visible selection union."""
+        """Return a frozen-by-copy snapshot of visible checked rows."""
 
         return tuple(
             dict(self.visible_data[row])
@@ -558,7 +556,7 @@ class LibraryPage(QWidget):
 
     def _update_selection_state(self, *_args) -> None:
         checked_count = len(self._checked_rows())
-        count = len(self._selected_rows())
+        count = checked_count
         row_count = self._table_model.rowCount() if self._table_model is not None else self.table.rowCount()
         if checked_count == 0 or row_count == 0:
             header_state = Qt.CheckState.Unchecked
@@ -572,6 +570,28 @@ class LibraryPage(QWidget):
         shown = len(self.visible_data)
         suffix = "索引来自用户选择目录" if self.live_mode else "仅演示界面，不操作真实文件"
         self.status.setText(f"已选择 {count} 项    ·    当前显示 {shown} 项    ·    {suffix}")
+
+    def _selection_changed(self, selected, _deselected) -> None:
+        if self._syncing_selection_checks:
+            return
+        rows = sorted({index.row() for index in selected.indexes()})
+        if rows:
+            self._syncing_selection_checks = True
+            try:
+                if self._table_model is not None:
+                    self._table_model.set_rows_checked(rows)
+                else:
+                    self.table.blockSignals(True)
+                    try:
+                        for row in rows:
+                            item = self.table.item(row, 0)
+                            if item is not None:
+                                item.setCheckState(Qt.CheckState.Checked)
+                    finally:
+                        self.table.blockSignals(False)
+            finally:
+                self._syncing_selection_checks = False
+        self._update_selection_state()
 
     def _header_clicked(self, column: int) -> None:
         if column == 0:
@@ -635,21 +655,21 @@ class LibraryPage(QWidget):
     def create_playlist_menu(self) -> PlaylistAddMenu:
         menu = PlaylistAddMenu(self._playlist_names, self)
         menu.create_requested.connect(self.new_playlist_requested)
-        menu.confirmed.connect(self._simulate_add_to_playlists)
+        menu.confirmed.connect(self._simulate_add_to_playlist)
         return menu
 
     def _show_add_menu(self) -> None:
         menu = self.create_playlist_menu()
         menu.exec(self.add_button.mapToGlobal(QPoint(0, self.add_button.height())))
 
-    def _simulate_add_to_playlists(self, playlists: list[str]) -> None:
+    def _simulate_add_to_playlist(self, playlist: str) -> None:
         records = self._selected_records()
         if self.live_mode:
-            self.add_to_playlists_requested.emit(records, list(playlists))
+            self.add_to_playlists_requested.emit(records, playlist)
             return
         item_count = len(records)
         self.status.setText(
-            f"已模拟将 {item_count} 项添加到 {len(playlists)} 个歌单    ·    已存在的快捷方式会自动跳过"
+            f"已模拟将 {item_count} 项添加到歌单“{playlist}”    ·    已存在的快捷方式会自动跳过"
         )
 
     def _request_delete(self) -> None:

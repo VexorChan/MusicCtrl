@@ -11,7 +11,7 @@ from dialogs.delete_confirm_dialog import DeleteConfirmDialog, DeleteLyricsConfi
 from dialogs.history_dialog import HistoryDialog
 from dialogs.import_dialog import ImportDialog
 from dialogs.lyrics_match_dialog import LyricsMatchDialog
-from dialogs.playlist_dialog import CreatePlaylistDialog
+from dialogs.playlist_dialog import CreatePlaylistDialog, RenamePlaylistDialog
 from dialogs.rename_preview_dialog import RenamePreviewDialog
 from dialogs.read_only_scan_dialog import ReadOnlyScanDialog
 from dialogs.settings_dialog import SettingsDialog
@@ -105,6 +105,9 @@ class MainWindow(QMainWindow):
         self.sidebar = Sidebar(live_mode=playlist_controller is not None)
         self.sidebar.navigation_requested.connect(self.navigate)
         self.sidebar.create_playlist_requested.connect(self.create_playlist)
+        self.sidebar.rename_playlist_requested.connect(self.rename_playlist)
+        self.sidebar.delete_playlist_requested.connect(self.delete_playlist)
+        self.sidebar.pin_playlist_requested.connect(self.set_playlist_pinned)
         root_layout.addWidget(self.sidebar)
 
         content = QWidget()
@@ -680,6 +683,9 @@ class MainWindow(QMainWindow):
             self._lyrics_warning(f"歌词关系已更新，但音乐列表刷新失败：{error}")
 
     def _background_running_changed(self, running: bool) -> None:
+        self.sidebar.set_playlist_management_enabled(
+            not self._has_running_background_task()
+        )
         if self._settings_dialog is not None:
             self._settings_dialog.set_maintenance_running(
                 self._has_running_background_task()
@@ -1551,7 +1557,15 @@ class MainWindow(QMainWindow):
             playlist.name: tuple(item.as_record() for item in playlist.records)
             for playlist in snapshot.playlists
         }
-        self._replace_playlists(tuple(records), records)
+        names = tuple(records)
+        pinned: tuple[str, ...] = ()
+        if self._playlist_controller is not None:
+            try:
+                names = self._playlist_controller.ordered_playlist_names(names)
+                pinned = self._playlist_controller.pinned_playlists()
+            except Exception as error:
+                self.pages["所有音乐"].status.setText(f"无法读取歌单置顶顺序：{error}")
+        self._replace_playlists(names, records, pinned=pinned)
         if self._pending_playlist_navigation is not None:
             key = f"playlist:{self._pending_playlist_navigation}"
             self._pending_playlist_navigation = None
@@ -1566,6 +1580,8 @@ class MainWindow(QMainWindow):
         self,
         names: object,
         snapshot_records: dict[str, tuple[dict[str, object], ...]] | None = None,
+        *,
+        pinned: tuple[str, ...] = (),
     ) -> None:
         if self._playlist_controller is None or not isinstance(names, (tuple, list)):
             return
@@ -1579,7 +1595,7 @@ class MainWindow(QMainWindow):
                 self.navigate("所有音乐")
             self.stack.removeWidget(page)
             page.deleteLater()
-        self.sidebar.set_playlists(clean_names)
+        self.sidebar.set_playlists(clean_names, pinned=pinned)
         for name in clean_names:
             key = f"playlist:{name}"
             if key not in self.pages:
@@ -1610,21 +1626,21 @@ class MainWindow(QMainWindow):
         if page is not None and isinstance(records, (tuple, list)):
             page.replace_data(records)
 
-    def _add_to_playlists(self, records: object, names: object) -> None:
+    def _add_to_playlists(self, records: object, name: object) -> None:
         if self._playlist_controller is None:
             return
         if self._has_running_background_task():
             self.pages["所有音乐"].status.setText("已有后台任务运行，请完成后再添加歌单。")
             return
-        if not isinstance(records, list) or not isinstance(names, list) or not records or not names:
-            self.pages["所有音乐"].status.setText("请选择音乐和至少一个歌单。")
+        if not isinstance(records, list) or not isinstance(name, str) or not records or not name.strip():
+            self.pages["所有音乐"].status.setText("请选择音乐和一个歌单。")
             return
         try:
             inputs = tuple(self._playlist_audio_input(record) for record in records)
         except Exception as error:
             self.pages["所有音乐"].status.setText(f"无法添加到歌单：{error}")
             return
-        self._playlist_add_queue = [(str(name), inputs) for name in names]
+        self._playlist_add_queue = [(name, inputs)]
         self._start_next_playlist_add()
 
     @staticmethod
@@ -1708,6 +1724,7 @@ class MainWindow(QMainWindow):
             self._playlist_controller is not None
             and getattr(self._playlist_controller, "last_terminal_kind", "") == "operation"
         ):
+            self._pending_playlist_navigation = None
             QTimer.singleShot(0, self._queue_current_playlist_refresh)
 
     def _queue_current_playlist_refresh(self) -> None:
@@ -1716,6 +1733,77 @@ class MainWindow(QMainWindow):
         root = self._playlist_controller.remembered_root()
         if isinstance(root, Path) and root.is_absolute():
             self._queue_library_refresh((("playlist", root),))
+
+    def rename_playlist(self, name: str) -> None:
+        controller = self._playlist_controller
+        if controller is None:
+            return
+        if self._has_running_background_task():
+            self.pages["所有音乐"].status.setText("已有后台任务运行，请完成后再重命名歌单。")
+            return
+        dialog = RenamePlaylistDialog(name, self)
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
+        new_name = dialog.name_input.text().strip()
+        if not new_name or new_name == name:
+            return
+        try:
+            controller.start_rename_playlist(name, new_name)
+        except Exception as error:
+            self.pages["所有音乐"].status.setText(f"无法重命名歌单：{error}")
+            return
+        self._pending_playlist_navigation = new_name
+        self.pages["所有音乐"].status.setText(f"正在重命名歌单“{name}”…")
+
+    def delete_playlist(self, name: str) -> None:
+        controller = self._playlist_controller
+        if controller is None:
+            return
+        if self._has_running_background_task():
+            self.pages["所有音乐"].status.setText("已有后台任务运行，请完成后再删除歌单。")
+            return
+        page = self.pages.get(f"playlist:{name}")
+        shortcut_count = len(page.all_data) if page is not None else 0
+        answer = QMessageBox.warning(
+            self,
+            "删除歌单",
+            f"将删除歌单“{name}”及其中 {shortcut_count} 个受管快捷方式。\n\n"
+            "不会删除、移动或修改真实音乐文件。检测到未知或损坏项目时将拒绝删除。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            controller.start_delete_playlist(name)
+        except Exception as error:
+            self.pages["所有音乐"].status.setText(f"无法删除歌单：{error}")
+            return
+        self.pages["所有音乐"].status.setText(f"正在安全删除歌单“{name}”…")
+
+    def set_playlist_pinned(self, name: str, pinned: bool) -> None:
+        controller = self._playlist_controller
+        if controller is None:
+            return
+        if self._has_running_background_task():
+            self.pages["所有音乐"].status.setText("已有后台任务运行，请完成后再调整歌单顺序。")
+            return
+        try:
+            ordered = controller.set_playlist_pinned(name, pinned)
+            pinned_names = controller.pinned_playlists()
+        except Exception as error:
+            self.pages["所有音乐"].status.setText(f"无法更新歌单置顶状态：{error}")
+            return
+        current_key = next(
+            (key for key, page in self.pages.items() if self.stack.currentWidget() is page),
+            "所有音乐",
+        )
+        self.sidebar.set_playlists(ordered, pinned=pinned_names)
+        self.sidebar.select_key(current_key)
+        for page in self.pages.values():
+            page.set_playlist_names(ordered)
+        state = "已置顶" if pinned else "已取消置顶"
+        self.pages["所有音乐"].status.setText(f"歌单“{name}”{state}。")
 
     def create_playlist(self) -> None:
         if self._has_running_background_task():

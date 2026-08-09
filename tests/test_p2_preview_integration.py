@@ -251,6 +251,8 @@ class P2PreviewIntegrationTests(unittest.TestCase):
 
         def select_path(path: Path) -> None:
             page.table.clearSelection()
+            for row in range(page.table.rowCount()):
+                page.table.item(row, 0).setCheckState(Qt.CheckState.Unchecked)
             for row, record in enumerate(page.visible_data):
                 if record["_canonical_path"] == path:
                     page.table.selectRow(row)
