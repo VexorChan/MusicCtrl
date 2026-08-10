@@ -1,5 +1,18 @@
 # 2026-08-10 本机稳定交付记录
 
+## 2026-08-10 08:10 重命名、快捷方式联动与统一选择修复最终交付
+
+- `RUNTIME_HEAD=5f4c873051b55ac8628cd39c9777ce478de27134`，构建前已推送并通过 `git ls-remote` 回读，与 `origin/main` 完全一致。
+- 主工作区和独立构建 worktree 均为 436 项测试通过；同时通过 `unittest discover`（启用 `ResourceWarning` 错误）、`compileall`、`smoke_test.py`、`git diff --check` 和隔离环境依赖检查。
+- 独立构建 worktree：`work/p8-final-5f4c873-20260810-071852`；Python 3.13.5、PyInstaller 6.21.0、PySide6 6.9.2、Mutagen 1.48.1、pywin32 308。
+- `MusicCtrl.exe` SHA-256：`E6DF3D395BD9B7F1032E84E126318B42C4610CFEE0E237F6656536351965866B`；`SHA256SUMS.txt` 的 225 个条目全部回读一致，安装目录共 226 个文件。
+- 安装目录：`%LOCALAPPDATA%\Programs\MusicCtrl`；旧安装完整保留为 `%LOCALAPPDATA%\Programs\MusicCtrl-backup-20260810-072540`，未删除。安装目录内数据库和日志文件为 0。
+- 桌面快捷方式 `%USERPROFILE%\Desktop\乐库整理助手.lnk` 的目标、工作目录和图标均已回读为最终安装 EXE；通过该快捷方式启动的进程路径为最终安装目录，界面正常显示并可正常关闭。
+- Computer Use 仅在 `work/computer-use-20260810-072639` 和隔离 `manual-ui-*` 数据库中操作：验证主列表、重命名预览和歌词候选的勾选/高亮双向同步及再次点击取消；“无需更改”行默认禁用，编辑后可选，恢复原名后自动取消。
+- 真人式重命名成功 2 项、失败或恢复 0 项；影响预统计为 2 个快捷方式。一首测试歌曲关联两个歌单后，两个 `playlist_items` 保持同一稳定 `audio_asset_id`，关系均为 `current/active`，两个 `.lnk` 回读目标均为新歌曲路径，未改动无关文件。
+- 歌词真人式验收识别 2 个 LRC：100% 候选自动匹配，65% 候选保持待人工确认；候选行点击与复选框同步，再次点击同时取消。
+- 本节之后的提交只更新交付证据，不改变已构建运行时。
+
 ## 2026-08-10 02:25 歌单选择、元数据与一致性修复最终交付
 
 - `RUNTIME_HEAD=ba89f0c36e55b4333690935daa034bd823f176de`，构建前已推送并通过 `git ls-remote` 回读，与 `origin/main` 完全一致。
